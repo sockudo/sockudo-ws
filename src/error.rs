@@ -216,7 +216,7 @@ impl From<h2::Error> for Error {
                 return Error::Io(io_err);
             }
             // If into_io returned None despite is_io being true, wrap as generic IO error
-            return Error::Io(std::io::Error::new(std::io::ErrorKind::Other, err_string));
+            return Error::Io(std::io::Error::other(err_string));
         }
         Error::Http2(e)
     }

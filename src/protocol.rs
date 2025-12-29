@@ -10,7 +10,7 @@ use bytes::{Bytes, BytesMut};
 use crate::error::{CloseReason, Error, Result};
 #[cfg(feature = "permessage-deflate")]
 use crate::frame::encode_frame_with_rsv;
-use crate::frame::{encode_frame, Frame, FrameParser, OpCode};
+use crate::frame::{Frame, FrameParser, OpCode, encode_frame};
 use crate::utf8::{validate_utf8, validate_utf8_incomplete};
 
 #[cfg(feature = "permessage-deflate")]

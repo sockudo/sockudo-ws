@@ -3,9 +3,9 @@
 //! Run with: cargo bench
 
 use bytes::BytesMut;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use sockudo_ws::frame::{encode_frame, FrameParser, OpCode};
+use sockudo_ws::frame::{FrameParser, OpCode, encode_frame};
 use sockudo_ws::simd::apply_mask;
 use sockudo_ws::utf8::validate_utf8;
 

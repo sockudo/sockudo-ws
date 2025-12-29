@@ -101,7 +101,7 @@ mod server;
 mod stream;
 
 pub use client::H3WebSocketClient;
-pub use handshake::{build_h3_response, H3HandshakeRequest};
+pub use handshake::{H3HandshakeRequest, build_h3_response};
 pub use server::H3WebSocketServer;
 pub use stream::H3Stream;
 

@@ -120,7 +120,7 @@ impl AsyncRead for H3Stream {
                 if matches!(e, quinn::ReadError::Reset(_)) {
                     *this.recv_finished = true;
                 }
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)))
+                Poll::Ready(Err(io::Error::other(e)))
             }
             Poll::Pending => Poll::Pending,
         }
@@ -142,7 +142,7 @@ impl AsyncWrite for H3Stream {
         // Use quinn::SendStream::poll_write (requires Pin<&mut Self>)
         match this.send.poll_write(cx, buf) {
             Poll::Ready(Ok(n)) => Poll::Ready(Ok(n)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -160,7 +160,7 @@ impl AsyncWrite for H3Stream {
         // In quinn 0.11, finish() is synchronous and returns Result<(), ClosedStream>
         match this.send.get_mut().finish() {
             Ok(()) => Poll::Ready(Ok(())),
-            Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+            Err(e) => Poll::Ready(Err(io::Error::other(e))),
         }
     }
 }

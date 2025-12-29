@@ -9,13 +9,13 @@ use socket2::{Domain, Protocol as SockProtocol, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use sockudo_ws::Config;
 use sockudo_ws::error::Result;
 use sockudo_ws::handshake::{build_response, generate_accept_key, parse_request};
 use sockudo_ws::protocol::{Message, Protocol, Role};
-use sockudo_ws::Config;
 
 #[cfg(feature = "permessage-deflate")]
-use sockudo_ws::deflate::{parse_deflate_offer, DeflateConfig};
+use sockudo_ws::deflate::{DeflateConfig, parse_deflate_offer};
 #[cfg(feature = "permessage-deflate")]
 use sockudo_ws::protocol::CompressedProtocol;
 
@@ -315,7 +315,7 @@ async fn handle_connection_compressed(
                     write_buf.clear();
                     // Encode close manually without compression
                     use bytes::Bytes;
-                    use sockudo_ws::frame::{encode_frame, OpCode};
+                    use sockudo_ws::frame::{OpCode, encode_frame};
                     let payload = if let Some(ref r) = reason {
                         let mut p = BytesMut::with_capacity(2 + r.reason.len());
                         p.extend_from_slice(&r.code.to_be_bytes());

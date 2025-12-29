@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 use crate::protocol::Role;
 use crate::{Config, WebSocketStream};
 
-use super::handshake::{build_h2_error_response, build_h2_response, H2HandshakeRequest};
+use super::handshake::{H2HandshakeRequest, build_h2_error_response, build_h2_response};
 use super::stream::H2Stream;
 
 /// HTTP/2 WebSocket server

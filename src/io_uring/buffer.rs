@@ -161,11 +161,7 @@ impl RegisteredBuffer {
 
     /// Get the remaining bytes to read
     pub fn remaining(&self) -> usize {
-        if self.pos >= self.len {
-            0
-        } else {
-            self.len - self.pos
-        }
+        self.len.saturating_sub(self.pos)
     }
 
     /// Get a slice of the unread data

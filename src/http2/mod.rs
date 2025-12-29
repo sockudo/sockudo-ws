@@ -68,7 +68,7 @@ mod server;
 mod stream;
 
 pub use client::H2WebSocketClient;
-pub use handshake::{build_h2_response, H2HandshakeRequest, H2HandshakeResponse};
+pub use handshake::{H2HandshakeRequest, H2HandshakeResponse, build_h2_response};
 pub use server::H2WebSocketServer;
 pub use stream::H2Stream;
 

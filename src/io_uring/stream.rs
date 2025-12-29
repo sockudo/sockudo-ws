@@ -24,7 +24,7 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -69,7 +69,7 @@ use tokio_uring::net::TcpStream as UringTcpStream;
 /// ```
 pub struct UringStream {
     /// The underlying tokio-uring TCP stream
-    inner: Arc<UringTcpStream>,
+    inner: Rc<UringTcpStream>,
     /// Read buffer for bridging completion-based to poll-based I/O
     read_state: ReadState,
     /// Write state
@@ -108,7 +108,7 @@ impl UringStream {
     /// traits, allowing it to work with any async protocol implementation.
     pub fn new(stream: UringTcpStream) -> Self {
         Self {
-            inner: Arc::new(stream),
+            inner: Rc::new(stream),
             read_state: ReadState {
                 buffer: Some(vec![0u8; 64 * 1024]),
                 data_len: 0,
@@ -151,18 +151,16 @@ impl AsyncRead for UringStream {
         let this = &mut *self;
 
         // First, try to satisfy from the internal buffer
-        if this.read_state.read_pos < this.read_state.data_len {
-            if let Some(ref read_buf) = this.read_state.buffer {
-                let available = this.read_state.data_len - this.read_state.read_pos;
-                let to_copy = std::cmp::min(available, buf.remaining());
+        if this.read_state.read_pos < this.read_state.data_len
+            && let Some(ref read_buf) = this.read_state.buffer
+        {
+            let available = this.read_state.data_len - this.read_state.read_pos;
+            let to_copy = std::cmp::min(available, buf.remaining());
 
-                buf.put_slice(
-                    &read_buf[this.read_state.read_pos..this.read_state.read_pos + to_copy],
-                );
-                this.read_state.read_pos += to_copy;
+            buf.put_slice(&read_buf[this.read_state.read_pos..this.read_state.read_pos + to_copy]);
+            this.read_state.read_pos += to_copy;
 
-                return Poll::Ready(Ok(()));
-            }
+            return Poll::Ready(Ok(()));
         }
 
         // Buffer exhausted, need to read more from io_uring
@@ -182,7 +180,7 @@ impl AsyncRead for UringStream {
             waker: Some(cx.waker().clone()),
         });
 
-        let _stream = Arc::clone(&this.inner);
+        let _stream = Rc::clone(&this.inner);
 
         // Note: In a real implementation, we'd use tokio-uring's spawn mechanism
         // to handle the completion. This is a simplified version.

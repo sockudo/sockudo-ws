@@ -39,18 +39,18 @@ use std::task::{Context, Poll};
 
 use axum::body::Body;
 use axum::extract::FromRequestParts;
-use axum::http::{header, request::Parts, Method, Response, StatusCode};
+use axum::http::{Method, Response, StatusCode, header, request::Parts};
 use axum::response::IntoResponse;
 use futures_core::Stream;
 use futures_sink::Sink;
 use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::Config;
 use crate::error::{Error, Result};
 use crate::handshake::generate_accept_key;
 use crate::protocol::{Message, Role};
 use crate::stream::WebSocketStream;
-use crate::Config;
 
 /// WebSocket upgrade extractor for Axum
 ///

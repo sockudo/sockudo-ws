@@ -33,10 +33,10 @@ use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
 
+use crate::Config;
 use crate::cork::CorkBuffer;
 use crate::error::{CloseReason, Error, Result};
 use crate::protocol::{Message, Protocol, Role};
-use crate::Config;
 
 pin_project! {
     /// A WebSocket stream over an async transport

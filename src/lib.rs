@@ -60,7 +60,7 @@ pub mod io_uring;
 pub use error::{Error, Result};
 pub use frame::{Frame, OpCode};
 pub use protocol::{Message, Role};
-pub use stream::{reunite, ReuniteError, SplitReader, SplitWriter, WebSocketStream};
+pub use stream::{ReuniteError, SplitReader, SplitWriter, WebSocketStream, reunite};
 
 // Re-export config types at top level for convenience
 
@@ -483,9 +483,9 @@ impl Default for ConfigBuilder {
 
 /// Prelude module for convenient imports
 pub mod prelude {
+    pub use crate::Config;
     pub use crate::error::{Error, Result};
     pub use crate::frame::{Frame, OpCode};
     pub use crate::protocol::{Message, Role};
     pub use crate::stream::WebSocketStream;
-    pub use crate::Config;
 }

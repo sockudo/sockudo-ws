@@ -6,10 +6,10 @@
 //! - Thread-local pools to avoid contention
 //! - Cache-line aligned allocations
 
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{Layout, alloc, dealloc};
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
-use std::mem::{align_of, size_of, MaybeUninit};
+use std::mem::{MaybeUninit, align_of, size_of};
 use std::ptr::NonNull;
 
 use crate::CACHE_LINE_SIZE;

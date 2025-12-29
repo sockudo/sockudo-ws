@@ -99,8 +99,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn load_certs_and_key(
-) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), Box<dyn std::error::Error>> {
+fn load_certs_and_key()
+-> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), Box<dyn std::error::Error>> {
     // Try to load from files, or generate self-signed for demo
     let cert_path = "cert.pem";
     let key_path = "key.pem";

@@ -202,7 +202,7 @@ impl H3MultiplexedConnection {
 
     /// Check if the connection is still open
     pub fn is_open(&self) -> bool {
-        !self.connection.close_reason().is_some()
+        self.connection.close_reason().is_none()
     }
 
     /// Get connection statistics

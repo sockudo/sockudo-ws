@@ -111,7 +111,7 @@ impl AsyncRead for H2Stream {
 
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(e))),
             Poll::Ready(None) => {
                 // Stream ended (END_STREAM received)
                 self.recv_eof = true;
@@ -144,14 +144,12 @@ impl AsyncWrite for H2Stream {
                 let to_send = std::cmp::min(capacity, buf.len());
                 let data = Bytes::copy_from_slice(&buf[..to_send]);
 
-                self.send
-                    .send_data(data, false)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                self.send.send_data(data, false).map_err(io::Error::other)?;
 
                 self.capacity_needed = 0;
                 Poll::Ready(Ok(to_send))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(e))),
             Poll::Ready(None) => {
                 // Stream was reset
                 Poll::Ready(Err(io::Error::new(
@@ -175,7 +173,7 @@ impl AsyncWrite for H2Stream {
         // Send empty DATA frame with END_STREAM flag
         self.send
             .send_data(Bytes::new(), true)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         Poll::Ready(Ok(()))
     }
 }

@@ -75,7 +75,7 @@ impl H3WebSocketServer {
         let server_config = ServerConfig::with_crypto(Arc::new(quic_config));
 
         // Create QUIC endpoint
-        let endpoint = Endpoint::server(server_config, addr).map_err(|e| Error::Io(e))?;
+        let endpoint = Endpoint::server(server_config, addr).map_err(Error::Io)?;
 
         Ok(Self {
             endpoint,

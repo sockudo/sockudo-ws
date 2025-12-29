@@ -10,8 +10,8 @@ use base64::Engine;
 use bytes::{BufMut, Bytes, BytesMut};
 use sha1::{Digest, Sha1};
 
-use crate::error::{Error, Result};
 use crate::WS_GUID;
+use crate::error::{Error, Result};
 
 /// Maximum HTTP header size (8KB should be enough for any reasonable request)
 const MAX_HEADER_SIZE: usize = 8192;
