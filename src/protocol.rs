@@ -565,9 +565,7 @@ impl CompressedProtocol {
                             eprintln!("[PROTOCOL] Added message to output");
                         }
                     } else if DEBUG {
-                        eprintln!(
-                            "[PROTOCOL] No message from handle_frame (fragment or control)"
-                        );
+                        eprintln!("[PROTOCOL] No message from handle_frame (fragment or control)");
                     }
                 }
                 None => {
