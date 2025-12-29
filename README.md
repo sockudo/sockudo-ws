@@ -2,7 +2,9 @@
 
 Ultra-low latency WebSocket library for Rust, designed for high-frequency trading (HFT) applications and real-time systems. Fully compatible with Tokio and Axum.
 
-This library will be used in [Sockudo](https://github.com/RustNSparks/sockudo), a high-performance Pusher-compatible WebSocket server.
+Used in [Sockudo](https://github.com/RustNSparks/sockudo), a high-performance Pusher-compatible WebSocket server.
+
+**Coming soon:** N-API bindings for Node.js
 
 ## Performance
 
