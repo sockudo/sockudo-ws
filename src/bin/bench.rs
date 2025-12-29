@@ -8,9 +8,9 @@ use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use sockudo_ws::Config;
 use sockudo_ws::handshake::{build_request, generate_key, parse_response, validate_accept_key};
 use sockudo_ws::protocol::{Message, Protocol, Role};
+use sockudo_ws::Config;
 
 use bytes::BytesMut;
 
@@ -110,13 +110,13 @@ async fn run_benchmark(
 
         match parse_response(&buf) {
             Ok(Some((res, consumed))) => {
-                if let Some(accept) = res.accept
-                    && !validate_accept_key(&key, accept)
-                {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Invalid accept key",
-                    ));
+                if let Some(accept) = res.accept {
+                    if !validate_accept_key(&key, accept) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Invalid accept key",
+                        ));
+                    }
                 }
                 // Keep leftover data
                 let _ = buf.split_to(consumed);

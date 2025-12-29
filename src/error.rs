@@ -43,6 +43,31 @@ pub enum Error {
     Capacity(&'static str),
     /// Compression/decompression error
     Compression(String),
+
+    // ========================================================================
+    // Transport-specific errors
+    // ========================================================================
+    /// HTTP/2 error
+    #[cfg(feature = "http2")]
+    Http2(h2::Error),
+
+    /// HTTP/3 error
+    #[cfg(feature = "http3")]
+    Http3(String),
+
+    /// QUIC connection error
+    #[cfg(feature = "http3")]
+    Quic(quinn::ConnectionError),
+
+    /// QUIC write error
+    #[cfg(feature = "http3")]
+    QuicWrite(quinn::WriteError),
+
+    /// Extended CONNECT protocol not supported by server
+    ExtendedConnectNotSupported,
+
+    /// Stream was reset by peer
+    StreamReset,
 }
 
 /// Close frame reason
@@ -118,6 +143,18 @@ impl fmt::Display for Error {
             Error::InvalidCloseCode(code) => write!(f, "Invalid close code: {}", code),
             Error::Capacity(msg) => write!(f, "Capacity exceeded: {}", msg),
             Error::Compression(msg) => write!(f, "Compression error: {}", msg),
+            #[cfg(feature = "http2")]
+            Error::Http2(e) => write!(f, "HTTP/2 error: {}", e),
+            #[cfg(feature = "http3")]
+            Error::Http3(msg) => write!(f, "HTTP/3 error: {}", msg),
+            #[cfg(feature = "http3")]
+            Error::Quic(e) => write!(f, "QUIC error: {}", e),
+            #[cfg(feature = "http3")]
+            Error::QuicWrite(e) => write!(f, "QUIC write error: {}", e),
+            Error::ExtendedConnectNotSupported => {
+                write!(f, "Extended CONNECT protocol not supported by server")
+            }
+            Error::StreamReset => write!(f, "Stream was reset by peer"),
         }
     }
 }
@@ -126,6 +163,12 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Io(e) => Some(e),
+            #[cfg(feature = "http2")]
+            Error::Http2(e) => Some(e),
+            #[cfg(feature = "http3")]
+            Error::Quic(e) => Some(e),
+            #[cfg(feature = "http3")]
+            Error::QuicWrite(e) => Some(e),
             _ => None,
         }
     }
@@ -156,5 +199,53 @@ impl From<Error> for io::Error {
             }
             other => io::Error::other(other.to_string()),
         }
+    }
+}
+
+// ============================================================================
+// Transport-specific From implementations
+// ============================================================================
+
+#[cfg(feature = "http2")]
+impl From<h2::Error> for Error {
+    fn from(e: h2::Error) -> Self {
+        if e.is_io() {
+            // Clone the error info before consuming it
+            let err_string = e.to_string();
+            if let Some(io_err) = e.into_io() {
+                return Error::Io(io_err);
+            }
+            // If into_io returned None despite is_io being true, wrap as generic IO error
+            return Error::Io(std::io::Error::new(std::io::ErrorKind::Other, err_string));
+        }
+        Error::Http2(e)
+    }
+}
+
+#[cfg(feature = "http3")]
+impl From<quinn::ConnectionError> for Error {
+    fn from(e: quinn::ConnectionError) -> Self {
+        Error::Quic(e)
+    }
+}
+
+#[cfg(feature = "http3")]
+impl From<quinn::WriteError> for Error {
+    fn from(e: quinn::WriteError) -> Self {
+        Error::QuicWrite(e)
+    }
+}
+
+#[cfg(feature = "http3")]
+impl From<h3::error::ConnectionError> for Error {
+    fn from(e: h3::error::ConnectionError) -> Self {
+        Error::Http3(e.to_string())
+    }
+}
+
+#[cfg(feature = "http3")]
+impl From<h3::error::StreamError> for Error {
+    fn from(e: h3::error::StreamError) -> Self {
+        Error::Http3(e.to_string())
     }
 }

@@ -48,10 +48,19 @@ pub mod deflate;
 #[cfg(feature = "axum-integration")]
 pub mod axum_integration;
 
+#[cfg(feature = "http2")]
+pub mod http2;
+
+#[cfg(feature = "http3")]
+pub mod http3;
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+pub mod io_uring;
+
 pub use error::{Error, Result};
 pub use frame::{Frame, OpCode};
 pub use protocol::{Message, Role};
-pub use stream::{ReuniteError, SplitReader, SplitWriter, WebSocketStream, reunite};
+pub use stream::{reunite, ReuniteError, SplitReader, SplitWriter, WebSocketStream};
 
 // Re-export config types at top level for convenience
 
@@ -80,6 +89,95 @@ pub const MEDIUM_MESSAGE_THRESHOLD: usize = 65535;
 
 /// WebSocket GUID for handshake
 pub const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+// ============================================================================
+// Transport-specific configurations
+// ============================================================================
+
+/// HTTP/2 configuration (RFC 8441)
+#[cfg(feature = "http2")]
+#[derive(Debug, Clone)]
+pub struct Http2Config {
+    /// Initial stream-level flow control window size (default: 1MB)
+    pub initial_stream_window_size: u32,
+    /// Initial connection-level flow control window size (default: 2MB)
+    pub initial_connection_window_size: u32,
+    /// Maximum concurrent streams per connection (default: 100)
+    pub max_concurrent_streams: u32,
+    /// Enable Extended CONNECT protocol for WebSocket (default: true)
+    pub enable_connect_protocol: bool,
+}
+
+#[cfg(feature = "http2")]
+impl Default for Http2Config {
+    fn default() -> Self {
+        Self {
+            initial_stream_window_size: 1024 * 1024,         // 1MB
+            initial_connection_window_size: 2 * 1024 * 1024, // 2MB
+            max_concurrent_streams: 100,
+            enable_connect_protocol: true,
+        }
+    }
+}
+
+/// HTTP/3 configuration (RFC 9220)
+#[cfg(feature = "http3")]
+#[derive(Debug, Clone)]
+pub struct Http3Config {
+    /// Maximum idle timeout for QUIC connection in milliseconds (default: 30000)
+    pub max_idle_timeout_ms: u64,
+    /// Initial stream-level flow control window size (default: 1MB)
+    pub initial_stream_window_size: u64,
+    /// Enable 0-RTT for faster reconnection (default: false)
+    pub enable_0rtt: bool,
+    /// Enable Extended CONNECT protocol for WebSocket (default: true)
+    pub enable_connect_protocol: bool,
+    /// Maximum UDP payload size (default: 1350)
+    pub max_udp_payload_size: u16,
+}
+
+#[cfg(feature = "http3")]
+impl Default for Http3Config {
+    fn default() -> Self {
+        Self {
+            max_idle_timeout_ms: 30_000,
+            initial_stream_window_size: 1024 * 1024, // 1MB
+            enable_0rtt: false,
+            enable_connect_protocol: true,
+            max_udp_payload_size: 1350,
+        }
+    }
+}
+
+/// io_uring configuration (Linux only)
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+#[derive(Debug, Clone)]
+pub struct IoUringConfig {
+    /// Number of registered buffers for zero-copy I/O (default: 64)
+    pub registered_buffer_count: usize,
+    /// Size of each registered buffer in bytes (default: 64KB)
+    pub registered_buffer_size: usize,
+    /// Enable SQPOLL mode for reduced syscalls (default: false)
+    pub sqpoll: bool,
+    /// Number of submission queue entries (default: 256)
+    pub sq_entries: u32,
+}
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+impl Default for IoUringConfig {
+    fn default() -> Self {
+        Self {
+            registered_buffer_count: 64,
+            registered_buffer_size: 64 * 1024, // 64KB
+            sqpoll: false,
+            sq_entries: 256,
+        }
+    }
+}
+
+// ============================================================================
+// Compression
+// ============================================================================
 
 /// Compression mode for WebSocket connections
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -143,6 +241,17 @@ pub struct Config {
     pub auto_ping: bool,
     /// Ping interval in seconds (default: 30)
     pub ping_interval: u32,
+
+    // Transport-specific configurations
+    /// HTTP/2 configuration (requires `http2` feature)
+    #[cfg(feature = "http2")]
+    pub http2: Http2Config,
+    /// HTTP/3 configuration (requires `http3` feature)
+    #[cfg(feature = "http3")]
+    pub http3: Http3Config,
+    /// io_uring configuration (requires `io-uring` feature, Linux only)
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    pub io_uring: IoUringConfig,
 }
 
 impl Default for Config {
@@ -156,6 +265,12 @@ impl Default for Config {
             max_backpressure: 1024 * 1024,
             auto_ping: true,
             ping_interval: 30,
+            #[cfg(feature = "http2")]
+            http2: Http2Config::default(),
+            #[cfg(feature = "http3")]
+            http3: Http3Config::default(),
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            io_uring: IoUringConfig::default(),
         }
     }
 }
@@ -177,6 +292,12 @@ impl Config {
             max_backpressure: 1024 * 1024,
             auto_ping: true,
             ping_interval: 30,
+            #[cfg(feature = "http2")]
+            http2: Http2Config::default(),
+            #[cfg(feature = "http3")]
+            http3: Http3Config::default(),
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            io_uring: IoUringConfig::default(),
         }
     }
 }
@@ -251,6 +372,103 @@ impl ConfigBuilder {
         self
     }
 
+    // ========================================================================
+    // HTTP/2 Configuration Methods
+    // ========================================================================
+
+    /// Set HTTP/2 initial stream window size
+    #[cfg(feature = "http2")]
+    pub fn http2_stream_window_size(mut self, size: u32) -> Self {
+        self.config.http2.initial_stream_window_size = size;
+        self
+    }
+
+    /// Set HTTP/2 initial connection window size
+    #[cfg(feature = "http2")]
+    pub fn http2_connection_window_size(mut self, size: u32) -> Self {
+        self.config.http2.initial_connection_window_size = size;
+        self
+    }
+
+    /// Set HTTP/2 maximum concurrent streams
+    #[cfg(feature = "http2")]
+    pub fn http2_max_streams(mut self, count: u32) -> Self {
+        self.config.http2.max_concurrent_streams = count;
+        self
+    }
+
+    /// Enable or disable HTTP/2 Extended CONNECT protocol (RFC 8441)
+    #[cfg(feature = "http2")]
+    pub fn http2_enable_connect_protocol(mut self, enabled: bool) -> Self {
+        self.config.http2.enable_connect_protocol = enabled;
+        self
+    }
+
+    // ========================================================================
+    // HTTP/3 Configuration Methods
+    // ========================================================================
+
+    /// Set HTTP/3 maximum idle timeout in milliseconds
+    #[cfg(feature = "http3")]
+    pub fn http3_idle_timeout(mut self, ms: u64) -> Self {
+        self.config.http3.max_idle_timeout_ms = ms;
+        self
+    }
+
+    /// Set HTTP/3 initial stream window size
+    #[cfg(feature = "http3")]
+    pub fn http3_stream_window_size(mut self, size: u64) -> Self {
+        self.config.http3.initial_stream_window_size = size;
+        self
+    }
+
+    /// Enable or disable HTTP/3 0-RTT
+    #[cfg(feature = "http3")]
+    pub fn http3_enable_0rtt(mut self, enabled: bool) -> Self {
+        self.config.http3.enable_0rtt = enabled;
+        self
+    }
+
+    /// Enable or disable HTTP/3 Extended CONNECT protocol (RFC 9220)
+    #[cfg(feature = "http3")]
+    pub fn http3_enable_connect_protocol(mut self, enabled: bool) -> Self {
+        self.config.http3.enable_connect_protocol = enabled;
+        self
+    }
+
+    /// Set HTTP/3 maximum UDP payload size
+    #[cfg(feature = "http3")]
+    pub fn http3_max_udp_payload_size(mut self, size: u16) -> Self {
+        self.config.http3.max_udp_payload_size = size;
+        self
+    }
+
+    // ========================================================================
+    // io_uring Configuration Methods
+    // ========================================================================
+
+    /// Set io_uring registered buffer count and size
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    pub fn io_uring_buffers(mut self, count: usize, size: usize) -> Self {
+        self.config.io_uring.registered_buffer_count = count;
+        self.config.io_uring.registered_buffer_size = size;
+        self
+    }
+
+    /// Enable or disable io_uring SQPOLL mode
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    pub fn io_uring_sqpoll(mut self, enabled: bool) -> Self {
+        self.config.io_uring.sqpoll = enabled;
+        self
+    }
+
+    /// Set io_uring submission queue entries
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    pub fn io_uring_sq_entries(mut self, entries: u32) -> Self {
+        self.config.io_uring.sq_entries = entries;
+        self
+    }
+
     /// Build the configuration
     pub fn build(self) -> Config {
         self.config
@@ -265,9 +483,9 @@ impl Default for ConfigBuilder {
 
 /// Prelude module for convenient imports
 pub mod prelude {
-    pub use crate::Config;
     pub use crate::error::{Error, Result};
     pub use crate::frame::{Frame, OpCode};
     pub use crate::protocol::{Message, Role};
     pub use crate::stream::WebSocketStream;
+    pub use crate::Config;
 }

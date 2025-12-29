@@ -1,7 +1,7 @@
 [package]
 name = "sockudo-ws"
 version = "1.0.0"
-edition = "2024"
+edition = "2021"
 authors = ["HFT WebSocket Library"]
 description = "Ultra-low latency WebSocket library for HFT applications"
 license = "MIT"
@@ -27,6 +27,21 @@ neon = ["simd"]
 tokio-runtime = ["tokio", "tokio-util"]
 axum-integration = ["axum", "tokio-runtime"]
 permessage-deflate = ["flate2"]
+
+# HTTP/2 WebSocket support (RFC 8441)
+http2 = ["h2", "http", "tokio-runtime"]
+
+# HTTP/3 WebSocket support (RFC 9220)
+http3 = ["quinn", "h3", "h3-quinn", "http", "rustls", "tokio-runtime"]
+
+# io_uring support (Linux only)
+io-uring = ["tokio-uring"]
+
+# All transport features
+all-transports = ["http2", "http3", "io-uring"]
+
+# Full feature set
+full = ["simd", "tokio-runtime", "axum-integration", "permessage-deflate", "all-transports"]
 
 [dependencies]
 # Tokio async runtime
@@ -64,6 +79,19 @@ flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"], op
 # Socket options (SO_REUSEPORT, TCP_NODELAY)
 socket2 = { version = "0.5", features = ["all"] }
 
+# HTTP/2 support (RFC 8441)
+h2 = { version = "0.4", optional = true }
+http = { version = "1.0", optional = true }
+
+# HTTP/3 support (RFC 9220)
+quinn = { version = "0.11", optional = true }
+h3 = { version = "0.0.8", optional = true }
+h3-quinn = { version = "0.0.10", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+
+# io_uring support (Linux only)
+tokio-uring = { version = "0.5", optional = true }
+
 [dev-dependencies]
 criterion = "0.5"
 rand = "0.9"
@@ -73,6 +101,16 @@ futures-util = "0.3"
 axum = "0.8"
 hyper = { version = "1.0", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+rcgen = "0.13"
+rustls-pemfile = "2.0"
+
+[[example]]
+name = "http2_echo"
+required-features = ["http2"]
+
+[[example]]
+name = "http3_echo"
+required-features = ["http3"]
 
 [[bench]]
 name = "websocket_bench"
