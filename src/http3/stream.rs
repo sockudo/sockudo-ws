@@ -1,21 +1,25 @@
 //! HTTP/3 stream wrapper implementing AsyncRead + AsyncWrite
 //!
 //! This module provides `H3Stream`, a wrapper around QUIC bidirectional streams
-//! that implements tokio's `AsyncRead` and `AsyncWrite` traits.
+//! that implements tokio's `AsyncRead` and `AsyncWrite` traits for use with
+//! `WebSocketStream`.
 
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pin_project! {
-    /// A wrapper around HTTP/3 bidirectional streams that implements AsyncRead + AsyncWrite
+    /// A wrapper around HTTP/3/QUIC streams that implements AsyncRead + AsyncWrite
     ///
     /// This allows QUIC streams to be used with `WebSocketStream<H3Stream>`,
     /// providing the same API as TCP-based or HTTP/2-based WebSocket connections.
+    ///
+    /// After the HTTP/3 Extended CONNECT handshake completes with a 200 OK,
+    /// the stream transitions to raw WebSocket frame mode using this wrapper.
     ///
     /// # Example
     ///
@@ -37,6 +41,7 @@ pin_project! {
         send: quinn::SendStream,
         recv: quinn::RecvStream,
         recv_buf: BytesMut,
+        pending_bytes: Option<Bytes>,
         recv_finished: bool,
     }
 }
@@ -48,11 +53,12 @@ impl H3Stream {
             send,
             recv,
             recv_buf: BytesMut::with_capacity(64 * 1024),
+            pending_bytes: None,
             recv_finished: false,
         }
     }
 
-    /// Create from a bidirectional QUIC stream
+    /// Create from a bidirectional QUIC stream tuple
     pub fn from_bi(stream: (quinn::SendStream, quinn::RecvStream)) -> Self {
         Self::new(stream.0, stream.1)
     }
@@ -96,7 +102,17 @@ impl AsyncRead for H3Stream {
     ) -> Poll<io::Result<()>> {
         let this = self.project();
 
-        // First, try to satisfy from the internal buffer
+        // First, drain any pending bytes from h3 layer
+        if let Some(pending) = this.pending_bytes {
+            let to_copy = std::cmp::min(buf.remaining(), pending.len());
+            buf.put_slice(&pending.split_to(to_copy));
+            if pending.is_empty() {
+                *this.pending_bytes = None;
+            }
+            return Poll::Ready(Ok(()));
+        }
+
+        // Then try internal buffer
         if !this.recv_buf.is_empty() {
             let to_copy = std::cmp::min(buf.remaining(), this.recv_buf.len());
             buf.put_slice(&this.recv_buf.split_to(to_copy));
@@ -108,14 +124,9 @@ impl AsyncRead for H3Stream {
             return Poll::Ready(Ok(()));
         }
 
-        // Poll the QUIC RecvStream for more data using poll_read_buf
+        // Poll the QUIC RecvStream for more data
         match this.recv.poll_read_buf(cx, buf) {
-            Poll::Ready(Ok(())) => {
-                // If no bytes were read but buf had space, stream is finished
-                // poll_read_buf returns Ok(()) even when finished, we detect it
-                // by checking if it wrote any bytes
-                Poll::Ready(Ok(()))
-            }
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
             Poll::Ready(Err(e)) => {
                 if matches!(e, quinn::ReadError::Reset(_)) {
                     *this.recv_finished = true;
@@ -139,7 +150,6 @@ impl AsyncWrite for H3Stream {
 
         let this = self.project();
 
-        // Use quinn::SendStream::poll_write (requires Pin<&mut Self>)
         match this.send.poll_write(cx, buf) {
             Poll::Ready(Ok(n)) => Poll::Ready(Ok(n)),
             Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
@@ -148,16 +158,14 @@ impl AsyncWrite for H3Stream {
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // QUIC handles flow control and doesn't require explicit flushing
-        // in the same way as TCP. Data is sent as soon as possible.
+        // QUIC handles flow control internally and doesn't require explicit flushing
         Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.project();
 
-        // Finish the send stream (send FIN)
-        // In quinn 0.11, finish() is synchronous and returns Result<(), ClosedStream>
+        // Finish the send stream (send FIN per RFC 9220 Section 3)
         match this.send.get_mut().finish() {
             Ok(()) => Poll::Ready(Ok(())),
             Err(e) => Poll::Ready(Err(io::Error::other(e))),

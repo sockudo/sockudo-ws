@@ -18,6 +18,10 @@ use crate::CACHE_LINE_SIZE;
 ///
 /// Pre-allocates a pool of objects and recycles them without
 /// calling the system allocator in the hot path.
+///
+/// Uses generation counters to prevent use-after-free vulnerabilities.
+/// Each slot tracks its generation, and handles include the generation
+/// at allocation time. Access is only valid if generations match.
 #[repr(C, align(64))]
 pub struct SlabPool<T, const N: usize> {
     /// Free list head (index into slots, or N if empty)
@@ -25,26 +29,32 @@ pub struct SlabPool<T, const N: usize> {
     /// Number of allocated objects
     allocated: usize,
     /// Pre-allocated slots
-    slots: [UnsafeCell<SlabSlot<T>>; N],
+    slots: [SlabSlot<T>; N],
 }
 
-use std::mem::ManuallyDrop;
+struct SlabSlot<T> {
+    /// Generation counter - incremented on each free to invalidate old handles
+    generation: u32,
+    /// The slot data
+    data: UnsafeCell<SlabSlotData<T>>,
+}
 
-union SlabSlot<T> {
+union SlabSlotData<T> {
     /// When free: index of next free slot
     next_free: usize,
     /// When allocated: the actual value
-    value: ManuallyDrop<MaybeUninit<T>>,
+    value: std::mem::ManuallyDrop<MaybeUninit<T>>,
 }
 
 impl<T, const N: usize> SlabPool<T, N> {
     /// Create a new slab pool with all slots free
     pub fn new() -> Self {
         // Initialize free list: each slot points to the next
-        let slots: [UnsafeCell<SlabSlot<T>>; N] = std::array::from_fn(|i| {
-            UnsafeCell::new(SlabSlot {
+        let slots: [SlabSlot<T>; N] = std::array::from_fn(|i| SlabSlot {
+            generation: 0,
+            data: UnsafeCell::new(SlabSlotData {
                 next_free: if i + 1 < N { i + 1 } else { N },
-            })
+            }),
         });
 
         Self {
@@ -63,56 +73,129 @@ impl<T, const N: usize> SlabPool<T, N> {
         }
 
         let idx = self.free_head;
-        let slot = unsafe { &mut *self.slots[idx].get() };
+        let slot = &self.slots[idx];
 
-        // Update free list
-        self.free_head = unsafe { slot.next_free };
+        // SAFETY: We have &mut self, so exclusive access is guaranteed.
+        // The slot is currently free (in the free list), so next_free is the active union variant.
+        let next_free = unsafe { (*slot.data.get()).next_free };
+        self.free_head = next_free;
         self.allocated += 1;
 
         Some(SlabHandle {
             index: idx,
+            generation: slot.generation,
             _marker: PhantomData,
         })
     }
 
     /// Initialize an allocated slot with a value
+    ///
+    /// # Panics
+    /// Panics if the handle is invalid (wrong generation or out of bounds)
     #[inline]
     pub fn init(&mut self, handle: SlabHandle<T>, value: T) -> &mut T {
-        let slot = unsafe { &mut *self.slots[handle.index].get() };
+        self.validate_handle(&handle);
+        let slot = &self.slots[handle.index];
+
+        // SAFETY: We validated the handle and have &mut self.
+        // The slot is allocated (not in free list), so value is the active variant.
         unsafe {
-            (*slot.value).write(value);
-            (*slot.value).assume_init_mut()
+            let data = &mut *slot.data.get();
+            (*data.value).write(value);
+            (*data.value).assume_init_mut()
         }
     }
 
     /// Get a reference to an allocated object
+    ///
+    /// # Panics
+    /// Panics if the handle is invalid (wrong generation or out of bounds)
     #[inline]
     pub fn get(&self, handle: SlabHandle<T>) -> &T {
-        let slot = unsafe { &*self.slots[handle.index].get() };
-        unsafe { (*slot.value).assume_init_ref() }
+        self.validate_handle(&handle);
+        let slot = &self.slots[handle.index];
+
+        // SAFETY: We validated the handle. The slot is allocated and initialized,
+        // so value is the active union variant and has been initialized via init().
+        unsafe {
+            let data = &*slot.data.get();
+            (*data.value).assume_init_ref()
+        }
     }
 
     /// Get a mutable reference to an allocated object
+    ///
+    /// # Panics
+    /// Panics if the handle is invalid (wrong generation or out of bounds)
     #[inline]
     pub fn get_mut(&mut self, handle: SlabHandle<T>) -> &mut T {
-        let slot = unsafe { &mut *self.slots[handle.index].get() };
-        unsafe { (*slot.value).assume_init_mut() }
+        self.validate_handle(&handle);
+        let slot = &self.slots[handle.index];
+
+        // SAFETY: We validated the handle and have &mut self.
+        // The slot is allocated and initialized, so value is the active variant.
+        unsafe {
+            let data = &mut *slot.data.get();
+            (*data.value).assume_init_mut()
+        }
     }
 
     /// Free an object back to the pool
+    ///
+    /// # Panics
+    /// Panics if the handle is invalid (wrong generation or out of bounds)
     #[inline]
     pub fn free(&mut self, handle: SlabHandle<T>) {
-        let slot = unsafe { &mut *self.slots[handle.index].get() };
+        self.validate_handle(&handle);
+        let slot = &mut self.slots[handle.index];
 
-        // Drop the value
+        // SAFETY: We validated the handle and have &mut self.
+        // The slot is allocated, so value is the active variant.
         unsafe {
-            std::ptr::drop_in_place((*slot.value).assume_init_mut());
+            let data = &mut *slot.data.get();
+            std::ptr::drop_in_place((*data.value).assume_init_mut());
         }
 
-        // Add to free list
-        slot.next_free = self.free_head;
+        // Increment generation to invalidate any remaining handles to this slot
+        slot.generation = slot.generation.wrapping_add(1);
+
+        // SAFETY: We're switching the union to next_free variant after dropping value
+        unsafe {
+            (*slot.data.get()).next_free = self.free_head;
+        }
         self.free_head = handle.index;
         self.allocated -= 1;
+    }
+
+    /// Validate that a handle is still valid (correct generation)
+    #[inline]
+    fn validate_handle(&self, handle: &SlabHandle<T>) {
+        assert!(
+            handle.index < N,
+            "SlabHandle index {} out of bounds (pool size {})",
+            handle.index,
+            N
+        );
+        assert!(
+            self.slots[handle.index].generation == handle.generation,
+            "SlabHandle has stale generation {} (current: {}), slot was freed and reallocated",
+            handle.generation,
+            self.slots[handle.index].generation
+        );
+    }
+
+    /// Try to get a reference, returning None if handle is invalid
+    /// This is the non-panicking version for cases where you want to check validity
+    #[inline]
+    pub fn try_get(&self, handle: SlabHandle<T>) -> Option<&T> {
+        if handle.index >= N || self.slots[handle.index].generation != handle.generation {
+            return None;
+        }
+        // SAFETY: We just validated the handle
+        unsafe {
+            let data = &*self.slots[handle.index].data.get();
+            Some((*data.value).assume_init_ref())
+        }
     }
 
     /// Get number of allocated objects
@@ -135,17 +218,37 @@ impl<T, const N: usize> Default for SlabPool<T, N> {
 }
 
 /// Handle to an allocated slab object
+///
+/// Includes a generation counter to detect use-after-free attempts.
+/// If the slot has been freed and potentially reallocated, the generation
+/// will not match and access will panic.
 #[derive(Clone, Copy)]
 pub struct SlabHandle<T> {
     index: usize,
+    generation: u32,
     _marker: PhantomData<T>,
 }
 
 impl<T> SlabHandle<T> {
-    /// Get the raw index
+    /// Get the raw index (for debugging purposes)
     #[inline]
     pub fn index(&self) -> usize {
         self.index
+    }
+
+    /// Get the generation (for debugging purposes)
+    #[inline]
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+}
+
+impl<T> std::fmt::Debug for SlabHandle<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlabHandle")
+            .field("index", &self.index)
+            .field("generation", &self.generation)
+            .finish()
     }
 }
 
@@ -163,21 +266,25 @@ pub struct Arena {
     start: NonNull<u8>,
     /// Size of current chunk
     chunk_size: usize,
-    /// List of additional chunks
-    chunks: Vec<NonNull<u8>>,
+    /// List of additional chunks (stores both pointer and size)
+    chunks: Vec<(NonNull<u8>, usize)>,
 }
 
 impl Arena {
     /// Create a new arena with the specified initial capacity
     pub fn new(capacity: usize) -> Self {
         let layout = Layout::from_size_align(capacity, CACHE_LINE_SIZE).unwrap();
+
+        // SAFETY: We're allocating with a valid layout. The pointer is checked for null.
         let ptr = unsafe { alloc(layout) };
 
         if ptr.is_null() {
             panic!("Arena allocation failed");
         }
 
+        // SAFETY: We just verified ptr is not null
         let ptr = unsafe { NonNull::new_unchecked(ptr) };
+        // SAFETY: Adding capacity to the base pointer stays within the allocated region
         let end = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(capacity)) };
 
         Self {
@@ -197,7 +304,9 @@ impl Arena {
         let new_ptr = aligned + size;
 
         if new_ptr <= self.end.as_ptr() as usize {
+            // SAFETY: aligned is within our allocated region and properly aligned
             let result = unsafe { NonNull::new_unchecked(aligned as *mut u8) };
+            // SAFETY: new_ptr is within or at end of our allocated region
             self.ptr = unsafe { NonNull::new_unchecked(new_ptr as *mut u8) };
             Some(result)
         } else {
@@ -217,6 +326,7 @@ impl Arena {
     #[inline]
     pub fn alloc_with<T>(&mut self, value: T) -> Option<&mut T> {
         let ptr = self.alloc::<T>()?;
+        // SAFETY: ptr points to valid, aligned, uninitialized memory for T
         unsafe {
             std::ptr::write(ptr.as_ptr(), value);
             Some(&mut *ptr.as_ptr())
@@ -227,6 +337,7 @@ impl Arena {
     #[inline]
     pub fn alloc_slice<T>(&mut self, len: usize) -> Option<&mut [MaybeUninit<T>]> {
         let ptr = self.alloc_bytes(size_of::<T>() * len, align_of::<T>())?;
+        // SAFETY: ptr is properly aligned for T and has enough space for len elements
         Some(unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr() as *mut MaybeUninit<T>, len) })
     }
 
@@ -234,6 +345,7 @@ impl Arena {
     #[inline]
     pub fn alloc_slice_copy<T: Copy>(&mut self, slice: &[T]) -> Option<&mut [T]> {
         let ptr = self.alloc_bytes(std::mem::size_of_val(slice), align_of::<T>())?;
+        // SAFETY: ptr is properly aligned and sized for the slice
         let dest = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr() as *mut T, slice.len()) };
         dest.copy_from_slice(slice);
         Some(dest)
@@ -245,25 +357,29 @@ impl Arena {
         let new_size = self.chunk_size.max(size + align).next_power_of_two();
         let layout = Layout::from_size_align(new_size, CACHE_LINE_SIZE).unwrap();
 
+        // SAFETY: Allocating with valid layout
         let ptr = unsafe { alloc(layout) };
         if ptr.is_null() {
             return None;
         }
 
-        // Save old chunk
-        self.chunks.push(self.start);
+        // Save old chunk with its size for proper deallocation
+        self.chunks.push((self.start, self.chunk_size));
 
-        // Set up new chunk
+        // SAFETY: ptr is non-null (checked above)
         let ptr = unsafe { NonNull::new_unchecked(ptr) };
         self.start = ptr;
+        // SAFETY: Adding new_size stays within the allocation
         self.end = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(new_size)) };
         self.chunk_size = new_size;
 
         // Allocate from new chunk
         let aligned = (ptr.as_ptr() as usize + align - 1) & !(align - 1);
         let new_ptr = aligned + size;
+        // SAFETY: new_ptr is within the new chunk
         self.ptr = unsafe { NonNull::new_unchecked(new_ptr as *mut u8) };
 
+        // SAFETY: aligned is within the new chunk and properly aligned
         Some(unsafe { NonNull::new_unchecked(aligned as *mut u8) })
     }
 
@@ -276,10 +392,11 @@ impl Arena {
 
     /// Clear the arena and free all extra chunks
     pub fn clear(&mut self) {
-        // Free extra chunks
-        for chunk in self.chunks.drain(..) {
+        // Free extra chunks using their stored sizes
+        for (chunk, size) in self.chunks.drain(..) {
+            // SAFETY: Each chunk was allocated with this layout
             unsafe {
-                let layout = Layout::from_size_align(self.chunk_size, CACHE_LINE_SIZE).unwrap();
+                let layout = Layout::from_size_align(size, CACHE_LINE_SIZE).unwrap();
                 dealloc(chunk.as_ptr(), layout);
             }
         }
@@ -303,21 +420,25 @@ impl Arena {
 impl Drop for Arena {
     fn drop(&mut self) {
         // Free current chunk
+        // SAFETY: start was allocated with chunk_size and CACHE_LINE_SIZE alignment
         let layout = Layout::from_size_align(self.chunk_size, CACHE_LINE_SIZE).unwrap();
         unsafe {
             dealloc(self.start.as_ptr(), layout);
         }
 
-        // Free all extra chunks
-        for chunk in &self.chunks {
+        // Free all extra chunks using their stored sizes
+        for (chunk, size) in &self.chunks {
+            // SAFETY: Each chunk was allocated with its corresponding size
             unsafe {
+                let layout = Layout::from_size_align(*size, CACHE_LINE_SIZE).unwrap();
                 dealloc(chunk.as_ptr(), layout);
             }
         }
     }
 }
 
-// SAFETY: Arena is not Sync (single-threaded use only)
+// SAFETY: Arena manages its own memory and can be sent between threads.
+// It is not Sync because concurrent access to the bump pointer would be unsafe.
 unsafe impl Send for Arena {}
 
 /// Buffer pool for reusing I/O buffers
@@ -394,6 +515,36 @@ mod tests {
         let h3 = pool.alloc().unwrap();
         pool.init(h3, 30);
         assert_eq!(*pool.get(h3), 30);
+    }
+
+    #[test]
+    #[should_panic(expected = "stale generation")]
+    fn test_slab_pool_use_after_free_panics() {
+        let mut pool: SlabPool<i32, 4> = SlabPool::new();
+
+        let h1 = pool.alloc().unwrap();
+        pool.init(h1, 10);
+
+        // Free the slot
+        pool.free(h1);
+
+        // This should panic - using a freed handle
+        let _ = pool.get(h1);
+    }
+
+    #[test]
+    fn test_slab_pool_try_get() {
+        let mut pool: SlabPool<i32, 4> = SlabPool::new();
+
+        let h1 = pool.alloc().unwrap();
+        pool.init(h1, 10);
+
+        assert_eq!(pool.try_get(h1), Some(&10));
+
+        pool.free(h1);
+
+        // try_get returns None for freed handles instead of panicking
+        assert_eq!(pool.try_get(h1), None);
     }
 
     #[test]

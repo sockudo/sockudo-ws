@@ -97,6 +97,7 @@ criterion = "0.5"
 rand = "0.9"
 tokio = { version = "1.42", features = ["full"] }
 tokio-tungstenite = "0.26"
+tokio-websockets = { version = "0.10", features = ["client", "server", "sha1_smol", "fastrand"] }
 futures-util = "0.3"
 axum = "0.8"
 hyper = { version = "1.0", features = ["full"] }
@@ -114,6 +115,10 @@ required-features = ["http3"]
 
 [[bench]]
 name = "websocket_bench"
+harness = false
+
+[[bench]]
+name = "comparison_bench"
 harness = false
 
 [profile.release]

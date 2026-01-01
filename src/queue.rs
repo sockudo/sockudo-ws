@@ -53,18 +53,33 @@ impl CacheAlignedAtomic {
 ///
 /// Optimized for the common case of one event loop thread producing
 /// and one worker thread consuming.
+///
+/// # Safety Model
+///
+/// This queue uses UnsafeCell for interior mutability of the buffer slots.
+/// The safety invariants are:
+///
+/// 1. Only the producer writes to slots (after claiming via head CAS)
+/// 2. Only the consumer reads from slots (after claiming via tail CAS)
+/// 3. Acquire/Release ordering ensures visibility:
+///    - Producer: Release on head store publishes the write
+///    - Consumer: Acquire on head load sees the published write
+/// 4. The head/tail indices ensure a slot is never accessed by both sides simultaneously
 #[repr(C, align(64))]
 pub struct SpscQueue<T, const N: usize> {
     /// Write position (only modified by producer)
     head: CacheAlignedAtomic,
     /// Read position (only modified by consumer)
     tail: CacheAlignedAtomic,
-    /// Ring buffer storage
+    /// Ring buffer storage - UnsafeCell allows mutation through &self
+    /// which is required for lock-free producer/consumer access
     buffer: [UnsafeCell<MaybeUninit<T>>; N],
 }
 
-// SAFETY: SpscQueue is designed for single producer / single consumer
-// The buffer is only accessed through atomic head/tail with proper ordering
+// SAFETY: SpscQueue is designed for single producer / single consumer.
+// - T: Send is required because values of T are moved between threads
+// - The producer and consumer operate on disjoint slots at any given time
+// - Atomic operations with proper ordering ensure memory visibility
 unsafe impl<T: Send, const N: usize> Send for SpscQueue<T, N> {}
 unsafe impl<T: Send, const N: usize> Sync for SpscQueue<T, N> {}
 
@@ -78,7 +93,8 @@ impl<T, const N: usize> SpscQueue<T, N> {
         Self {
             head: CacheAlignedAtomic::new(0),
             tail: CacheAlignedAtomic::new(0),
-            // SAFETY: MaybeUninit doesn't require initialization
+            // SAFETY: An array of MaybeUninit doesn't require initialization.
+            // MaybeUninit<T> has no validity requirements for its contents.
             buffer: unsafe { MaybeUninit::uninit().assume_init() },
         }
     }
@@ -91,6 +107,9 @@ impl<T, const N: usize> SpscQueue<T, N> {
 
     /// Try to push an item (producer only)
     /// Returns Err(item) if queue is full
+    ///
+    /// # Safety Contract
+    /// This method must only be called from a single producer thread.
     #[inline]
     pub fn try_push(&self, item: T) -> std::result::Result<(), T> {
         let head = self.head.load(Ordering::Relaxed);
@@ -101,13 +120,18 @@ impl<T, const N: usize> SpscQueue<T, N> {
             return Err(item);
         }
 
-        // Write item
+        // SAFETY: We have exclusive access to this slot because:
+        // 1. head > tail means the slot at head index is not being read by consumer
+        // 2. We haven't published head+1 yet, so consumer can't access this slot
+        // 3. Only one producer exists (SPSC invariant)
+        // The UnsafeCell allows us to get a mutable pointer through &self.
         unsafe {
-            let slot = &*self.buffer[head & Self::mask()].get();
-            std::ptr::write(slot.as_ptr() as *mut T, item);
+            let slot = self.buffer[head & Self::mask()].get();
+            std::ptr::write((*slot).as_mut_ptr(), item);
         }
 
-        // Publish the write
+        // Publish the write with Release ordering
+        // This ensures the write above is visible before the head update
         self.head.store(head.wrapping_add(1), Ordering::Release);
 
         Ok(())
@@ -115,6 +139,9 @@ impl<T, const N: usize> SpscQueue<T, N> {
 
     /// Try to pop an item (consumer only)
     /// Returns None if queue is empty
+    ///
+    /// # Safety Contract
+    /// This method must only be called from a single consumer thread.
     #[inline]
     pub fn try_pop(&self) -> Option<T> {
         let tail = self.tail.load(Ordering::Relaxed);
@@ -125,13 +152,18 @@ impl<T, const N: usize> SpscQueue<T, N> {
             return None;
         }
 
-        // Read item
+        // SAFETY: We have exclusive access to this slot because:
+        // 1. tail < head means the producer has finished writing to this slot
+        // 2. Acquire ordering on head load synchronizes with producer's Release store
+        // 3. Only one consumer exists (SPSC invariant)
+        // 4. We haven't published tail+1 yet, so producer can't reuse this slot
         let item = unsafe {
-            let slot = &*self.buffer[tail & Self::mask()].get();
-            std::ptr::read(slot.as_ptr())
+            let slot = self.buffer[tail & Self::mask()].get();
+            std::ptr::read((*slot).as_ptr())
         };
 
-        // Publish the read
+        // Publish the read with Release ordering
+        // This ensures the read above completes before making the slot available
         self.tail.store(tail.wrapping_add(1), Ordering::Release);
 
         Some(item)
@@ -168,7 +200,8 @@ impl<T, const N: usize> Default for SpscQueue<T, N> {
 
 impl<T, const N: usize> Drop for SpscQueue<T, N> {
     fn drop(&mut self) {
-        // Drop any remaining items
+        // SAFETY: We have &mut self, so no concurrent access is possible.
+        // We need to drop any items remaining in the queue.
         while self.try_pop().is_some() {}
     }
 }
@@ -177,18 +210,30 @@ impl<T, const N: usize> Drop for SpscQueue<T, N> {
 ///
 /// Uses a bounded ring buffer with compare-and-swap for thread safety.
 /// Optimized for low contention scenarios.
+///
+/// # Safety Model
+///
+/// This queue uses sequence numbers per slot to coordinate access:
+/// 1. Each slot has a sequence number that tracks its state
+/// 2. Producers CAS the head to claim a slot, then write, then update sequence
+/// 3. Consumers CAS the tail to claim a slot, then read, then update sequence
+/// 4. The sequence number prevents ABA problems and ensures proper synchronization
 #[repr(C, align(64))]
 pub struct MpmcQueue<T, const N: usize> {
     /// Write position
     head: CacheAlignedAtomic,
     /// Read position
     tail: CacheAlignedAtomic,
-    /// Sequence numbers for each slot (for ABA prevention)
+    /// Sequence numbers for each slot (for ABA prevention and synchronization)
     sequences: [AtomicUsize; N],
     /// Ring buffer storage
     buffer: [UnsafeCell<MaybeUninit<T>>; N],
 }
 
+// SAFETY: MpmcQueue is designed for multiple producers and consumers.
+// - T: Send is required because values cross thread boundaries
+// - CAS operations on head/tail serialize slot access
+// - Sequence numbers with acquire/release ordering ensure visibility
 unsafe impl<T: Send, const N: usize> Send for MpmcQueue<T, N> {}
 unsafe impl<T: Send, const N: usize> Sync for MpmcQueue<T, N> {}
 
@@ -207,6 +252,7 @@ impl<T, const N: usize> MpmcQueue<T, N> {
             head: CacheAlignedAtomic::new(0),
             tail: CacheAlignedAtomic::new(0),
             sequences,
+            // SAFETY: MaybeUninit doesn't require initialization
             buffer: unsafe { MaybeUninit::uninit().assume_init() },
         }
     }
@@ -228,7 +274,7 @@ impl<T, const N: usize> MpmcQueue<T, N> {
             let diff = seq as isize - head as isize;
 
             if diff == 0 {
-                // Slot is available for writing
+                // Slot is available for writing - try to claim it
                 match self.head.compare_exchange(
                     head,
                     head.wrapping_add(1),
@@ -236,22 +282,24 @@ impl<T, const N: usize> MpmcQueue<T, N> {
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => {
-                        // Write the item
+                        // SAFETY: We successfully claimed this slot via CAS.
+                        // No other producer can write here until we update the sequence.
+                        // No consumer can read here because sequence == head, not head+1.
                         unsafe {
-                            let slot = &*self.buffer[idx].get();
-                            std::ptr::write(slot.as_ptr() as *mut T, item);
+                            let slot = self.buffer[idx].get();
+                            std::ptr::write((*slot).as_mut_ptr(), item);
                         }
-                        // Update sequence to signal completion
+                        // Signal completion - consumers waiting for seq == head+1 will proceed
                         self.sequences[idx].store(head.wrapping_add(1), Ordering::Release);
                         return Ok(());
                     }
-                    Err(h) => head = h, // Retry with new head
+                    Err(h) => head = h, // Another producer won, retry with new head
                 }
             } else if diff < 0 {
-                // Queue is full
+                // Queue is full (sequence hasn't caught up)
                 return Err(item);
             } else {
-                // Another producer is writing, reload head
+                // diff > 0: Another producer is writing to this slot, reload head
                 head = self.head.load(Ordering::Relaxed);
             }
         }
@@ -269,7 +317,7 @@ impl<T, const N: usize> MpmcQueue<T, N> {
             let diff = seq as isize - (tail.wrapping_add(1)) as isize;
 
             if diff == 0 {
-                // Slot has data ready
+                // Slot has data ready - try to claim it
                 match self.tail.compare_exchange(
                     tail,
                     tail.wrapping_add(1),
@@ -277,22 +325,26 @@ impl<T, const N: usize> MpmcQueue<T, N> {
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => {
-                        // Read the item
+                        // SAFETY: We successfully claimed this slot via CAS.
+                        // No other consumer can read here.
+                        // The producer has finished (sequence == tail+1).
+                        // Acquire on sequence load synchronized with producer's Release.
                         let item = unsafe {
-                            let slot = &*self.buffer[idx].get();
-                            std::ptr::read(slot.as_ptr())
+                            let slot = self.buffer[idx].get();
+                            std::ptr::read((*slot).as_ptr())
                         };
-                        // Update sequence for next round
+                        // Make slot available for producers in the next round
+                        // sequence = tail + N means producers looking at head = tail + N can use it
                         self.sequences[idx].store(tail.wrapping_add(N), Ordering::Release);
                         return Some(item);
                     }
-                    Err(t) => tail = t, // Retry with new tail
+                    Err(t) => tail = t, // Another consumer won, retry with new tail
                 }
             } else if diff < 0 {
-                // Queue is empty
+                // Queue is empty (no data at this position yet)
                 return None;
             } else {
-                // Another consumer is reading, reload tail
+                // diff > 0: Another consumer is reading from this slot, reload tail
                 tail = self.tail.load(Ordering::Relaxed);
             }
         }
@@ -323,6 +375,7 @@ impl<T, const N: usize> Default for MpmcQueue<T, N> {
 
 impl<T, const N: usize> Drop for MpmcQueue<T, N> {
     fn drop(&mut self) {
+        // SAFETY: We have &mut self, so no concurrent access.
         while self.try_pop().is_some() {}
     }
 }
@@ -373,5 +426,34 @@ mod tests {
         assert_eq!(queue.try_pop(), Some(1));
         assert_eq!(queue.try_pop(), Some(2));
         assert_eq!(queue.try_pop(), None);
+    }
+
+    #[test]
+    fn test_spsc_wraparound() {
+        let queue: SpscQueue<i32, 4> = SpscQueue::new();
+
+        // Fill and drain multiple times to test wraparound
+        for round in 0..10 {
+            for i in 0..4 {
+                queue.try_push(round * 4 + i).unwrap();
+            }
+            for i in 0..4 {
+                assert_eq!(queue.try_pop(), Some(round * 4 + i));
+            }
+        }
+    }
+
+    #[test]
+    fn test_mpmc_wraparound() {
+        let queue: MpmcQueue<i32, 4> = MpmcQueue::new();
+
+        for round in 0..10 {
+            for i in 0..4 {
+                queue.try_push(round * 4 + i).unwrap();
+            }
+            for i in 0..4 {
+                assert_eq!(queue.try_pop(), Some(round * 4 + i));
+            }
+        }
     }
 }

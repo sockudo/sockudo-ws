@@ -1,0 +1,42 @@
+   Compiling sockudo-ws v1.2.0 (/home/radud/Desktop/Code/Rust/sockudo-ws)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 7.68s
+     Running benches/comparison_bench.rs (target/release/deps/comparison_bench-62423810171e86a2)
+Gnuplot not found, using plotters backend
+Benchmarking masking_comparison/sockudo_ws/64
+Benchmarking masking_comparison/sockudo_ws/64: Warming up for 3.0000 s
+Benchmarking masking_comparison/sockudo_ws/64: Collecting 100 samples in estimated 5.0000 s (1.2B iterations)
+Benchmarking masking_comparison/sockudo_ws/64: Analyzing
+masking_comparison/sockudo_ws/64
+                        time:   [4.2426 ns 4.2455 ns 4.2489 ns]
+                        thrpt:  [14.028 GiB/s 14.040 GiB/s 14.049 GiB/s]
+Found 8 outliers among 100 measurements (8.00%)
+  4 (4.00%) low mild
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+Benchmarking masking_comparison/standard_xor/64
+Benchmarking masking_comparison/standard_xor/64: Warming up for 3.0000 s
+Benchmarking masking_comparison/standard_xor/64: Collecting 100 samples in estimated 5.0000 s (548M iterations)
+Benchmarking masking_comparison/standard_xor/64: Analyzing
+masking_comparison/standard_xor/64
+                        time:   [9.1199 ns 9.1258 ns 9.1325 ns]
+                        thrpt:  [6.5267 GiB/s 6.5315 GiB/s 6.5357 GiB/s]
+Found 4 outliers among 100 measurements (4.00%)
+  4 (4.00%) high mild
+Benchmarking masking_comparison/sockudo_ws/256
+Benchmarking masking_comparison/sockudo_ws/256: Warming up for 3.0000 s
+Benchmarking masking_comparison/sockudo_ws/256: Collecting 100 samples in estimated 5.0000 s (1.8B iterations)
+Benchmarking masking_comparison/sockudo_ws/256: Analyzing
+masking_comparison/sockudo_ws/256
+                        time:   [2.6972 ns 2.7000 ns 2.7029 ns]
+                        thrpt:  [88.207 GiB/s 88.304 GiB/s 88.396 GiB/s]
+Benchmarking masking_comparison/standard_xor/256
+Benchmarking masking_comparison/standard_xor/256: Warming up for 3.0000 s
+Benchmarking masking_comparison/standard_xor/256: Collecting 100 samples in estimated 5.0000 s (137M iterations)
+Benchmarking masking_comparison/standard_xor/256: Analyzing
+masking_comparison/standard_xor/256
+                        time:   [36.540 ns 36.549 ns 36.558 ns]
+                        thrpt:  [6.5216 GiB/s 6.5233 GiB/s 6.5249 GiB/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking masking_comparison/sockudo_ws/1024
+Benchmarking masking_comparison/sockudo_ws/1024: Warming up for 3.0000 s

@@ -3,6 +3,16 @@
 //! This module provides WebSocket bootstrapping over HTTP/3 using QUIC,
 //! implementing the Extended CONNECT Protocol defined in RFC 9220.
 //!
+//! # RFC 9220 Compliance
+//!
+//! This implementation follows RFC 9220 "Bootstrapping WebSockets with HTTP/3":
+//!
+//! - **SETTINGS_ENABLE_CONNECT_PROTOCOL (0x08)**: Server advertises support
+//! - **Extended CONNECT**: Client sends `:method=CONNECT` with `:protocol=websocket`
+//! - **200 OK response**: Server accepts and transitions to WebSocket mode
+//! - **501 Not Implemented**: Server rejects unsupported `:protocol` values
+//! - **Stream closure**: FIN maps to orderly close, RST to H3_REQUEST_CANCELLED
+//!
 //! # Architecture
 //!
 //! ```text
@@ -12,6 +22,7 @@
 //! ├─────────────────────────────────────────┤
 //! │              HTTP/3 Layer                │
 //! │    Extended CONNECT (:protocol=websocket)│
+//! │         SETTINGS_ENABLE_CONNECT_PROTOCOL │
 //! ├─────────────────────────────────────────┤
 //! │              QUIC Transport              │
 //! │    (multiplexed streams over UDP)        │
@@ -101,11 +112,24 @@ mod server;
 mod stream;
 
 pub use client::H3WebSocketClient;
-pub use handshake::{H3HandshakeRequest, build_h3_response};
+pub use handshake::{H3HandshakeRequest, build_h3_error_response, build_h3_response};
 pub use server::H3WebSocketServer;
 pub use stream::H3Stream;
 
-/// HTTP/3 SETTINGS_ENABLE_CONNECT_PROTOCOL parameter (RFC 9220)
+/// HTTP/3 SETTINGS_ENABLE_CONNECT_PROTOCOL parameter (RFC 9220, Section 5)
 ///
-/// Same value as HTTP/2 (0x08), indicates support for Extended CONNECT.
+/// Value: 0x08 (same as HTTP/2 per RFC 8441)
+/// Default: 0 (disabled)
+///
+/// When set to 1, indicates the server supports Extended CONNECT
+/// with the `:protocol` pseudo-header for WebSocket bootstrapping.
 pub const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x08;
+
+/// The `:protocol` pseudo-header value for WebSocket (RFC 9220)
+pub const PROTOCOL_WEBSOCKET: &str = "websocket";
+
+/// H3_REQUEST_CANCELLED error code for stream reset (RFC 9114, Section 8.1)
+///
+/// Used when closing a WebSocket connection abnormally, analogous to
+/// TCP RST in RFC 6455.
+pub const H3_REQUEST_CANCELLED: u64 = 0x10c;

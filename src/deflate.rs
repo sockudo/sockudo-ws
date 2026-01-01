@@ -169,7 +169,9 @@ impl DeflateConfig {
 pub struct DeflateEncoder {
     compress: Compress,
     no_context_takeover: bool,
+    #[allow(dead_code)]
     window_bits: u8,
+    #[allow(dead_code)]
     compression_level: Compression,
     threshold: usize,
 }
@@ -231,16 +233,21 @@ impl DeflateEncoder {
             let before_out = self.compress.total_out();
             let before_in = self.compress.total_in();
 
-            // Get writable slice
+            // Get writable slice using spare_capacity_mut to avoid UB with uninitialized memory.
+            // We get the spare capacity, compress into it, then only set_len for bytes actually written.
             let out_start = output.len();
-            let out_capacity = output.capacity();
-            unsafe {
-                output.set_len(out_capacity);
-            }
+            let spare = output.spare_capacity_mut();
+
+            // SAFETY: We're creating a &mut [u8] from MaybeUninit<u8> slice.
+            // flate2's compress() will write to this buffer and tell us how many bytes were written.
+            // We only call set_len() for the bytes that were actually initialized by compress().
+            let spare_slice = unsafe {
+                std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len())
+            };
 
             let status = self
                 .compress
-                .compress(input, &mut output[out_start..], FlushCompress::Sync)
+                .compress(input, spare_slice, FlushCompress::Sync)
                 .map_err(|e| Error::Compression(format!("deflate error: {}", e)))?;
 
             let consumed = (self.compress.total_in() - before_in) as usize;
@@ -248,6 +255,8 @@ impl DeflateEncoder {
 
             total_in += consumed;
 
+            // SAFETY: compress() wrote exactly `produced` bytes to spare_slice.
+            // We're only extending the length by the number of bytes that were initialized.
             unsafe {
                 output.set_len(out_start + produced);
             }
@@ -285,6 +294,7 @@ impl DeflateEncoder {
 pub struct DeflateDecoder {
     decompress: Decompress,
     no_context_takeover: bool,
+    #[allow(dead_code)]
     window_bits: u8,
 }
 
@@ -347,20 +357,20 @@ impl DeflateDecoder {
             let before_out = self.decompress.total_out();
             let before_in = self.decompress.total_in();
 
-            // Get writable slice
+            // Get writable slice using spare_capacity_mut to avoid UB with uninitialized memory.
             let out_start = output.len();
-            let out_capacity = output.capacity();
-            unsafe {
-                output.set_len(out_capacity);
-            }
+            let spare = output.spare_capacity_mut();
+
+            // SAFETY: We're creating a &mut [u8] from MaybeUninit<u8> slice.
+            // flate2's decompress() will write to this buffer and tell us how many bytes were written.
+            // We only call set_len() for the bytes that were actually initialized by decompress().
+            let spare_slice = unsafe {
+                std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len())
+            };
 
             let status = self
                 .decompress
-                .decompress(
-                    &input[total_in..],
-                    &mut output[out_start..],
-                    FlushDecompress::Sync,
-                )
+                .decompress(&input[total_in..], spare_slice, FlushDecompress::Sync)
                 .map_err(|e| Error::Compression(format!("inflate error: {}", e)))?;
 
             let consumed = (self.decompress.total_in() - before_in) as usize;
@@ -368,6 +378,8 @@ impl DeflateDecoder {
 
             total_in += consumed;
 
+            // SAFETY: decompress() wrote exactly `produced` bytes to spare_slice.
+            // We're only extending the length by the number of bytes that were initialized.
             unsafe {
                 output.set_len(out_start + produced);
             }
