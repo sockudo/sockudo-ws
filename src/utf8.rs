@@ -2,16 +2,18 @@
 //!
 //! This module provides high-performance UTF-8 validation using:
 //! - `simdutf8` crate for x86_64 (SSE4.2, AVX2, AVX-512), aarch64 (NEON), arm (NEON), wasm32
-//! - Custom SIMD implementations for architectures not supported by simdutf8:
+//! - Custom SIMD implementations for architectures/instructions not supported by simdutf8:
+//!   - x86_64 SSE2 - for older CPUs without SSE4.2 (stable Rust)
 //!   - LoongArch64 (LSX/LASX) - requires nightly + `nightly` feature
 //!   - PowerPC/PowerPC64 (AltiVec) - requires nightly + `nightly` feature
 //!   - s390x (z13 vectors) - requires `nightly` feature
 //!
-//! The custom implementations use the Lemire lookup-table algorithm from simdjson.
+//! The custom implementations use ASCII fast-path detection with scalar validation fallback.
 //!
 //! # Performance
 //!
-//! - x86-64: Up to 23x faster than std on valid non-ASCII (via simdutf8)
+//! - x86-64 (SSE4.2+): Up to 23x faster than std on valid non-ASCII (via simdutf8)
+//! - x86-64 (SSE2 only): Significantly faster than std on ASCII-heavy input (custom SIMD)
 //! - aarch64: Up to 11x faster than std on valid non-ASCII (via simdutf8)
 //! - LoongArch64/PowerPC/s390x: Significantly faster than std (custom SIMD)
 //!
@@ -31,16 +33,21 @@
 /// Automatically selects the fastest available implementation for the platform.
 #[inline]
 pub fn validate_utf8(data: &[u8]) -> bool {
-    // For architectures supported by simdutf8, use it directly
+    // For x86_64/x86, try simdutf8 first (handles SSE4.2+, AVX2, AVX-512)
+    // If not available, fall back to custom SSE2 implementation
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    {
+        validate_utf8_x86(data)
+    }
+
+    // For aarch64, arm (NEON), and wasm32, use simdutf8
     #[cfg(any(
-        target_arch = "x86_64",
-        target_arch = "x86",
         target_arch = "aarch64",
         all(target_arch = "arm", target_feature = "neon"),
         target_arch = "wasm32",
     ))]
     {
-        simdutf8::basic::from_utf8(data).is_ok()
+        return simdutf8::basic::from_utf8(data).is_ok();
     }
 
     // For LoongArch64 with nightly, use custom SIMD implementation
@@ -81,6 +88,113 @@ pub fn validate_utf8(data: &[u8]) -> bool {
     {
         simdutf8::basic::from_utf8(data).is_ok()
     }
+}
+
+// ============================================================================
+// x86/x86_64 Implementation - SSE2/SSE4.2/AVX2/AVX-512 dispatch
+// ============================================================================
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+fn validate_utf8_x86(data: &[u8]) -> bool {
+    // Try simdutf8 first - it will use the best available instruction set
+    // (AVX-512, AVX2, or SSE4.2) if supported
+    // Note: simdutf8 does NOT support SSE2, only SSE4.2+
+
+    // Check if we have SSE4.2 or better (which simdutf8 supports)
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("sse4.2") {
+            // simdutf8 will handle SSE4.2, AVX2, or AVX-512 automatically
+            return simdutf8::basic::from_utf8(data).is_ok();
+        }
+    }
+
+    #[cfg(target_arch = "x86")]
+    {
+        if std::arch::is_x86_feature_detected!("sse4.2") {
+            return simdutf8::basic::from_utf8(data).is_ok();
+        }
+    }
+
+    // SSE4.2 not available, fall back to custom SSE2 implementation
+    // SSE2 is guaranteed on all x86_64 CPUs, and very common on x86
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SSE2 is guaranteed on x86_64
+        unsafe { validate_utf8_sse2(data) }
+    }
+
+    #[cfg(target_arch = "x86")]
+    {
+        if std::arch::is_x86_feature_detected!("sse2") {
+            unsafe { validate_utf8_sse2(data) }
+        } else {
+            // No SIMD available, use scalar fallback
+            validate_utf8_scalar(data)
+        }
+    }
+}
+
+// ============================================================================
+// x86/x86_64 SSE2 Implementation (Custom)
+// ============================================================================
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "sse2")]
+unsafe fn validate_utf8_sse2(data: &[u8]) -> bool {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let mut i = 0;
+    let len = data.len();
+
+    // For short inputs, use scalar validation
+    if len < 16 {
+        return validate_utf8_scalar(data);
+    }
+
+    // Process 16 bytes at a time with SSE2
+    while i + 16 <= len {
+        // SAFETY: We checked that i + 16 <= len, so this is in bounds
+        unsafe {
+            // Load 16 bytes
+            let chunk_ptr = data.as_ptr().add(i) as *const __m128i;
+            let chunk = _mm_loadu_si128(chunk_ptr);
+
+            // Check for ASCII fast path (all bytes < 0x80)
+            // Create a mask of 0x80 for each byte
+            let high_bit_mask = _mm_set1_epi8(0x80u8 as i8);
+
+            // Test if any byte has the high bit set
+            // _mm_movemask_epi8 creates a 16-bit mask from the high bit of each byte
+            let test = _mm_and_si128(chunk, high_bit_mask);
+            let mask = _mm_movemask_epi8(test);
+
+            if mask == 0 {
+                // Pure ASCII chunk - all bytes are valid UTF-8
+                i += 16;
+                continue;
+            }
+        }
+
+        // Non-ASCII detected - need full validation for this chunk
+        // Fall back to scalar validation for this chunk
+        let chunk_slice = &data[i..i + 16];
+        if !validate_utf8_scalar(chunk_slice) {
+            return false;
+        }
+
+        i += 16;
+    }
+
+    // Handle remaining bytes with scalar validation
+    if i < len {
+        return validate_utf8_scalar(&data[i..]);
+    }
+
+    true
 }
 
 // ============================================================================
@@ -595,6 +709,34 @@ mod tests {
                     len
                 );
             }
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    fn test_sse2_validation() {
+        // Test that exercises the SSE2 code path specifically
+        // This test directly calls the SSE2 implementation
+        unsafe {
+            // Test ASCII fast path (16 bytes)
+            let ascii_16 = b"Hello, World!!!!";
+            assert!(validate_utf8_sse2(ascii_16));
+
+            // Test longer ASCII to exercise SIMD loop
+            let long_ascii = "a".repeat(128);
+            assert!(validate_utf8_sse2(long_ascii.as_bytes()));
+
+            // Test mixed ASCII and UTF-8
+            let mixed = format!("{}日本語{}", "a".repeat(64), "b".repeat(64));
+            assert!(validate_utf8_sse2(mixed.as_bytes()));
+
+            // Test invalid UTF-8
+            assert!(!validate_utf8_sse2(&[0xFF, 0xFF]));
+            assert!(!validate_utf8_sse2(&[0xED, 0xA0, 0x80])); // Surrogate
+
+            // Test edge cases
+            assert!(validate_utf8_sse2(b"")); // Empty (< 16 bytes)
+            assert!(validate_utf8_sse2(b"short")); // < 16 bytes
         }
     }
 }

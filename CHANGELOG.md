@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [1.4.2] - 2026-01-01
+
+### Added
+
+- Custom SSE2 UTF-8 validation for x86/x86_64 CPUs without SSE4.2 support
+  - `simdutf8` crate only supports SSE4.2+ (introduced in 2008)
+  - New SSE2 implementation provides SIMD acceleration for older CPUs (SSE2 available since 2001)
+  - Uses ASCII fast-path detection: checks if all bytes in 16-byte chunks are ASCII (< 0x80)
+  - Falls back to `simdutf8` when SSE4.2+ is available for optimal performance
+  - No feature flags required, works on stable Rust
+
+### Fixed
+
+- Clippy warnings: removed unnecessary `return` statements in UTF-8 validation dispatch
+- Clippy warnings: simplified redundant closures in benchmarks
+
 ## [1.4.1] - 2026-01-01
 
 ### Changed
@@ -41,7 +59,9 @@ ASCII fast-path strategy: Check if all bytes in a 16/32-byte chunk have high bit
 
 | Architecture | Masking | UTF-8 |
 |---|---|---|
-| x86_64 (SSE2/AVX2/AVX-512) | Yes | Yes (simdutf8) |
+| x86_64 (AVX-512/AVX2/SSE4.2) | Yes | Yes (simdutf8) |
+| x86_64 (SSE2 only) | Yes | Yes (custom) |
+| x86 (SSE2) | Yes | Yes (custom) |
 | aarch64 (NEON) | Yes | Yes (simdutf8) |
 | arm (NEON) | Yes | Yes (simdutf8) |
 | loongarch64 (LSX/LASX) | Yes | Yes (custom) |

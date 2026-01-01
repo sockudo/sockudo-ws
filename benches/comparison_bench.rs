@@ -230,7 +230,7 @@ fn bench_handshake(c: &mut Criterion) {
     let mut group = c.benchmark_group("handshake");
 
     group.bench_function("sockudo_ws_generate_key", |b| {
-        b.iter(|| generate_key());
+        b.iter(generate_key);
     });
 
     group.bench_function("sockudo_ws_generate_accept_key", |b| {
