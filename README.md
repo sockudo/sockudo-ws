@@ -598,7 +598,7 @@ sockudo-ws uses SIMD acceleration for frame masking and UTF-8 validation:
 
 | Architecture | Instructions | Masking | UTF-8 | Stable | Nightly |
 |--------------|--------------|---------|-------|--------|---------|
-| x86_64 | SSE2 | ✅ | ❌ | ✅ | ✅ |
+| x86_64 | SSE2 | ✅ | ✅ | ✅ | ✅ |
 | x86_64 | SSE4.2 | ✅ | ✅ | ✅ | ✅ |
 | x86_64 | AVX2 | ✅ | ✅ | ✅ | ✅ |
 | x86_64 | AVX-512 | ✅ | ✅ | ✅ | ✅ |
