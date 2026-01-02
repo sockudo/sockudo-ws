@@ -51,6 +51,7 @@ use crate::error::{Error, Result};
 use crate::handshake::generate_accept_key;
 use crate::protocol::{Message, Role};
 use crate::stream::WebSocketStream;
+use crate::{SplitReader, SplitWriter};
 
 /// WebSocket upgrade extractor for Axum
 ///
