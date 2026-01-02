@@ -17,14 +17,13 @@
 //! # Server Example
 //!
 //! ```ignore
-//! use sockudo_ws::{Config, Message};
-//! use sockudo_ws::http2::H2WebSocketServer;
+//! use sockudo_ws::{WebSocketServer, Http2, Config, Message};
 //! use futures_util::StreamExt;
 //!
 //! #[tokio::main]
 //! async fn main() {
 //!     let listener = tokio::net::TcpListener::bind("127.0.0.1:8443").await.unwrap();
-//!     let server = H2WebSocketServer::new(Config::default());
+//!     let server = WebSocketServer::<Http2>::new(Config::default());
 //!
 //!     loop {
 //!         let (stream, _) = listener.accept().await.unwrap();
@@ -46,8 +45,7 @@
 //! # Client Example
 //!
 //! ```ignore
-//! use sockudo_ws::{Config, Message};
-//! use sockudo_ws::http2::H2WebSocketClient;
+//! use sockudo_ws::{WebSocketClient, Http2, Config, Message};
 //! use futures_util::SinkExt;
 //!
 //! #[tokio::main]
@@ -55,22 +53,27 @@
 //!     let stream = tokio::net::TcpStream::connect("server:443").await.unwrap();
 //!     let tls_stream = do_tls_handshake(stream).await;
 //!
-//!     let client = H2WebSocketClient::new(Config::default());
+//!     let client = WebSocketClient::<Http2>::new(Config::default());
 //!     let mut ws = client.connect(tls_stream, "wss://server/ws", None).await.unwrap();
 //!
 //!     ws.send(Message::Text("Hello over HTTP/2!".into())).await.unwrap();
 //! }
 //! ```
 
-mod client;
-mod handshake;
-mod server;
-mod stream;
+pub mod stream;
 
-pub use client::H2WebSocketClient;
-pub use handshake::{H2HandshakeRequest, H2HandshakeResponse, build_h2_response};
-pub use server::H2WebSocketServer;
-pub use stream::H2Stream;
+// Re-export stream type
+pub use stream::Http2Stream;
+
+// Re-export unified types with Http2 transport
+pub use crate::client::WebSocketClient;
+pub use crate::extended_connect::{
+    ExtendedConnectConfig, ExtendedConnectRequest, ExtendedConnectResponse,
+};
+pub use crate::extended_connect::{build_extended_connect_error, build_extended_connect_response};
+pub use crate::multiplex::MultiplexedConnection;
+pub use crate::server::WebSocketServer;
+pub use crate::transport::Http2;
 
 /// HTTP/2 SETTINGS_ENABLE_CONNECT_PROTOCOL parameter (RFC 8441)
 ///

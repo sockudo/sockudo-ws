@@ -7,10 +7,10 @@
 //!
 //! - **SIMD Acceleration**: AVX2/AVX-512/NEON for frame masking and UTF-8 validation
 //! - **Zero-Copy Parsing**: Direct buffer access without intermediate copies
-//! - **Custom Memory Pools**: No allocations in the hot path
 //! - **Write Batching (Corking)**: Minimizes syscalls via vectored I/O
 //! - **Cache-Line Alignment**: Prevents false sharing in concurrent scenarios
 //! - **Lock-Free Queues**: SPSC/MPMC for cross-task communication
+//! - **Optional mimalloc**: High-performance allocator for reduced latency
 //!
 //! ## Example with Axum
 //!
@@ -26,11 +26,33 @@
 //!
 //! let app = Router::new().route("/ws", get(ws_handler));
 //! ```
+//!
+//! ## HTTP/2 and HTTP/3 WebSocket Support
+//!
+//! ```ignore
+//! use sockudo_ws::{WebSocketServer, WebSocketClient, Http2, Http3, Config};
+//!
+//! // HTTP/2 server
+//! let server = WebSocketServer::<Http2>::new(Config::default());
+//! server.serve(tls_stream, |ws, req| async move {
+//!     // handle connection
+//! }).await?;
+//!
+//! // HTTP/3 server
+//! let server = WebSocketServer::<Http3>::bind(addr, tls_config, Config::default()).await?;
+//! server.serve(|ws, req| async move {
+//!     // handle connection
+//! }).await?;
+//! ```
 
 #![allow(dead_code)]
 #![allow(clippy::missing_safety_doc)]
 
-pub mod alloc;
+// Use mimalloc as the global allocator when the feature is enabled
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod cork;
 pub mod error;
 pub mod frame;
@@ -41,6 +63,18 @@ pub mod queue;
 pub mod simd;
 pub mod stream;
 pub mod utf8;
+
+// Transport and Extended CONNECT modules
+#[cfg(any(feature = "http2", feature = "http3"))]
+pub mod extended_connect;
+pub mod transport;
+
+pub mod server;
+
+pub mod client;
+
+#[cfg(any(feature = "http2", feature = "http3"))]
+pub mod multiplex;
 
 #[cfg(feature = "permessage-deflate")]
 pub mod deflate;
@@ -57,10 +91,33 @@ pub mod http3;
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 pub mod io_uring;
 
+// Core re-exports
 pub use error::{Error, Result};
 pub use frame::{Frame, OpCode};
+pub use handshake::HandshakeResult;
 pub use protocol::{Message, Role};
-pub use stream::{ReuniteError, SplitReader, SplitWriter, WebSocketStream, reunite};
+pub use stream::{ReuniteError, SplitReader, SplitWriter, Stream, WebSocketStream, reunite};
+
+// Transport re-exports
+pub use transport::{Http1, Http2, Http3, Transport};
+
+// Extended CONNECT re-exports (for HTTP/2 and HTTP/3)
+#[cfg(any(feature = "http2", feature = "http3"))]
+pub use extended_connect::{
+    ExtendedConnectConfig, ExtendedConnectRequest, ExtendedConnectResponse,
+};
+#[cfg(any(feature = "http2", feature = "http3"))]
+pub use extended_connect::{build_extended_connect_error, build_extended_connect_response};
+
+// Server/Client re-exports
+#[cfg(any(feature = "http2", feature = "http3"))]
+pub use server::WebSocketServer;
+
+#[cfg(any(feature = "http2", feature = "http3"))]
+pub use client::WebSocketClient;
+
+#[cfg(any(feature = "http2", feature = "http3"))]
+pub use multiplex::MultiplexedConnection;
 
 // Re-export config types at top level for convenience
 
@@ -488,4 +545,17 @@ pub mod prelude {
     pub use crate::frame::{Frame, OpCode};
     pub use crate::protocol::{Message, Role};
     pub use crate::stream::WebSocketStream;
+    pub use crate::transport::{Http1, Http2, Http3, Transport};
+
+    #[cfg(any(feature = "http2", feature = "http3"))]
+    pub use crate::extended_connect::ExtendedConnectRequest;
+
+    #[cfg(any(feature = "http2", feature = "http3"))]
+    pub use crate::server::WebSocketServer;
+
+    #[cfg(any(feature = "http2", feature = "http3"))]
+    pub use crate::client::WebSocketClient;
+
+    #[cfg(any(feature = "http2", feature = "http3"))]
+    pub use crate::multiplex::MultiplexedConnection;
 }

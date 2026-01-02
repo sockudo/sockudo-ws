@@ -1,6 +1,6 @@
 [package]
 name = "sockudo-ws"
-version = "1.4.3"
+version = "1.5.0"
 edition = "2024"
 authors = ["Diaconu Radu-Mihai"]
 description = "Ultra-low latency WebSocket library for HFT applications"
@@ -81,6 +81,9 @@ io-uring = ["tokio-uring"]
 # All transport features
 all-transports = ["http2", "http3", "io-uring"]
 
+# High-performance allocator
+mimalloc = ["dep:mimalloc"]
+
 # Full feature set
 full = ["simd", "tokio-runtime", "axum-integration", "permessage-deflate", "all-transports", "fastrand"]
 
@@ -156,6 +159,9 @@ rustls = { version = "^0.23", default-features = false, features = ["ring", "std
 
 # io_uring support (Linux only)
 tokio-uring = { version = "^0.5", optional = true }
+
+# High-performance allocator
+mimalloc = { version = "^0.1", default-features = false, optional = true }
 
 [dev-dependencies]
 criterion = "^0.5"

@@ -139,6 +139,9 @@ sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["a
 
 # Everything
 sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["full"] }
+
+# With mimalloc allocator (recommended for production)
+sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["mimalloc"] }
 ```
 
 ## Quick Start
@@ -242,8 +245,7 @@ async fn ws_handler(req: Request) -> Response<Body> {
 HTTP/2 WebSocket uses the Extended CONNECT protocol for multiplexed WebSocket streams over a single TCP connection.
 
 ```rust
-use sockudo_ws::http2::H2WebSocketServer;
-use sockudo_ws::{Config, Message};
+use sockudo_ws::{WebSocketServer, Http2, Config, Message};
 use futures_util::{SinkExt, StreamExt};
 
 #[tokio::main]
@@ -254,7 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .http2_max_streams(100)
         .build();
     
-    let server = H2WebSocketServer::new(config);
+    let server = WebSocketServer::<Http2>::new(config);
 
     loop {
         let (stream, _) = listener.accept().await?;
@@ -282,9 +284,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### HTTP/2 Client
 
 ```rust
-use sockudo_ws::http2::H2WebSocketClient;
+use sockudo_ws::{WebSocketClient, Http2, Config, Message};
 
-let client = H2WebSocketClient::new(Config::default());
+let client = WebSocketClient::<Http2>::new(Config::default());
 let mut ws = client.connect(tls_stream, "wss://example.com/ws", None).await?;
 
 ws.send(Message::text("Hello!")).await?;
@@ -295,7 +297,9 @@ ws.send(Message::text("Hello!")).await?;
 Open multiple WebSocket streams over a single HTTP/2 connection:
 
 ```rust
-let client = H2WebSocketClient::new(Config::default());
+use sockudo_ws::{WebSocketClient, Http2, Config};
+
+let client = WebSocketClient::<Http2>::new(Config::default());
 let mut conn = client.connect_multiplexed(tls_stream).await?;
 
 // Open multiple WebSocket streams on the same connection
@@ -308,8 +312,7 @@ let mut ws2 = conn.open_websocket("wss://example.com/notifications", None).await
 HTTP/3 WebSocket runs over QUIC, providing benefits like 0-RTT, no head-of-line blocking, and better mobile performance.
 
 ```rust
-use sockudo_ws::http3::H3WebSocketServer;
-use sockudo_ws::{Config, Message};
+use sockudo_ws::{WebSocketServer, Http3, Config, Message};
 use futures_util::{SinkExt, StreamExt};
 
 #[tokio::main]
@@ -321,7 +324,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .http3_idle_timeout(30_000)
         .build();
 
-    let server = H3WebSocketServer::bind(
+    let server = WebSocketServer::<Http3>::bind(
         "0.0.0.0:4433".parse()?,
         tls_config,
         ws_config,
@@ -392,13 +395,12 @@ Combine io_uring transport with HTTP/2 protocol for maximum performance:
 
 ```rust
 use sockudo_ws::io_uring::UringStream;
-use sockudo_ws::http2::H2WebSocketServer;
-use sockudo_ws::Config;
+use sockudo_ws::{WebSocketServer, Http2, Config};
 
 #[tokio_uring::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio_uring::net::TcpListener::bind("127.0.0.1:8080".parse()?)?;
-    let server = H2WebSocketServer::new(Config::default());
+    let server = WebSocketServer::<Http2>::new(Config::default());
 
     loop {
         let (tcp_stream, _) = listener.accept().await?;
@@ -585,6 +587,12 @@ For client mask generation:
 | `io-uring` | Linux io_uring support |
 | `all-transports` | All transport features |
 
+### Allocator Features
+
+| Feature | Description |
+|---------|-------------|
+| `mimalloc` | Use mimalloc as global allocator (10-30% throughput improvement) |
+
 ### Integration Features
 
 | Feature | Description |
@@ -770,49 +778,51 @@ cargo run --example http3_echo --features http3
 ```
 sockudo-ws/
 ├── src/
-│   ├── lib.rs          # Public API, Config
-│   ├── stream.rs       # WebSocketStream, Split types
-│   ├── protocol.rs     # WebSocket protocol state machine
-│   ├── frame.rs        # Frame encoding/decoding
-│   ├── handshake.rs    # HTTP upgrade handshake
-│   ├── simd.rs         # SIMD masking (AVX/SSE/NEON/AltiVec/LSX)
-│   ├── utf8.rs         # SIMD UTF-8 validation
-│   ├── cork.rs         # Write batching buffer
-│   ├── deflate.rs      # permessage-deflate compression
-│   ├── error.rs        # Error types with categorization
-│   ├── http2/          # HTTP/2 WebSocket (RFC 8441)
+│   ├── lib.rs            # Public API, Config
+│   ├── stream/           # WebSocket stream types
 │   │   ├── mod.rs
-│   │   ├── stream.rs   # H2Stream wrapper
-│   │   ├── handshake.rs
-│   │   ├── server.rs   # H2WebSocketServer
-│   │   └── client.rs   # H2WebSocketClient
-│   ├── http3/          # HTTP/3 WebSocket (RFC 9220)
+│   │   ├── websocket.rs  # WebSocketStream, Split types
+│   │   └── transport_stream.rs
+│   ├── protocol.rs       # WebSocket protocol state machine
+│   ├── frame.rs          # Frame encoding/decoding
+│   ├── handshake.rs      # HTTP upgrade handshake
+│   ├── simd.rs           # SIMD masking (AVX/SSE/NEON/AltiVec/LSX)
+│   ├── utf8.rs           # SIMD UTF-8 validation
+│   ├── cork.rs           # Write batching buffer
+│   ├── deflate.rs        # permessage-deflate compression
+│   ├── error.rs          # Error types with categorization
+│   ├── transport.rs      # Transport trait (Http1, Http2, Http3)
+│   ├── server.rs         # WebSocketServer<T: Transport>
+│   ├── client.rs         # WebSocketClient<T: Transport>
+│   ├── multiplex.rs      # MultiplexedConnection
+│   ├── extended_connect.rs # Shared Extended CONNECT logic
+│   ├── http2/            # HTTP/2 WebSocket (RFC 8441)
 │   │   ├── mod.rs
-│   │   ├── stream.rs   # H3Stream wrapper
-│   │   ├── handshake.rs
-│   │   ├── server.rs   # H3WebSocketServer
-│   │   └── client.rs   # H3WebSocketClient
-│   └── io_uring/       # Linux io_uring transport
+│   │   └── stream.rs     # Http2Stream wrapper
+│   ├── http3/            # HTTP/3 WebSocket (RFC 9220)
+│   │   ├── mod.rs
+│   │   └── stream.rs     # Http3Stream wrapper
+│   └── io_uring/         # Linux io_uring transport
 │       ├── mod.rs
-│       ├── stream.rs   # UringStream wrapper
-│       └── buffer.rs   # Registered buffer pool
-├── fuzz/               # Fuzzing targets
+│       ├── stream.rs     # UringStream wrapper
+│       └── buffer.rs     # Registered buffer pool
+├── fuzz/                 # Fuzzing targets
 │   └── fuzz_targets/
 │       ├── parse_frame.rs
 │       ├── unmask.rs
 │       ├── utf8_validation.rs
 │       └── protocol.rs
 ├── examples/
-│   ├── simple_echo.rs  # Basic echo server
-│   ├── split_echo.rs   # Concurrent read/write
-│   ├── axum_echo.rs    # Axum integration
-│   ├── http2_echo.rs   # HTTP/2 WebSocket server
-│   └── http3_echo.rs   # HTTP/3 WebSocket server
+│   ├── simple_echo.rs    # Basic echo server
+│   ├── split_echo.rs     # Concurrent read/write
+│   ├── axum_echo.rs      # Axum integration
+│   ├── http2_echo.rs     # HTTP/2 WebSocket server
+│   └── http3_echo.rs     # HTTP/3 WebSocket server
 ├── autobahn/
-│   ├── server.rs       # Autobahn test server
-│   └── Makefile        # Build and test automation
+│   ├── server.rs         # Autobahn test server
+│   └── Makefile          # Build and test automation
 └── benches/
-    └── throughput.rs   # Criterion benchmarks
+    └── throughput.rs     # Criterion benchmarks
 ```
 
 ## Performance Optimizations
@@ -824,6 +834,7 @@ sockudo-ws/
 5. **Vectored I/O**: Uses `writev()` to send multiple buffers in single syscall
 6. **io_uring**: Kernel-level async I/O with submission queue batching
 7. **Alignment-Aware SIMD**: Handles unaligned prefix/suffix for optimal memory access
+8. **Optional mimalloc**: High-performance allocator for reduced allocation latency
 
 ## License
 

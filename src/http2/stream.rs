@@ -1,6 +1,6 @@
 //! HTTP/2 stream wrapper implementing AsyncRead + AsyncWrite
 //!
-//! This module provides `H2Stream`, a wrapper around h2's `SendStream` and `RecvStream`
+//! This module provides `Http2Stream`, a wrapper around h2's `SendStream` and `RecvStream`
 //! that implements tokio's `AsyncRead` and `AsyncWrite` traits. This allows HTTP/2 streams
 //! to be used with the existing `WebSocketStream<S>` generic type.
 
@@ -14,25 +14,25 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// A wrapper around h2 send/receive streams that implements AsyncRead + AsyncWrite
 ///
-/// This allows HTTP/2 streams to be used with `WebSocketStream<H2Stream>`,
+/// This allows HTTP/2 streams to be used with `WebSocketStream<Http2Stream>`,
 /// providing the same API as TCP-based WebSocket connections.
 ///
 /// # Example
 ///
 /// ```ignore
-/// use sockudo_ws::{Config, WebSocketStream};
-/// use sockudo_ws::http2::H2Stream;
+/// use sockudo_ws::{Config, WebSocketStream, Http2};
+/// use sockudo_ws::http2::stream::Http2Stream;
 ///
 /// // After HTTP/2 handshake and Extended CONNECT negotiation
-/// let h2_stream = H2Stream::new(send_stream, recv_stream);
-/// let mut ws = WebSocketStream::server(h2_stream, Config::default());
+/// let stream = Http2Stream::new(send_stream, recv_stream);
+/// let mut ws = WebSocketStream::server(stream, Config::default());
 ///
 /// // Use the same API as regular WebSocket
 /// while let Some(msg) = ws.next().await {
 ///     ws.send(msg?).await?;
 /// }
 /// ```
-pub struct H2Stream {
+pub struct Http2Stream {
     send: SendStream<Bytes>,
     recv: RecvStream,
     recv_buf: BytesMut,
@@ -42,8 +42,8 @@ pub struct H2Stream {
     capacity_needed: usize,
 }
 
-impl H2Stream {
-    /// Create a new H2Stream from h2 send and receive streams
+impl Http2Stream {
+    /// Create a new Http2Stream from h2 send and receive streams
     pub fn new(send: SendStream<Bytes>, recv: RecvStream) -> Self {
         Self {
             send,
@@ -75,7 +75,7 @@ impl H2Stream {
     }
 }
 
-impl AsyncRead for H2Stream {
+impl AsyncRead for Http2Stream {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -122,7 +122,7 @@ impl AsyncRead for H2Stream {
     }
 }
 
-impl AsyncWrite for H2Stream {
+impl AsyncWrite for Http2Stream {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -178,9 +178,9 @@ impl AsyncWrite for H2Stream {
     }
 }
 
-impl std::fmt::Debug for H2Stream {
+impl std::fmt::Debug for Http2Stream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("H2Stream")
+        f.debug_struct("Http2Stream")
             .field("recv_buf_len", &self.recv_buf.len())
             .field("recv_eof", &self.recv_eof)
             .field("capacity_needed", &self.capacity_needed)
@@ -190,16 +190,9 @@ impl std::fmt::Debug for H2Stream {
 
 #[cfg(test)]
 mod tests {
-    // Tests would require mocking h2 streams
-    // For now, we verify the types compile correctly
-
     #[test]
-    fn test_h2stream_is_send_sync() {
+    fn test_http2stream_is_send() {
         fn assert_send<T: Send>() {}
-        fn assert_sync<T: Sync>() {}
-
-        // H2Stream should be Send + Sync for use across tasks
-        assert_send::<super::H2Stream>();
-        // Note: h2 streams may not be Sync, which is fine
+        assert_send::<super::Http2Stream>();
     }
 }

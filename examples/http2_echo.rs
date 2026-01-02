@@ -13,8 +13,7 @@
 //! shows the basic structure - add TLS for production use.
 
 use futures_util::{SinkExt, StreamExt};
-use sockudo_ws::http2::H2WebSocketServer;
-use sockudo_ws::{Config, Message};
+use sockudo_ws::{Config, Http2, Message, WebSocketServer};
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -34,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .http2_max_streams(100)
         .build();
 
-    let server = H2WebSocketServer::new(config);
+    let server = WebSocketServer::<Http2>::new(config);
 
     loop {
         let (stream, addr) = listener.accept().await?;

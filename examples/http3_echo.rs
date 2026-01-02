@@ -18,8 +18,7 @@ use std::fs;
 
 use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use sockudo_ws::http3::H3WebSocketServer;
-use sockudo_ws::{Config, Message};
+use sockudo_ws::{Config, Http3, Message, WebSocketServer};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -47,7 +46,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .http3_idle_timeout(30_000)
         .build();
 
-    let server = H3WebSocketServer::bind("127.0.0.1:4433".parse()?, tls_config, ws_config).await?;
+    let server =
+        WebSocketServer::<Http3>::bind("127.0.0.1:4433".parse()?, tls_config, ws_config).await?;
 
     println!("Listening on: {}", server.local_addr()?);
     println!();

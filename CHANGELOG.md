@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-01-02
+
+### Added
+
+- **mimalloc feature**: Optional high-performance allocator for 10-30% throughput improvement
+  - Enable with `features = ["mimalloc"]`
+  - Automatically sets mimalloc as the global allocator
+
+### Changed
+
+- **Unified Transport API**: Major refactoring of HTTP/2 and HTTP/3 APIs
+  - `H2WebSocketServer` → `WebSocketServer<Http2>`
+  - `H3WebSocketServer` → `WebSocketServer<Http3>`
+  - `H2WebSocketClient` → `WebSocketClient<Http2>`
+  - `H3WebSocketClient` → `WebSocketClient<Http3>`
+  - New `Transport` trait with `Http1`, `Http2`, `Http3` marker types
+  - Shared `ExtendedConnectRequest`/`ExtendedConnectResponse` types
+  - `MultiplexedConnection` for HTTP/2 and HTTP/3 stream multiplexing
+
+- **Stream type renames**:
+  - `H2Stream` → `Http2Stream`
+  - `H3Stream` → `Http3Stream`
+
+### Removed
+
+- **Unused custom allocators**: Removed `src/alloc.rs` containing unused `SlabPool`, `Arena`, and `BufferPool`
+  - These were never integrated into the codebase
+  - Use the `slab` crate from tokio-rs if slab allocation is needed
+
+### Migration Guide
+
+```rust
+// Before (1.4.x)
+use sockudo_ws::http2::H2WebSocketServer;
+let server = H2WebSocketServer::new(config);
+
+// After (1.5.0)
+use sockudo_ws::{WebSocketServer, Http2};
+let server = WebSocketServer::<Http2>::new(config);
+```
+
 ## [1.4.3] - 2026-01-01
 
 ### Fixed
@@ -195,6 +236,9 @@ ASCII fast-path strategy: Check if all bytes in a 16/32-byte chunk have high bit
 - Passes all 517 Autobahn test cases
 - Outperforms uWebSockets in benchmarks
 
+[1.5.0]: https://github.com/RustNSparks/sockudo-ws/compare/v1.4.3...v1.5.0
+[1.4.3]: https://github.com/RustNSparks/sockudo-ws/compare/v1.4.2...v1.4.3
+[1.4.2]: https://github.com/RustNSparks/sockudo-ws/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/RustNSparks/sockudo-ws/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/RustNSparks/sockudo-ws/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/RustNSparks/sockudo-ws/compare/v1.2.0...v1.3.0

@@ -1,25 +1,6 @@
-//! Async WebSocket stream implementation
+//! WebSocket stream implementation
 //!
-//! This module provides the main `WebSocketStream` type that implements
-//! both `Stream` and `Sink` traits for async message handling.
-//!
-//! # Split Streams
-//!
-//! For concurrent send/receive, use the `split()` method:
-//!
-//! ```ignore
-//! let (mut reader, mut writer) = ws.split();
-//!
-//! // Spawn a task for reading
-//! let read_task = tokio::spawn(async move {
-//!     while let Some(msg) = reader.next().await {
-//!         println!("Received: {:?}", msg);
-//!     }
-//! });
-//!
-//! // Send messages from another task
-//! writer.send(Message::Text("Hello".into())).await?;
-//! ```
+//! This module provides the main `WebSocketStream` type.
 
 use std::io;
 use std::pin::Pin;

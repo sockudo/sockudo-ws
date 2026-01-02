@@ -17,7 +17,7 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────┐
-//! │         WebSocketStream<H3Stream>        │
+//! │         WebSocketStream<Http3Stream>     │
 //! │            (same familiar API)           │
 //! ├─────────────────────────────────────────┤
 //! │              HTTP/3 Layer                │
@@ -41,8 +41,7 @@
 //! # Server Example
 //!
 //! ```ignore
-//! use sockudo_ws::{Config, Message};
-//! use sockudo_ws::http3::H3WebSocketServer;
+//! use sockudo_ws::{WebSocketServer, Http3, Config, Message};
 //! use futures_util::StreamExt;
 //!
 //! #[tokio::main]
@@ -50,7 +49,7 @@
 //!     // Load TLS certificate and key (required for QUIC)
 //!     let tls_config = load_server_tls_config()?;
 //!
-//!     let server = H3WebSocketServer::bind(
+//!     let server = WebSocketServer::<Http3>::bind(
 //!         "0.0.0.0:443".parse()?,
 //!         tls_config,
 //!         Config::default(),
@@ -73,15 +72,14 @@
 //! # Client Example
 //!
 //! ```ignore
-//! use sockudo_ws::{Config, Message};
-//! use sockudo_ws::http3::H3WebSocketClient;
+//! use sockudo_ws::{WebSocketClient, Http3, Config, Message};
 //! use futures_util::{SinkExt, StreamExt};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let tls_config = load_client_tls_config()?;
 //!
-//!     let client = H3WebSocketClient::new(Config::default());
+//!     let client = WebSocketClient::<Http3>::new(Config::default());
 //!     let mut ws = client.connect(
 //!         "server.example.com:443".parse()?,
 //!         "server.example.com",
@@ -106,15 +104,20 @@
 //! on Linux when available, providing optimal performance without
 //! any extra configuration.
 
-mod client;
-mod handshake;
-mod server;
-mod stream;
+pub mod stream;
 
-pub use client::H3WebSocketClient;
-pub use handshake::{H3HandshakeRequest, build_h3_error_response, build_h3_response};
-pub use server::H3WebSocketServer;
-pub use stream::H3Stream;
+// Re-export stream types
+pub use stream::{Http3ClientStream, Http3ServerStream, Http3Stream};
+
+// Re-export unified types with Http3 transport
+pub use crate::client::WebSocketClient;
+pub use crate::extended_connect::{
+    ExtendedConnectConfig, ExtendedConnectRequest, ExtendedConnectResponse,
+};
+pub use crate::extended_connect::{build_extended_connect_error, build_extended_connect_response};
+pub use crate::multiplex::MultiplexedConnection;
+pub use crate::server::WebSocketServer;
+pub use crate::transport::Http3;
 
 /// HTTP/3 SETTINGS_ENABLE_CONNECT_PROTOCOL parameter (RFC 9220, Section 5)
 ///
