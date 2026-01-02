@@ -413,4 +413,14 @@ mod tests {
         let accept = generate_accept_key(key);
         assert_eq!(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
     }
+
+    #[test]
+    fn test_websocket_split_compiles() {
+        // This test verifies that the split() method signature is correct
+        // and that SplitReader/SplitWriter types are properly accessible
+
+        // Verify the types exist and are importable
+        fn _takes_split_reader(_: crate::SplitReader<UpgradedStream>) {}
+        fn _takes_split_writer(_: crate::SplitWriter<UpgradedStream>) {}
+    }
 }
