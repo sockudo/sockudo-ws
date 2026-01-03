@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="VcsDirectoryMappings">
+    <mapping directory="" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/uWebSockets" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/uWebSockets/fuzzing/libEpollFuzzer" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/uWebSockets/fuzzing/seed-corpus" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/uWebSockets/h1spec" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/uWebSockets/libdeflate" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/uWebSockets/uSockets" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/uWebSockets/uSockets/boringssl" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/uWebSockets/uSockets/lsquic" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/uWebSockets/uSockets/lsquic/src/liblsquic/ls-qpack" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/uWebSockets/uSockets/lsquic/src/lshpack" vcs="Git" />
+  </component>
+</project>

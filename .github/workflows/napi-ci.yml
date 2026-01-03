@@ -44,27 +44,9 @@ jobs:
           - host: windows-latest
             target: x86_64-pc-windows-msvc
             build: npm run build -- --target x86_64-pc-windows-msvc
-          - host: windows-latest
-            target: aarch64-pc-windows-msvc
-            build: npm run build -- --target aarch64-pc-windows-msvc
           - host: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             build: npm run build -- --target x86_64-unknown-linux-gnu
-          - host: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            build: npm run build -- --target x86_64-unknown-linux-musl
-          - host: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            build: npm run build -- --target aarch64-unknown-linux-gnu
-          - host: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            build: npm run build -- --target aarch64-unknown-linux-musl
-          - host: ubuntu-latest
-            target: armv7-unknown-linux-gnueabihf
-            build: npm run build -- --target armv7-unknown-linux-gnueabihf
-          - host: ubuntu-latest
-            target: x86_64-unknown-freebsd
-            build: npm run build -- --target x86_64-unknown-freebsd
 
     name: Build - ${{ matrix.settings.target }}
     runs-on: ${{ matrix.settings.host }}
@@ -81,30 +63,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.settings.target }}
-
-      - name: Install dependencies (Ubuntu)
-        if: matrix.settings.host == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-
-      - name: Install cross-compilation tools
-        if: matrix.settings.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-
-      - name: Install cross-compilation tools (ARM)
-        if: matrix.settings.target == 'armv7-unknown-linux-gnueabihf'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
-
-      - name: Install cross-compilation tools (musl aarch64)
-        if: matrix.settings.target == 'aarch64-unknown-linux-musl'
-        uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: 0.13.0
 
       - name: Install dependencies
         working-directory: napi-bindings

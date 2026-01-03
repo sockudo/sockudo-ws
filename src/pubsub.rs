@@ -139,17 +139,10 @@ struct Subscriber {
 }
 
 /// A topic with its subscribers
+#[derive(Default)]
 struct Topic {
     /// Set of subscriber IDs subscribed to this topic
     subscribers: HashSet<SubscriberId>,
-}
-
-impl Default for Topic {
-    fn default() -> Self {
-        Self {
-            subscribers: HashSet::new(),
-        }
-    }
 }
 
 /// Cache-line aligned shard for topic storage

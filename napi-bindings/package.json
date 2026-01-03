@@ -22,14 +22,8 @@
     "targets": [
       "x86_64-pc-windows-msvc",
       "x86_64-apple-darwin",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-linux-musl",
-      "aarch64-unknown-linux-gnu",
-      "aarch64-unknown-linux-musl",
       "aarch64-apple-darwin",
-      "aarch64-pc-windows-msvc",
-      "armv7-unknown-linux-gnueabihf",
-      "x86_64-unknown-freebsd"
+      "x86_64-unknown-linux-gnu"
     ]
   },
   "publishConfig": {
@@ -87,12 +81,6 @@
     "@sockudo/ws-win32-x64-msvc": "1.6.0",
     "@sockudo/ws-darwin-x64": "1.6.0",
     "@sockudo/ws-darwin-arm64": "1.6.0",
-    "@sockudo/ws-linux-x64-gnu": "1.6.0",
-    "@sockudo/ws-linux-x64-musl": "1.6.0",
-    "@sockudo/ws-linux-arm64-gnu": "1.6.0",
-    "@sockudo/ws-linux-arm64-musl": "1.6.0",
-    "@sockudo/ws-linux-arm-gnueabihf": "1.6.0",
-    "@sockudo/ws-win32-arm64-msvc": "1.6.0",
-    "@sockudo/ws-freebsd-x64": "1.6.0"
+    "@sockudo/ws-linux-x64-gnu": "1.6.0"
   }
 }
