@@ -1,6 +1,6 @@
 [package]
 name = "sockudo-ws-napi"
-version = "1.6.8"
+version = "1.6.9"
 edition = "2024"
 authors = ["Diaconu Radu-Mihai"]
 description = "Ultra-fast Node.js WebSocket bindings for sockudo-ws - the fastest WebSocket library"

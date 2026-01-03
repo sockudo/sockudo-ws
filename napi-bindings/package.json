@@ -1,6 +1,6 @@
 {
   "name": "@sockudo/ws",
-  "version": "1.6.8",
+  "version": "1.6.9",
   "description": "Ultra-fast WebSocket library for Node.js - 17% faster than alternatives, matching uWebSockets performance",
   "main": "index.js",
   "module": "index.mjs",
@@ -80,11 +80,11 @@
     "typescript": "^5.6.0"
   },
   "optionalDependencies": {
-    "@sockudo/ws-win32-x64-msvc": "1.6.8",
-    "@sockudo/ws-win32-arm64-msvc": "1.6.8",
-    "@sockudo/ws-darwin-x64": "1.6.8",
-    "@sockudo/ws-darwin-arm64": "1.6.8",
-    "@sockudo/ws-linux-x64-gnu": "1.6.8",
-    "@sockudo/ws-linux-arm64-gnu": "1.6.8"
+    "@sockudo/ws-win32-x64-msvc": "1.6.9",
+    "@sockudo/ws-win32-arm64-msvc": "1.6.9",
+    "@sockudo/ws-darwin-x64": "1.6.9",
+    "@sockudo/ws-darwin-arm64": "1.6.9",
+    "@sockudo/ws-linux-x64-gnu": "1.6.9",
+    "@sockudo/ws-linux-arm64-gnu": "1.6.9"
   }
 }

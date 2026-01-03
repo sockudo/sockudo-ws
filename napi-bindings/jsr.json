@@ -1,6 +1,6 @@
 {
   "name": "@sockudo/ws",
-  "version": "1.6.8",
+  "version": "1.6.9",
   "license": "MIT",
   "exports": "./index.mjs",
   "publish": {
