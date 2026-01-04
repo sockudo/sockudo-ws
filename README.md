@@ -4,8 +4,6 @@ Ultra-low latency WebSocket library for Rust, designed for high-frequency tradin
 
 Will be used in [Sockudo](https://github.com/RustNSparks/sockudo), a high-performance Pusher-compatible WebSocket server.
 
-**Coming soon:** N-API bindings for Node.js
-
 ## Performance
 
 ### Rust WebSocket Libraries Benchmark
@@ -101,7 +99,7 @@ sockudo-ws matches or exceeds uWebSockets performance while providing a safe, er
 - **Zero-Copy Parsing**: Direct buffer access without intermediate allocations
 - **Write Batching (Corking)**: Minimizes syscalls via vectored I/O
 - **permessage-deflate**: Full compression support with shared/dedicated compressors
-- **Split Streams**: Concurrent read/write from separate tasks
+- **Lock-Free Split Streams**: True concurrent read/write using OS-level stream splitting (zero mutex contention)
 - **Pub/Sub System**: High-performance topic-based messaging with sender exclusion
 - **HTTP/2 WebSocket**: RFC 8441 Extended CONNECT protocol support
 - **HTTP/3 WebSocket**: RFC 9220 WebSocket over QUIC support
@@ -173,7 +171,9 @@ async fn handle(stream: TcpStream) {
 }
 ```
 
-### Split Streams (Concurrent Read/Write)
+### Lock-Free Split Streams (Concurrent Read/Write)
+
+sockudo-ws uses **tokio::io::split()** for true concurrent I/O with **zero mutex contention**:
 
 ```rust
 use sockudo_ws::{Config, Message, WebSocketStream};
@@ -181,9 +181,12 @@ use tokio::sync::mpsc;
 
 async fn handle(stream: TcpStream) {
     let ws = WebSocketStream::server(stream, Config::default());
+    
+    // Split into independent read/write halves
+    // Reader and writer can operate 100% concurrently!
     let (mut reader, mut writer) = ws.split();
 
-    // Writer task
+    // Writer task - NEVER blocks reader
     let (tx, mut rx) = mpsc::channel::<Message>(32);
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -191,7 +194,7 @@ async fn handle(stream: TcpStream) {
         }
     });
 
-    // Reader loop
+    // Reader loop - NEVER blocks writer
     while let Some(msg) = reader.next().await {
         match msg.unwrap() {
             Message::Text(text) => {
@@ -203,6 +206,12 @@ async fn handle(stream: TcpStream) {
     }
 }
 ```
+
+**Why This is Fast:**
+- ✅ **Zero mutex contention** - reader and writer operate independently
+- ✅ **OS-level splitting** - leverages tokio's optimized `ReadHalf` and `WriteHalf`
+- ✅ **True concurrency** - can read and write simultaneously without blocking
+- ✅ **Control frame coordination** - Ping/Pong/Close handled via lightweight mpsc channel
 
 ### Pub/Sub System
 
@@ -735,26 +744,32 @@ if ws.is_backpressured() {
 }
 ```
 
-### Split Streams
+### Lock-Free Split Streams
 
-For concurrent read/write operations:
+For concurrent read/write operations with zero mutex contention:
 
 ```rust
 let (reader, writer) = ws.split();
 
-// SplitReader
+// SplitReader - operates independently, never blocks writer
 reader.next().await  // Receive message
+reader.is_closed()   // Check if closed (non-blocking)
 
-// SplitWriter
+// SplitWriter - operates independently, never blocks reader
 writer.send(msg).await?;
 writer.send_text("hello").await?;
 writer.send_binary(bytes).await?;
 writer.close(1000, "bye").await?;
-writer.is_closed().await;
-
-// Reunite
-let ws = sockudo_ws::reunite(reader, writer)?;
+writer.is_closed()   // Check if closed (non-blocking)
+writer.flush().await?;  // Flush pending control responses
 ```
+
+**Implementation Details:**
+- Uses `tokio::io::split()` for OS-level stream splitting
+- Reader owns `ReadHalf<S>` and protocol decoder
+- Writer owns `WriteHalf<S>` and protocol encoder
+- Control frames (Ping/Pong/Close) coordinated via mpsc channel
+- No shared mutex - true concurrent I/O
 
 ### Message Types
 

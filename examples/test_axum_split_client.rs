@@ -15,15 +15,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Perform WebSocket handshake
     let mut stream = stream;
-    let handshake = format!(
-        "GET /ws HTTP/1.1\r\n\
+    let handshake = "GET /ws HTTP/1.1\r\n\
          Host: 127.0.0.1:3000\r\n\
          Upgrade: websocket\r\n\
          Connection: Upgrade\r\n\
          Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
          Sec-WebSocket-Version: 13\r\n\
-         \r\n"
-    );
+         \r\n";
 
     stream.write_all(handshake.as_bytes()).await?;
 
@@ -44,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n--- Testing split functionality ---\n");
 
     // Send test messages
-    let test_messages = vec![
+    let test_messages = [
         "Hello from test client",
         "Testing split() functionality",
         "Message 3",

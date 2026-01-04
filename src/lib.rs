@@ -98,7 +98,7 @@ pub use frame::{Frame, OpCode};
 pub use handshake::HandshakeResult;
 pub use protocol::{Message, Role};
 pub use pubsub::{PubSub, PubSubState, PublishResult, SubscriberId};
-pub use stream::{ReuniteError, SplitReader, SplitWriter, Stream, WebSocketStream, reunite};
+pub use stream::{SplitReader, SplitWriter, Stream, WebSocketStream};
 
 // Transport re-exports
 pub use transport::{Http1, Http2, Http3, Transport};
