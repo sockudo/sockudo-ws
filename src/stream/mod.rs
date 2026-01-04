@@ -34,3 +34,6 @@ mod websocket;
 
 pub use transport_stream::Stream;
 pub use websocket::*;
+
+#[cfg(feature = "permessage-deflate")]
+pub use websocket::CompressedWebSocketStream;

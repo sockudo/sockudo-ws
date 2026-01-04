@@ -44,7 +44,7 @@ use futures_core::Stream;
 use futures_sink::Sink;
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
-use pin_project_lite::pin_project;
+
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::Config;
@@ -53,6 +53,11 @@ use crate::handshake::generate_accept_key;
 use crate::protocol::{Message, Role};
 use crate::stream::WebSocketStream;
 use crate::{SplitReader, SplitWriter};
+
+#[cfg(feature = "permessage-deflate")]
+use crate::deflate::DeflateConfig;
+#[cfg(feature = "permessage-deflate")]
+use crate::stream::CompressedWebSocketStream;
 
 /// WebSocket upgrade extractor for Axum
 ///
@@ -98,47 +103,68 @@ impl WebSocketUpgrade {
         Fut: Future<Output = ()> + Send + 'static,
     {
         let accept_key = generate_accept_key(&self.key);
-        let config = self.config.clone();
-        let handler_config = self.config;
+        let handler_config = self.config.clone();
         let protocol = self.protocol;
         let on_upgrade = self.on_upgrade;
 
         // Negotiate permessage-deflate if enabled
         // Priority: explicit deflate config > compression mode
         #[cfg(feature = "permessage-deflate")]
-        let extensions = {
+        let (extensions, negotiated_deflate) = {
             // Get deflate config from either explicit config or compression mode
             let deflate_config = handler_config
                 .deflate
                 .clone()
                 .or_else(|| handler_config.compression.to_deflate_config());
 
-            if let Some(ref config) = deflate_config {
-                self.extensions
-                    .as_deref()
-                    .and_then(|ext| {
-                        crate::deflate::parse_deflate_offer(ext).map(|params| {
-                            // Parse and validate deflate parameters from the client's offer
-                            crate::deflate::DeflateConfig::from_params(&params)
-                                .ok()
-                                .map(|_| config.to_response_header())
-                        })
+            if let Some(ref server_config) = deflate_config {
+                // Check if client offers permessage-deflate
+                let negotiated = self.extensions.as_deref().and_then(|ext| {
+                    crate::deflate::parse_deflate_offer(ext).and_then(|params| {
+                        // Parse and validate deflate parameters from the client's offer
+                        crate::deflate::DeflateConfig::from_params(&params)
+                            .ok()
+                            .map(|_client_config| {
+                                // Use server's config but respect client's constraints
+                                server_config.clone()
+                            })
                     })
-                    .flatten()
+                });
+
+                if let Some(ref config) = negotiated {
+                    (Some(config.to_response_header()), Some(config.clone()))
+                } else {
+                    (None, None)
+                }
             } else {
-                None
+                (None, None)
             }
         };
 
         #[cfg(not(feature = "permessage-deflate"))]
-        let extensions = None;
+        let extensions: Option<String> = None;
+
+        #[cfg(feature = "permessage-deflate")]
+        let config_for_response = handler_config.clone();
+        #[cfg(not(feature = "permessage-deflate"))]
+        let config_for_response = handler_config.clone();
 
         WebSocketUpgradeResponse {
             accept_key,
             protocol,
             extensions,
-            config,
+            config: config_for_response,
             on_upgrade,
+            #[cfg(feature = "permessage-deflate")]
+            handler: Box::new(move |stream| {
+                let ws = if let Some(deflate_config) = negotiated_deflate {
+                    WebSocket::new_compressed(stream, handler_config, deflate_config)
+                } else {
+                    WebSocket::new(stream, handler_config)
+                };
+                Box::pin(handler(ws))
+            }),
+            #[cfg(not(feature = "permessage-deflate"))]
             handler: Box::new(move |stream| {
                 let ws = WebSocket::new(stream, handler_config);
                 Box::pin(handler(ws))
@@ -375,20 +401,45 @@ impl AsyncWrite for UpgradedStream {
     }
 }
 
-pin_project! {
-    /// WebSocket connection for Axum handlers
-    ///
-    /// Implements both `Stream<Item = Result<Message>>` and `Sink<Message>`.
-    pub struct WebSocket {
-        #[pin]
-        inner: WebSocketStream<UpgradedStream>,
-    }
+/// Inner stream type that can be either compressed or uncompressed
+#[cfg(feature = "permessage-deflate")]
+enum WebSocketInner {
+    Plain(WebSocketStream<UpgradedStream>),
+    Compressed(CompressedWebSocketStream<UpgradedStream>),
+}
+
+#[cfg(not(feature = "permessage-deflate"))]
+enum WebSocketInner {
+    Plain(WebSocketStream<UpgradedStream>),
+}
+
+/// WebSocket connection for Axum handlers
+///
+/// Implements both `Stream<Item = Result<Message>>` and `Sink<Message>`.
+/// Automatically handles permessage-deflate compression when negotiated.
+pub struct WebSocket {
+    inner: WebSocketInner,
 }
 
 impl WebSocket {
     fn new(stream: UpgradedStream, config: Config) -> Self {
         Self {
-            inner: WebSocketStream::from_raw(stream, Role::Server, config),
+            inner: WebSocketInner::Plain(WebSocketStream::from_raw(stream, Role::Server, config)),
+        }
+    }
+
+    #[cfg(feature = "permessage-deflate")]
+    fn new_compressed(
+        stream: UpgradedStream,
+        config: Config,
+        deflate_config: DeflateConfig,
+    ) -> Self {
+        Self {
+            inner: WebSocketInner::Compressed(CompressedWebSocketStream::server(
+                stream,
+                config,
+                deflate_config,
+            )),
         }
     }
 
@@ -405,9 +456,9 @@ impl WebSocket {
         use futures_sink::Sink;
         use std::future::poll_fn;
 
-        poll_fn(|cx| Pin::new(&mut self.inner).poll_ready(cx)).await?;
-        Pin::new(&mut self.inner).start_send(msg)?;
-        poll_fn(|cx| Pin::new(&mut self.inner).poll_flush(cx)).await
+        poll_fn(|cx| Pin::new(&mut *self).poll_ready(cx)).await?;
+        Pin::new(&mut *self).start_send(msg)?;
+        poll_fn(|cx| Pin::new(&mut *self).poll_flush(cx)).await
     }
 
     /// Receive a message
@@ -415,17 +466,25 @@ impl WebSocket {
         use futures_core::Stream;
         use std::future::poll_fn;
 
-        poll_fn(|cx| Pin::new(&mut self.inner).poll_next(cx)).await
+        poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
     }
 
     /// Close the connection
-    pub async fn close(mut self, code: u16, reason: &str) -> Result<()> {
-        self.inner.close(code, reason).await
+    pub async fn close(self, code: u16, reason: &str) -> Result<()> {
+        match self.inner {
+            WebSocketInner::Plain(mut ws) => ws.close(code, reason).await,
+            #[cfg(feature = "permessage-deflate")]
+            WebSocketInner::Compressed(mut ws) => ws.close(code, reason).await,
+        }
     }
 
     /// Check if the connection is closed
     pub fn is_closed(&self) -> bool {
-        self.inner.is_closed()
+        match &self.inner {
+            WebSocketInner::Plain(ws) => ws.is_closed(),
+            #[cfg(feature = "permessage-deflate")]
+            WebSocketInner::Compressed(ws) => ws.is_closed(),
+        }
     }
 
     /// Split the WebSocket into separate reader and writer halves
@@ -447,8 +506,15 @@ impl WebSocket {
     /// // Write from current task
     /// writer.send(Message::Text("Hello".into())).await?;
     /// ```
-    pub fn split(self) -> (SplitReader<UpgradedStream>, SplitWriter<UpgradedStream>) {
-        self.inner.split()
+    ///
+    /// Note: split() is only available for uncompressed WebSocket connections.
+    /// For compressed connections, use the async send/recv methods instead.
+    pub fn split(self) -> Option<(SplitReader<UpgradedStream>, SplitWriter<UpgradedStream>)> {
+        match self.inner {
+            WebSocketInner::Plain(ws) => Some(ws.split()),
+            #[cfg(feature = "permessage-deflate")]
+            WebSocketInner::Compressed(_) => None, // Compressed streams don't support split yet
+        }
     }
 }
 
@@ -456,7 +522,12 @@ impl Stream for WebSocket {
     type Item = Result<Message>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.project().inner.poll_next(cx)
+        let this = self.get_mut();
+        match &mut this.inner {
+            WebSocketInner::Plain(ws) => Pin::new(ws).poll_next(cx),
+            #[cfg(feature = "permessage-deflate")]
+            WebSocketInner::Compressed(ws) => Pin::new(ws).poll_next(cx),
+        }
     }
 }
 
@@ -464,19 +535,39 @@ impl Sink<Message> for WebSocket {
     type Error = Error;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        self.project().inner.poll_ready(cx)
+        let this = self.get_mut();
+        match &mut this.inner {
+            WebSocketInner::Plain(ws) => Pin::new(ws).poll_ready(cx),
+            #[cfg(feature = "permessage-deflate")]
+            WebSocketInner::Compressed(ws) => Pin::new(ws).poll_ready(cx),
+        }
     }
 
     fn start_send(self: Pin<&mut Self>, item: Message) -> Result<()> {
-        self.project().inner.start_send(item)
+        let this = self.get_mut();
+        match &mut this.inner {
+            WebSocketInner::Plain(ws) => Pin::new(ws).start_send(item),
+            #[cfg(feature = "permessage-deflate")]
+            WebSocketInner::Compressed(ws) => Pin::new(ws).start_send(item),
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        self.project().inner.poll_flush(cx)
+        let this = self.get_mut();
+        match &mut this.inner {
+            WebSocketInner::Plain(ws) => Pin::new(ws).poll_flush(cx),
+            #[cfg(feature = "permessage-deflate")]
+            WebSocketInner::Compressed(ws) => Pin::new(ws).poll_flush(cx),
+        }
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        self.project().inner.poll_close(cx)
+        let this = self.get_mut();
+        match &mut this.inner {
+            WebSocketInner::Plain(ws) => Pin::new(ws).poll_close(cx),
+            #[cfg(feature = "permessage-deflate")]
+            WebSocketInner::Compressed(ws) => Pin::new(ws).poll_close(cx),
+        }
     }
 }
 

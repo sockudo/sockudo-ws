@@ -1729,7 +1729,7 @@ dependencies = [
 
 [[package]]
 name = "sockudo-ws"
-version = "1.7.2"
+version = "1.7.3"
 dependencies = [
  "aws-lc-rs",
  "axum",

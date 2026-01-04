@@ -103,6 +103,9 @@ pub use protocol::{Message, Role};
 pub use pubsub::{PubSub, PubSubState, PublishResult, SubscriberId};
 pub use stream::{SplitReader, SplitWriter, Stream, WebSocketStream};
 
+#[cfg(feature = "permessage-deflate")]
+pub use stream::CompressedWebSocketStream;
+
 // Transport re-exports
 pub use transport::{Http1, Http2, Http3, Transport};
 

@@ -867,6 +867,353 @@ where
     }
 }
 
+// ============================================================================
+// Compressed WebSocket Stream (permessage-deflate)
+// ============================================================================
+
+#[cfg(feature = "permessage-deflate")]
+pin_project! {
+    /// A WebSocket stream with permessage-deflate compression (RFC 7692)
+    ///
+    /// This type mirrors `WebSocketStream` but uses `CompressedProtocol` for
+    /// automatic compression/decompression of messages.
+    pub struct CompressedWebSocketStream<S> {
+        #[pin]
+        inner: S,
+        protocol: crate::protocol::CompressedProtocol,
+        read_buf: BytesMut,
+        write_buf: CorkBuffer,
+        state: StreamState,
+        config: Config,
+        pending_messages: Vec<Message>,
+        pending_index: usize,
+        high_water_mark: usize,
+        low_water_mark: usize,
+    }
+}
+
+#[cfg(feature = "permessage-deflate")]
+impl<S> CompressedWebSocketStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    /// Create a new compressed WebSocket stream for server role
+    pub fn server(inner: S, config: Config, deflate_config: crate::deflate::DeflateConfig) -> Self {
+        let protocol = crate::protocol::CompressedProtocol::server(
+            config.max_frame_size,
+            config.max_message_size,
+            deflate_config,
+        );
+
+        Self {
+            inner,
+            protocol,
+            read_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
+            write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
+            state: StreamState::Open,
+            config,
+            pending_messages: Vec::new(),
+            pending_index: 0,
+            high_water_mark: DEFAULT_HIGH_WATER_MARK,
+            low_water_mark: DEFAULT_LOW_WATER_MARK,
+        }
+    }
+
+    /// Create a new compressed WebSocket stream for client role
+    pub fn client(inner: S, config: Config, deflate_config: crate::deflate::DeflateConfig) -> Self {
+        let protocol = crate::protocol::CompressedProtocol::client(
+            config.max_frame_size,
+            config.max_message_size,
+            deflate_config,
+        );
+
+        Self {
+            inner,
+            protocol,
+            read_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
+            write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
+            state: StreamState::Open,
+            config,
+            pending_messages: Vec::new(),
+            pending_index: 0,
+            high_water_mark: DEFAULT_HIGH_WATER_MARK,
+            low_water_mark: DEFAULT_LOW_WATER_MARK,
+        }
+    }
+
+    /// Check if the connection is closed
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.state == StreamState::Closed || self.protocol.is_closed()
+    }
+
+    /// Check if backpressure should be applied
+    #[inline]
+    pub fn is_backpressured(&self) -> bool {
+        self.write_buf.pending_bytes() > self.high_water_mark
+    }
+
+    /// Get the current write buffer length
+    #[inline]
+    pub fn write_buffer_len(&self) -> usize {
+        self.write_buf.pending_bytes()
+    }
+
+    /// Send a close frame
+    pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
+        if self.state != StreamState::Open {
+            return Ok(());
+        }
+
+        let close = Message::Close(Some(CloseReason::new(code, reason)));
+        self.protocol
+            .encode_message(&close, self.write_buf.buffer_mut())?;
+        self.state = StreamState::CloseSent;
+
+        self.flush_write_buf().await?;
+        Ok(())
+    }
+
+    /// Flush the write buffer to the underlying stream
+    async fn flush_write_buf(&mut self) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        while self.write_buf.has_data() {
+            let slices = self.write_buf.get_write_slices();
+            if slices.is_empty() {
+                break;
+            }
+
+            let n = self.inner.write_vectored(&slices).await?;
+            if n == 0 {
+                return Err(Error::ConnectionClosed);
+            }
+            self.write_buf.consume(n);
+        }
+
+        self.inner.flush().await?;
+        Ok(())
+    }
+
+    /// Read more data from the underlying stream
+    fn poll_read_more(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        let this = self.project();
+
+        if this.read_buf.capacity() - this.read_buf.len() < 4096 {
+            this.read_buf.reserve(8192);
+        }
+
+        let buf_len = this.read_buf.len();
+        let buf_cap = this.read_buf.capacity();
+
+        unsafe {
+            this.read_buf.set_len(buf_cap);
+        }
+
+        let mut read_buf = ReadBuf::new(&mut this.read_buf[buf_len..]);
+
+        match this.inner.poll_read(cx, &mut read_buf) {
+            Poll::Ready(Ok(())) => {
+                let n = read_buf.filled().len();
+                unsafe {
+                    this.read_buf.set_len(buf_len + n);
+                }
+                if n == 0 {
+                    Poll::Ready(Ok(0))
+                } else {
+                    Poll::Ready(Ok(n))
+                }
+            }
+            Poll::Ready(Err(e)) => {
+                unsafe {
+                    this.read_buf.set_len(buf_len);
+                }
+                Poll::Ready(Err(e))
+            }
+            Poll::Pending => {
+                unsafe {
+                    this.read_buf.set_len(buf_len);
+                }
+                Poll::Pending
+            }
+        }
+    }
+
+    /// Process read buffer and extract messages
+    fn process_read_buf(&mut self) -> Result<()> {
+        if self.read_buf.is_empty() {
+            return Ok(());
+        }
+
+        let messages = self.protocol.process(&mut self.read_buf)?;
+
+        if !messages.is_empty() {
+            self.pending_messages = messages;
+            self.pending_index = 0;
+        }
+
+        Ok(())
+    }
+
+    /// Get the next pending message
+    fn next_pending_message(&mut self) -> Option<Message> {
+        if self.pending_index < self.pending_messages.len() {
+            let msg = self.pending_messages[self.pending_index].clone();
+            self.pending_index += 1;
+
+            if self.pending_index >= self.pending_messages.len() {
+                self.pending_messages.clear();
+                self.pending_index = 0;
+            }
+
+            Some(msg)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(feature = "permessage-deflate")]
+impl<S> Stream for CompressedWebSocketStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    type Item = Result<Message>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            if self.state == StreamState::Closed {
+                return Poll::Ready(None);
+            }
+
+            if let Some(msg) = self.as_mut().get_mut().next_pending_message() {
+                match &msg {
+                    Message::Ping(data) => {
+                        let this = self.as_mut().get_mut();
+                        this.protocol.encode_pong(data, this.write_buf.buffer_mut());
+                    }
+                    Message::Close(reason) => {
+                        let this = self.as_mut().get_mut();
+                        if this.state == StreamState::Open {
+                            this.protocol
+                                .encode_close_response(this.write_buf.buffer_mut());
+                            this.state = StreamState::Closed;
+                        }
+                        return Poll::Ready(Some(Ok(Message::Close(reason.clone()))));
+                    }
+                    _ => {}
+                }
+
+                return Poll::Ready(Some(Ok(msg)));
+            }
+
+            match self.as_mut().poll_read_more(cx) {
+                Poll::Ready(Ok(0)) => {
+                    self.as_mut().get_mut().state = StreamState::Closed;
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Ok(_n)) => match self.as_mut().get_mut().process_read_buf() {
+                    Ok(()) => continue,
+                    Err(e) => return Poll::Ready(Some(Err(e))),
+                },
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Some(Err(e.into())));
+                }
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "permessage-deflate")]
+impl<S> Sink<Message> for CompressedWebSocketStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    type Error = Error;
+
+    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if self.state == StreamState::Closed {
+            return Poll::Ready(Err(Error::ConnectionClosed));
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Message) -> Result<()> {
+        let this = self.get_mut();
+
+        if this.state == StreamState::Closed {
+            return Err(Error::ConnectionClosed);
+        }
+
+        if item.is_close() {
+            this.state = StreamState::CloseSent;
+        }
+
+        this.protocol
+            .encode_message(&item, this.write_buf.buffer_mut())?;
+        Ok(())
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        let this = self.as_mut().get_mut();
+
+        while this.write_buf.has_data() {
+            let slices = this.write_buf.get_write_slices();
+            if slices.is_empty() {
+                break;
+            }
+
+            match Pin::new(&mut this.inner).poll_write_vectored(cx, &slices) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(Error::ConnectionClosed));
+                }
+                Poll::Ready(Ok(n)) => {
+                    this.write_buf.consume(n);
+                }
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(e.into()));
+                }
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
+            }
+        }
+
+        match Pin::new(&mut self.as_mut().get_mut().inner).poll_flush(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if self.state == StreamState::Open {
+            let close = Message::Close(Some(CloseReason::new(1000, "")));
+            if let Err(e) = self.as_mut().start_send(close) {
+                return Poll::Ready(Err(e));
+            }
+        }
+
+        match self.as_mut().poll_flush(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
+
+        match Pin::new(&mut self.as_mut().get_mut().inner).poll_shutdown(cx) {
+            Poll::Ready(Ok(())) => {
+                self.as_mut().get_mut().state = StreamState::Closed;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
