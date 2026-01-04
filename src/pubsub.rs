@@ -3,11 +3,9 @@
 //! This module provides an ultra-fast topic-based publish/subscribe system
 //! inspired by uWebSockets, designed for maximum throughput with:
 //!
-//! - **Sharded topics**: Reduces lock contention across topics
+//! - **DashMap/DashSet**: Lock-free concurrent hash maps for minimal contention
 //! - **Lock-free subscriber IDs**: Atomic allocation of subscriber identifiers
 //! - **Zero-copy messages**: Uses `Bytes` for efficient message sharing
-//! - **Cache-line alignment**: Prevents false sharing in concurrent access
-//! - **Batched delivery**: Amortizes overhead across multiple subscribers
 //! - **Pusher-style string IDs**: Optional string-based subscriber identifiers
 //!
 //! # Example (Numeric IDs - High Performance)
@@ -67,19 +65,13 @@
 //! pubsub.remove_subscriber_by_socket_id(socket_id);
 //! ```
 
-use std::collections::{HashMap, HashSet};
-use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use parking_lot::RwLock;
+use dashmap::{DashMap, DashSet};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::CACHE_LINE_SIZE;
 use crate::protocol::Message;
-
-/// Number of shards for topic partitioning (power of 2 for fast modulo)
-const NUM_SHARDS: usize = 64;
 
 /// Unique identifier for a subscriber
 ///
@@ -133,68 +125,9 @@ struct Subscriber {
     /// Channel for sending messages to this subscriber
     sender: UnboundedSender<Message>,
     /// Topics this subscriber is subscribed to (for cleanup)
-    topics: RwLock<HashSet<String>>,
+    topics: DashSet<String>,
     /// Optional Pusher-style socket ID (e.g., "1234.5678")
     socket_id: Option<String>,
-}
-
-/// A topic with its subscribers
-#[derive(Default)]
-struct Topic {
-    /// Set of subscriber IDs subscribed to this topic
-    subscribers: HashSet<SubscriberId>,
-}
-
-/// Cache-line aligned shard for topic storage
-#[repr(C, align(64))]
-struct TopicShard {
-    /// Topics in this shard
-    topics: RwLock<HashMap<String, Topic>>,
-    /// Padding to fill cache line
-    _padding: [u8; CACHE_LINE_SIZE - std::mem::size_of::<RwLock<HashMap<String, Topic>>>()],
-}
-
-impl TopicShard {
-    fn new() -> Self {
-        Self {
-            topics: RwLock::new(HashMap::new()),
-            _padding: [0; CACHE_LINE_SIZE - std::mem::size_of::<RwLock<HashMap<String, Topic>>>()],
-        }
-    }
-}
-
-/// High-performance hasher for topic names (FxHash-style)
-#[derive(Default)]
-struct TopicHasher {
-    hash: u64,
-}
-
-impl Hasher for TopicHasher {
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        // FxHash-style mixing for fast string hashing
-        const K: u64 = 0x517cc1b727220a95;
-        for byte in bytes {
-            self.hash = (self.hash.rotate_left(5) ^ (*byte as u64)).wrapping_mul(K);
-        }
-    }
-
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.hash
-    }
-}
-
-#[derive(Default)]
-struct TopicHasherBuilder;
-
-impl BuildHasher for TopicHasherBuilder {
-    type Hasher = TopicHasher;
-
-    #[inline]
-    fn build_hasher(&self) -> TopicHasher {
-        TopicHasher::default()
-    }
 }
 
 /// High-performance pub/sub state
@@ -205,8 +138,7 @@ impl BuildHasher for TopicHasherBuilder {
 /// # Thread Safety
 ///
 /// `PubSub` is fully thread-safe and can be shared across async tasks.
-/// It uses sharding to minimize contention when different topics are
-/// accessed concurrently.
+/// It uses `DashMap` and `DashSet` for lock-free concurrent access.
 ///
 /// # Subscriber ID Modes
 ///
@@ -219,18 +151,16 @@ impl BuildHasher for TopicHasherBuilder {
 ///    Use `create_subscriber_with_id()` for this mode. String IDs are mapped
 ///    to internal numeric IDs for efficient lookup.
 pub struct PubSub {
-    /// Topic shards for reduced contention
-    shards: Box<[TopicShard; NUM_SHARDS]>,
+    /// Topics mapped to their subscriber sets
+    topics: DashMap<String, DashSet<SubscriberId>>,
     /// All subscribers indexed by ID
-    subscribers: RwLock<HashMap<SubscriberId, Arc<Subscriber>>>,
+    subscribers: DashMap<SubscriberId, Arc<Subscriber>>,
     /// Socket ID to SubscriberId mapping (for Pusher-style IDs)
-    socket_id_map: RwLock<HashMap<String, SubscriberId>>,
+    socket_id_map: DashMap<String, SubscriberId>,
     /// Next subscriber ID (atomic counter)
     next_subscriber_id: AtomicU64,
     /// Total number of active subscribers
     subscriber_count: AtomicUsize,
-    /// Total number of topics with at least one subscriber
-    topic_count: AtomicUsize,
     /// Total messages published (for stats)
     messages_published: AtomicU64,
 }
@@ -241,36 +171,14 @@ pub type PubSubState = PubSub;
 impl PubSub {
     /// Create a new pub/sub system
     pub fn new() -> Self {
-        // Initialize shards
-        let shards: Box<[TopicShard; NUM_SHARDS]> = (0..NUM_SHARDS)
-            .map(|_| TopicShard::new())
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap_or_else(|_| panic!("Failed to create topic shards"));
-
         Self {
-            shards,
-            subscribers: RwLock::new(HashMap::new()),
-            socket_id_map: RwLock::new(HashMap::new()),
+            topics: DashMap::new(),
+            subscribers: DashMap::new(),
+            socket_id_map: DashMap::new(),
             next_subscriber_id: AtomicU64::new(1),
             subscriber_count: AtomicUsize::new(0),
-            topic_count: AtomicUsize::new(0),
             messages_published: AtomicU64::new(0),
         }
-    }
-
-    /// Get the shard index for a topic
-    #[inline]
-    fn shard_index(&self, topic: &str) -> usize {
-        let mut hasher = TopicHasher::default();
-        topic.hash(&mut hasher);
-        (hasher.finish() as usize) & (NUM_SHARDS - 1)
-    }
-
-    /// Get a reference to a topic shard
-    #[inline]
-    fn shard(&self, topic: &str) -> &TopicShard {
-        &self.shards[self.shard_index(topic)]
     }
 
     // =========================================================================
@@ -293,11 +201,11 @@ impl PubSub {
 
         let subscriber = Arc::new(Subscriber {
             sender,
-            topics: RwLock::new(HashSet::new()),
+            topics: DashSet::new(),
             socket_id: None,
         });
 
-        self.subscribers.write().insert(id, subscriber);
+        self.subscribers.insert(id, subscriber);
         self.subscriber_count.fetch_add(1, Ordering::Relaxed);
 
         id
@@ -307,22 +215,18 @@ impl PubSub {
     ///
     /// This should be called when a WebSocket connection closes.
     pub fn remove_subscriber(&self, id: SubscriberId) {
-        // Get the subscriber and its topics
-        let subscriber = {
-            let mut subs = self.subscribers.write();
-            subs.remove(&id)
-        };
+        // Get the subscriber
+        let subscriber = self.subscribers.remove(&id);
 
-        if let Some(sub) = subscriber {
+        if let Some((_, sub)) = subscriber {
             // Remove from socket_id_map if present
             if let Some(ref socket_id) = sub.socket_id {
-                self.socket_id_map.write().remove(socket_id);
+                self.socket_id_map.remove(socket_id);
             }
 
             // Unsubscribe from all topics
-            let topics: Vec<String> = sub.topics.read().iter().cloned().collect();
-            for topic in topics {
-                self.unsubscribe_internal(id, &topic);
+            for topic in sub.topics.iter() {
+                self.unsubscribe_internal(id, topic.key());
             }
             self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
         }
@@ -379,20 +283,17 @@ impl PubSub {
 
         let subscriber = Arc::new(Subscriber {
             sender,
-            topics: RwLock::new(HashSet::new()),
+            topics: DashSet::new(),
             socket_id: Some(socket_id.to_string()),
         });
 
         // Insert into socket_id_map
-        {
-            let mut map = self.socket_id_map.write();
-            if map.contains_key(socket_id) {
-                panic!("Socket ID '{}' is already in use", socket_id);
-            }
-            map.insert(socket_id.to_string(), id);
+        if self.socket_id_map.contains_key(socket_id) {
+            panic!("Socket ID '{}' is already in use", socket_id);
         }
+        self.socket_id_map.insert(socket_id.to_string(), id);
 
-        self.subscribers.write().insert(id, subscriber);
+        self.subscribers.insert(id, subscriber);
         self.subscriber_count.fetch_add(1, Ordering::Relaxed);
 
         id
@@ -412,11 +313,8 @@ impl PubSub {
         sender: UnboundedSender<Message>,
     ) -> (SubscriberId, bool) {
         // Check if already exists
-        {
-            let map = self.socket_id_map.read();
-            if let Some(&id) = map.get(socket_id) {
-                return (id, false);
-            }
+        if let Some(entry) = self.socket_id_map.get(socket_id) {
+            return (*entry.value(), false);
         }
 
         // Create new subscriber
@@ -424,21 +322,22 @@ impl PubSub {
 
         let subscriber = Arc::new(Subscriber {
             sender,
-            topics: RwLock::new(HashSet::new()),
+            topics: DashSet::new(),
             socket_id: Some(socket_id.to_string()),
         });
 
-        // Double-check and insert
-        {
-            let mut map = self.socket_id_map.write();
-            if let Some(&existing_id) = map.get(socket_id) {
+        // Try to insert - handle race condition
+        match self.socket_id_map.entry(socket_id.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
                 // Race condition: someone else created it
-                return (existing_id, false);
+                return (*entry.get(), false);
             }
-            map.insert(socket_id.to_string(), id);
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(id);
+            }
         }
 
-        self.subscribers.write().insert(id, subscriber);
+        self.subscribers.insert(id, subscriber);
         self.subscriber_count.fetch_add(1, Ordering::Relaxed);
 
         (id, true)
@@ -454,7 +353,7 @@ impl PubSub {
     ///
     /// The `SubscriberId` if found, or `None`
     pub fn get_subscriber_by_socket_id(&self, socket_id: &str) -> Option<SubscriberId> {
-        self.socket_id_map.read().get(socket_id).copied()
+        self.socket_id_map.get(socket_id).map(|r| *r.value())
     }
 
     /// Get the socket ID for a subscriber
@@ -468,7 +367,6 @@ impl PubSub {
     /// The socket ID if the subscriber has one, or `None`
     pub fn get_socket_id(&self, id: SubscriberId) -> Option<String> {
         self.subscribers
-            .read()
             .get(&id)
             .and_then(|sub| sub.socket_id.clone())
     }
@@ -588,14 +486,10 @@ impl PubSub {
     /// `true` if newly subscribed, `false` if already subscribed
     pub fn subscribe(&self, id: SubscriberId, topic: &str) -> bool {
         // Add topic to subscriber's set
-        let subscriber = {
-            let subs = self.subscribers.read();
-            subs.get(&id).cloned()
-        };
+        let subscriber = self.subscribers.get(&id);
 
         if let Some(sub) = subscriber {
-            let mut topics = sub.topics.write();
-            if !topics.insert(topic.to_string()) {
+            if !sub.topics.insert(topic.to_string()) {
                 return false; // Already subscribed
             }
         } else {
@@ -603,15 +497,7 @@ impl PubSub {
         }
 
         // Add subscriber to topic
-        let shard = self.shard(topic);
-        let mut topics = shard.topics.write();
-
-        let topic_entry = topics.entry(topic.to_string()).or_insert_with(|| {
-            self.topic_count.fetch_add(1, Ordering::Relaxed);
-            Topic::default()
-        });
-
-        topic_entry.subscribers.insert(id)
+        self.topics.entry(topic.to_string()).or_default().insert(id)
     }
 
     /// Unsubscribe from a topic
@@ -626,13 +512,8 @@ impl PubSub {
     /// `true` if was subscribed, `false` if wasn't subscribed
     pub fn unsubscribe(&self, id: SubscriberId, topic: &str) -> bool {
         // Remove topic from subscriber's set
-        let subscriber = {
-            let subs = self.subscribers.read();
-            subs.get(&id).cloned()
-        };
-
-        if let Some(sub) = subscriber {
-            sub.topics.write().remove(topic);
+        if let Some(sub) = self.subscribers.get(&id) {
+            sub.topics.remove(topic);
         }
 
         self.unsubscribe_internal(id, topic)
@@ -640,22 +521,16 @@ impl PubSub {
 
     /// Internal unsubscribe (doesn't update subscriber's topic set)
     fn unsubscribe_internal(&self, id: SubscriberId, topic: &str) -> bool {
-        let shard = self.shard(topic);
-        let mut topics = shard.topics.write();
+        let mut removed = false;
 
-        if let Some(topic_entry) = topics.get_mut(topic) {
-            let removed = topic_entry.subscribers.remove(&id);
-
-            // Remove empty topics
-            if topic_entry.subscribers.is_empty() {
-                topics.remove(topic);
-                self.topic_count.fetch_sub(1, Ordering::Relaxed);
-            }
-
-            removed
-        } else {
-            false
+        if let Some(topic_subs) = self.topics.get(topic) {
+            removed = topic_subs.remove(&id).is_some();
         }
+
+        // Remove empty topics
+        self.topics.remove_if(topic, |_, subs| subs.is_empty());
+
+        removed
     }
 
     // =========================================================================
@@ -708,28 +583,25 @@ impl PubSub {
         message: Message,
         exclude: Option<SubscriberId>,
     ) -> PublishResult {
-        let shard = self.shard(topic);
-        let topics = shard.topics.read();
-
-        let topic_entry = match topics.get(topic) {
+        let topic_subs = match self.topics.get(topic) {
             Some(t) => t,
             None => return PublishResult::NoSubscribers,
         };
 
-        if topic_entry.subscribers.is_empty() {
+        if topic_subs.is_empty() {
             return PublishResult::NoSubscribers;
         }
 
-        // Get subscriber senders
-        let subscribers = self.subscribers.read();
         let mut sent = 0;
 
-        for &sub_id in &topic_entry.subscribers {
+        for sub_id in topic_subs.iter() {
+            let sub_id = *sub_id.key();
+
             if Some(sub_id) == exclude {
                 continue;
             }
 
-            if let Some(subscriber) = subscribers.get(&sub_id) {
+            if let Some(subscriber) = self.subscribers.get(&sub_id) {
                 // Clone is O(1) for Message because it uses Bytes internally
                 if subscriber.sender.send(message.clone()).is_ok() {
                     sent += 1;
@@ -752,26 +624,20 @@ impl PubSub {
 
     /// Check if a subscriber is subscribed to a topic
     pub fn is_subscribed(&self, id: SubscriberId, topic: &str) -> bool {
-        let shard = self.shard(topic);
-        let topics = shard.topics.read();
-
-        topics
+        self.topics
             .get(topic)
-            .map(|t| t.subscribers.contains(&id))
+            .map(|t| t.contains(&id))
             .unwrap_or(false)
     }
 
     /// Get the number of subscribers to a topic
     pub fn topic_subscriber_count(&self, topic: &str) -> usize {
-        let shard = self.shard(topic);
-        let topics = shard.topics.read();
-
-        topics.get(topic).map(|t| t.subscribers.len()).unwrap_or(0)
+        self.topics.get(topic).map(|t| t.len()).unwrap_or(0)
     }
 
     /// Get the total number of topics (with at least one subscriber)
     pub fn topic_count(&self) -> usize {
-        self.topic_count.load(Ordering::Relaxed)
+        self.topics.len()
     }
 
     /// Get the total number of subscribers
@@ -786,36 +652,25 @@ impl PubSub {
 
     /// Get all topics a subscriber is subscribed to
     pub fn subscriber_topics(&self, id: SubscriberId) -> Vec<String> {
-        let subscribers = self.subscribers.read();
-
-        subscribers
+        self.subscribers
             .get(&id)
-            .map(|sub| sub.topics.read().iter().cloned().collect())
+            .map(|sub| sub.topics.iter().map(|t| t.key().clone()).collect())
             .unwrap_or_default()
     }
 
     /// Get all topic names in the system
     pub fn all_topics(&self) -> Vec<String> {
-        let mut all_topics = Vec::new();
-
-        for shard in self.shards.iter() {
-            let topics = shard.topics.read();
-            for topic in topics.keys() {
-                all_topics.push(topic.clone());
-            }
-        }
-
-        all_topics
+        self.topics.iter().map(|e| e.key().clone()).collect()
     }
 
     /// Get all socket IDs in the system
     pub fn all_socket_ids(&self) -> Vec<String> {
-        self.socket_id_map.read().keys().cloned().collect()
+        self.socket_id_map.iter().map(|e| e.key().clone()).collect()
     }
 
     /// Check if a socket ID exists
     pub fn has_socket_id(&self, socket_id: &str) -> bool {
-        self.socket_id_map.read().contains_key(socket_id)
+        self.socket_id_map.contains_key(socket_id)
     }
 }
 
@@ -824,10 +679,6 @@ impl Default for PubSub {
         Self::new()
     }
 }
-
-// Safe to send and share across threads
-unsafe impl Send for PubSub {}
-unsafe impl Sync for PubSub {}
 
 #[cfg(test)]
 mod tests {
@@ -940,10 +791,10 @@ mod tests {
     }
 
     #[test]
-    fn test_sharding_distribution() {
+    fn test_many_topics() {
         let pubsub = PubSub::new();
 
-        // Create many topics to test distribution
+        // Create many topics to test DashMap performance
         let (tx, _rx) = mpsc::unbounded_channel();
         let id = pubsub.create_subscriber(tx);
 

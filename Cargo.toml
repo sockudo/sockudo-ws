@@ -96,6 +96,9 @@ tokio-util = { version = "^0.7", features = ["codec"], optional = true }
 # Fast synchronization primitives for pub/sub
 parking_lot = "^0.12"
 
+# High-performance concurrent hash maps for pub/sub
+dashmap = "^6.1"
+
 # Axum integration
 axum = { version = "^0.8", optional = true }
 hyper = { version = "^1.0", optional = true }
