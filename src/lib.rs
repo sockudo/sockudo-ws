@@ -300,6 +300,9 @@ pub struct Config {
     pub auto_ping: bool,
     /// Ping interval in seconds (default: 30)
     pub ping_interval: u32,
+    /// Per-message deflate configuration (requires `permessage-deflate` feature)
+    #[cfg(feature = "permessage-deflate")]
+    pub deflate: Option<crate::deflate::DeflateConfig>,
 
     // Transport-specific configurations
     /// HTTP/2 configuration (requires `http2` feature)
@@ -324,6 +327,8 @@ impl Default for Config {
             max_backpressure: 1024 * 1024,
             auto_ping: true,
             ping_interval: 30,
+            #[cfg(feature = "permessage-deflate")]
+            deflate: None,
             #[cfg(feature = "http2")]
             http2: Http2Config::default(),
             #[cfg(feature = "http3")]
@@ -351,6 +356,8 @@ impl Config {
             max_backpressure: 1024 * 1024,
             auto_ping: true,
             ping_interval: 30,
+            #[cfg(feature = "permessage-deflate")]
+            deflate: None,
             #[cfg(feature = "http2")]
             http2: Http2Config::default(),
             #[cfg(feature = "http3")]
@@ -428,6 +435,24 @@ impl ConfigBuilder {
     /// Set ping interval in seconds
     pub fn ping_interval(mut self, seconds: u32) -> Self {
         self.config.ping_interval = seconds;
+        self
+    }
+
+    // ========================================================================
+    // Per-Message Deflate Configuration Methods
+    // ========================================================================
+
+    /// Enable per-message deflate compression with default configuration
+    #[cfg(feature = "permessage-deflate")]
+    pub fn enable_deflate(mut self) -> Self {
+        self.config.deflate = Some(crate::deflate::DeflateConfig::default());
+        self
+    }
+
+    /// Set per-message deflate configuration
+    #[cfg(feature = "permessage-deflate")]
+    pub fn deflate_config(mut self, config: crate::deflate::DeflateConfig) -> Self {
+        self.config.deflate = Some(config);
         self
     }
 

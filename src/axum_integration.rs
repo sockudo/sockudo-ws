@@ -61,6 +61,7 @@ use crate::{SplitReader, SplitWriter};
 pub struct WebSocketUpgrade {
     key: String,
     protocol: Option<String>,
+    extensions: Option<String>,
     config: Config,
     on_upgrade: OnUpgrade,
 }
@@ -102,9 +103,31 @@ impl WebSocketUpgrade {
         let protocol = self.protocol;
         let on_upgrade = self.on_upgrade;
 
+        // Negotiate permessage-deflate if enabled
+        #[cfg(feature = "permessage-deflate")]
+        let extensions = if let Some(ref deflate_config) = handler_config.deflate {
+            self.extensions
+                .as_deref()
+                .and_then(|ext| {
+                    crate::deflate::parse_deflate_offer(ext).map(|params| {
+                        // Parse and negotiate deflate parameters
+                        crate::deflate::DeflateConfig::from_params(&params)
+                            .ok()
+                            .map(|_| deflate_config.to_response_header())
+                    })
+                })
+                .flatten()
+        } else {
+            None
+        };
+
+        #[cfg(not(feature = "permessage-deflate"))]
+        let extensions = None;
+
         WebSocketUpgradeResponse {
             accept_key,
             protocol,
+            extensions,
             config,
             on_upgrade,
             handler: Box::new(move |stream| {
@@ -181,6 +204,13 @@ where
             .and_then(|v| v.to_str().ok())
             .map(|s| s.split(',').next().unwrap_or("").trim().to_string());
 
+        // Optional: Sec-WebSocket-Extensions
+        let extensions = parts
+            .headers
+            .get("sec-websocket-extensions")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
         // Extract OnUpgrade from extensions (placed there by Axum/Hyper)
         let on_upgrade = parts
             .extensions
@@ -190,6 +220,7 @@ where
         Ok(WebSocketUpgrade {
             key,
             protocol,
+            extensions,
             config: Config::default(),
             on_upgrade,
         })
@@ -244,6 +275,7 @@ type UpgradeHandler =
 pub struct WebSocketUpgradeResponse {
     accept_key: String,
     protocol: Option<String>,
+    extensions: Option<String>,
     config: Config,
     on_upgrade: OnUpgrade,
     handler: UpgradeHandler,
@@ -263,6 +295,10 @@ impl IntoResponse for WebSocketUpgradeResponse {
 
         if let Some(proto) = &self.protocol {
             res = res.header("Sec-WebSocket-Protocol", proto.as_str());
+        }
+
+        if let Some(ext) = &self.extensions {
+            res = res.header("Sec-WebSocket-Extensions", ext.as_str());
         }
 
         // Spawn a task to handle the upgrade after the response is sent
