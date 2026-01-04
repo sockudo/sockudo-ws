@@ -650,13 +650,26 @@ mod tests {
             assert_eq!(stored_config.compression_level, 1);
         }
 
-        // Helper function to simulate the negotiation logic from on_upgrade
+        /// Helper function to simulate the deflate negotiation logic from on_upgrade.
+        /// 
+        /// This mirrors the current implementation which validates the client's offer
+        /// but uses the server's original config for the response header.
+        /// 
+        /// # Parameters
+        /// - `deflate_config`: The server's deflate configuration
+        /// - `client_offer`: Optional client extension offer string
+        /// 
+        /// # Returns
+        /// - `Some(String)` with response header if negotiation succeeds
+        /// - `None` if client doesn't offer deflate or parameters are invalid
         fn negotiate_deflate(
             deflate_config: &crate::deflate::DeflateConfig,
             client_offer: Option<&str>,
         ) -> Option<String> {
             client_offer.and_then(|ext| {
                 crate::deflate::parse_deflate_offer(ext).and_then(|params| {
+                    // Validate client params, but use server's config for response
+                    // This matches the current implementation in on_upgrade (line 114-116)
                     crate::deflate::DeflateConfig::from_params(&params)
                         .ok()
                         .map(|_| deflate_config.to_response_header())
