@@ -347,12 +347,15 @@ impl Compression {
     /// Whether to use context takeover (preserve compression dictionary between messages)
     ///
     /// Smaller window modes disable context takeover to reduce memory.
-    /// Larger modes enable it for better compression across messages.
+    /// Shared mode also disables context takeover since the encoder pool
+    /// cannot maintain context across different connections.
+    /// Larger dedicated modes enable it for better compression across messages.
     #[inline]
     pub fn context_takeover(&self) -> bool {
         !matches!(
             self,
             Compression::Disabled
+                | Compression::Shared
                 | Compression::Window256B
                 | Compression::Window1KB
                 | Compression::Window2KB
