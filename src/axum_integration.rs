@@ -640,66 +640,48 @@ mod tests {
             assert_eq!(stored_config.compression_level, 1);
         }
 
-        #[test]
-        fn test_no_client_deflate_offer() {
-            // Simulate scenario where client doesn't offer deflate extension
-            // In this case, even if server has deflate enabled, no negotiation should happen
-            
-            // When parse_deflate_offer returns None (no offer), we expect None extensions
-            let no_offer = None::<String>;
-            let result = no_offer.as_deref().and_then(|ext| {
-                crate::deflate::parse_deflate_offer(ext).map(|params| {
-                    crate::deflate::DeflateConfig::from_params(&params)
-                        .ok()
-                        .map(|_| "permessage-deflate".to_string())
-                })
-            }).flatten();
-            assert!(result.is_none());
-
-            // When client offers something else (not permessage-deflate)
-            let other_offer = Some("gzip".to_string());
-            let result = other_offer.as_deref().and_then(|ext| {
-                crate::deflate::parse_deflate_offer(ext).map(|params| {
-                    crate::deflate::DeflateConfig::from_params(&params)
-                        .ok()
-                        .map(|_| "permessage-deflate".to_string())
-                })
-            }).flatten();
-            assert!(result.is_none());
-        }
-
-        #[test]
-        fn test_deflate_negotiation_with_valid_offer() {
-            // Simulate the negotiation logic from on_upgrade
-            let deflate_config = crate::deflate::DeflateConfig::default();
-            let client_offer = Some("permessage-deflate; client_max_window_bits".to_string());
-            
-            let result = client_offer.as_deref().and_then(|ext| {
-                crate::deflate::parse_deflate_offer(ext).map(|params| {
+        // Helper function to simulate the negotiation logic from on_upgrade
+        fn negotiate_deflate(
+            deflate_config: &crate::deflate::DeflateConfig,
+            client_offer: Option<&str>,
+        ) -> Option<String> {
+            client_offer.and_then(|ext| {
+                crate::deflate::parse_deflate_offer(ext).and_then(|params| {
                     crate::deflate::DeflateConfig::from_params(&params)
                         .ok()
                         .map(|_| deflate_config.to_response_header())
                 })
-            }).flatten();
+            })
+        }
 
+        #[test]
+        fn test_no_client_deflate_offer() {
+            // When client doesn't offer deflate extension, no negotiation should happen
+            let deflate_config = crate::deflate::DeflateConfig::default();
+            
+            // No offer at all
+            assert!(negotiate_deflate(&deflate_config, None).is_none());
+
+            // Client offers something else (not permessage-deflate)
+            assert!(negotiate_deflate(&deflate_config, Some("gzip")).is_none());
+        }
+
+        #[test]
+        fn test_deflate_negotiation_with_valid_offer() {
+            let deflate_config = crate::deflate::DeflateConfig::default();
+            
+            // Valid offer with client_max_window_bits (no value means client supports it)
+            let result = negotiate_deflate(&deflate_config, Some("permessage-deflate; client_max_window_bits"));
             assert!(result.is_some());
             assert_eq!(result.unwrap(), "permessage-deflate");
         }
 
         #[test]
         fn test_deflate_negotiation_with_invalid_params() {
-            // Simulate negotiation with invalid parameters
             let deflate_config = crate::deflate::DeflateConfig::default();
-            let client_offer = Some("permessage-deflate; server_max_window_bits=99".to_string());
             
-            let result = client_offer.as_deref().and_then(|ext| {
-                crate::deflate::parse_deflate_offer(ext).map(|params| {
-                    crate::deflate::DeflateConfig::from_params(&params)
-                        .ok()
-                        .map(|_| deflate_config.to_response_header())
-                })
-            }).flatten();
-
+            // Invalid window bits (out of range)
+            let result = negotiate_deflate(&deflate_config, Some("permessage-deflate; server_max_window_bits=99"));
             // Should be None because from_params fails with invalid window bits
             assert!(result.is_none());
         }
