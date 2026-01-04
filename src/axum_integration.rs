@@ -507,12 +507,12 @@ mod tests {
         
         // Validate that we can create a config from the parsed params
         let params = params.unwrap();
-        let parsed_config = DeflateConfig::from_params(&params);
-        assert!(parsed_config.is_ok());
+        let client_config = DeflateConfig::from_params(&params);
+        assert!(client_config.is_ok());
         
-        // Test with config containing deflate settings
-        let deflate_config = DeflateConfig::default();
-        let response_header = deflate_config.to_response_header();
+        // Generate response header using server's config (as in on_upgrade)
+        let server_config = DeflateConfig::default();
+        let response_header = server_config.to_response_header();
         
         // Verify response header contains permessage-deflate
         assert!(response_header.starts_with("permessage-deflate"));
@@ -683,7 +683,7 @@ mod tests {
         assert!(validated_config.is_ok());
         
         // Generate response header using server's config (not client's)
-        // This matches the actual implementation in on_upgrade (line 116)
+        // This matches the actual implementation in the on_upgrade method
         let response_header = server_config.to_response_header();
         assert!(response_header.starts_with("permessage-deflate"));
         
