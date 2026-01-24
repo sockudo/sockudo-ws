@@ -464,7 +464,7 @@ impl Protocol {
     /// Encode a message for sending
     pub fn encode_message(&mut self, msg: &Message, buf: &mut BytesMut) -> Result<()> {
         let mask = if self.role == Role::Client {
-            Some(crate::mask::generate_mask_fast())
+            Some(crate::mask::generate_mask())
         } else {
             None
         };
@@ -506,7 +506,7 @@ impl Protocol {
     /// Encode a pong response for a ping
     pub fn encode_pong(&mut self, ping_data: &[u8], buf: &mut BytesMut) {
         let mask = if self.role == Role::Client {
-            Some(crate::mask::generate_mask_fast())
+            Some(crate::mask::generate_mask())
         } else {
             None
         };
@@ -516,7 +516,7 @@ impl Protocol {
     /// Encode a close response
     pub fn encode_close_response(&mut self, buf: &mut BytesMut) {
         let mask = if self.role == Role::Client {
-            Some(crate::mask::generate_mask_fast())
+            Some(crate::mask::generate_mask())
         } else {
             None
         };
@@ -787,7 +787,7 @@ impl CompressedProtocol {
     /// Encode a message for sending with compression
     pub fn encode_message(&mut self, msg: &Message, buf: &mut BytesMut) -> Result<()> {
         let mask = if self.inner.role == Role::Client {
-            Some(crate::mask::generate_mask_fast())
+            Some(crate::mask::generate_mask())
         } else {
             None
         };
@@ -1138,7 +1138,7 @@ impl CompressedWriterProtocol {
     /// Encode a message for sending with compression
     pub fn encode_message(&mut self, msg: &Message, buf: &mut BytesMut) -> Result<()> {
         let mask = if self.role == Role::Client {
-            Some(crate::mask::generate_mask_fast())
+            Some(crate::mask::generate_mask())
         } else {
             None
         };
@@ -1183,7 +1183,7 @@ impl CompressedWriterProtocol {
     /// Encode a pong response for a ping
     pub fn encode_pong(&mut self, ping_data: &[u8], buf: &mut BytesMut) {
         let mask = if self.role == Role::Client {
-            Some(crate::mask::generate_mask_fast())
+            Some(crate::mask::generate_mask())
         } else {
             None
         };
@@ -1193,7 +1193,7 @@ impl CompressedWriterProtocol {
     /// Encode a close response
     pub fn encode_close_response(&mut self, buf: &mut BytesMut) {
         let mask = if self.role == Role::Client {
-            Some(crate::mask::generate_mask_fast())
+            Some(crate::mask::generate_mask())
         } else {
             None
         };
