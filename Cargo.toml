@@ -1,6 +1,6 @@
 [package]
 name = "sockudo-ws"
-version = "1.7.4"
+version = "1.7.5"
 edition = "2024"
 authors = ["Diaconu Radu-Mihai"]
 repository = "https://github.com/sockudo/sockudo-ws"
