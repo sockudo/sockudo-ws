@@ -28,7 +28,7 @@ Benchmarked using [web-socket-benchmark](https://github.com/nurmohammed840/web-s
 git clone https://github.com/nurmohammed840/web-socket-benchmark
 cd web-socket-benchmark
 
-# Run benchmarks
+# Add sockudo-ws to the benchmark suite, then run:
 cargo bench
 ```
 
@@ -43,7 +43,7 @@ Environment: AMD Ryzen 9 7950X, 32GB RAM, Linux 6.18, Rust 1.82
 
 ### vs uWebSockets (C++)
 
-Benchmarked against [uWebSockets](https://github.com/uNetworking/uWebSockets), the industry standard for high-performance WebSockets:
+Benchmarked against [uWebSockets](https://github.com/uNetworking/uWebSockets), the industry standard for high-performance WebSockets, using the [fastwebsockets benchmark suite](https://github.com/denoland/fastwebsockets/tree/main/benches):
 
 | Test Case | sockudo-ws | uWebSockets | Ratio |
 |-----------|------------|-------------|-------|
@@ -55,36 +55,13 @@ Benchmarked against [uWebSockets](https://github.com/uNetworking/uWebSockets), t
 <details>
 <summary><b>How to reproduce</b></summary>
 
-**sockudo-ws benchmark:**
-
 ```bash
-cd sockudo-ws
-cargo build --release --example echo_server
-./target/release/examples/echo_server &
+# Clone the fastwebsockets repository
+git clone https://github.com/denoland/fastwebsockets
+cd fastwebsockets/benches
 
-# Using websocket-bench (https://github.com/anycable/websocket-bench)
-websocket-bench broadcast ws://127.0.0.1:8080 \
-  --concurrent 100 \
-  --sample-size 100000 \
-  --payload-size 512 \
-  --step-size 100
-```
-
-**uWebSockets benchmark:**
-
-```bash
-# Build uWebSockets echo server
-git clone https://github.com/uNetworking/uWebSockets
-cd uWebSockets
-make
-./EchoServer &
-
-# Run same benchmark
-websocket-bench broadcast ws://127.0.0.1:9001 \
-  --concurrent 100 \
-  --sample-size 100000 \
-  --payload-size 512 \
-  --step-size 100
+# Follow the instructions in the benchmark directory to run
+# the comparison between sockudo-ws and uWebSockets
 ```
 
 Environment: AMD Ryzen 9 7950X, 32GB RAM, Linux 6.18, Rust 1.82, uWebSockets v20.64
