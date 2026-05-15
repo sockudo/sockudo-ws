@@ -78,7 +78,6 @@ pub fn apply_mask(data: &mut [u8], mask: [u8; 4]) {
     #[cfg(target_arch = "aarch64")]
     {
         unsafe { apply_mask_neon_aligned(data, mask) };
-        return;
     }
 
     #[cfg(target_arch = "loongarch64")]

@@ -39,6 +39,9 @@ use crate::transport::Http2;
 #[cfg(feature = "http3")]
 use crate::transport::Http3;
 
+#[cfg(feature = "http3")]
+type H3ClientSendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
+
 // ============================================================================
 // Stream<T> - Unified transport stream
 // ============================================================================
@@ -368,6 +371,8 @@ enum Http3StreamInner {
     Client {
         stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
         read_buf: BytesMut,
+        _endpoint: Option<quinn::Endpoint>,
+        _send_request: Option<H3ClientSendRequest>,
     },
 }
 
@@ -414,10 +419,25 @@ impl Stream<Http3> {
     pub fn from_h3_client(
         stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     ) -> Self {
+        Self::from_h3_client_with_handles(stream, None, None)
+    }
+
+    /// Create from an h3 client request stream and retain its connection handles.
+    ///
+    /// h3 closes the HTTP/3 connection when the final `SendRequest` handle drops.
+    /// Single-stream clients keep a clone here so the WebSocket owns the lifetime
+    /// of the underlying H3 connection.
+    pub(crate) fn from_h3_client_with_handles(
+        stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+        endpoint: Option<quinn::Endpoint>,
+        send_request: Option<H3ClientSendRequest>,
+    ) -> Self {
         Self {
             inner: StreamInner::Http3(Http3StreamInner::Client {
                 stream,
                 read_buf: BytesMut::with_capacity(64 * 1024),
+                _endpoint: endpoint,
+                _send_request: send_request,
             }),
             _marker: PhantomData,
         }
@@ -501,7 +521,9 @@ impl AsyncRead for Stream<Http3> {
                     Poll::Pending => Poll::Pending,
                 }
             }
-            StreamInner::Http3(Http3StreamInner::Client { stream, read_buf }) => {
+            StreamInner::Http3(Http3StreamInner::Client {
+                stream, read_buf, ..
+            }) => {
                 // First drain buffered data
                 if !read_buf.is_empty() {
                     let to_copy = std::cmp::min(buf.remaining(), read_buf.len());

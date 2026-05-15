@@ -723,10 +723,7 @@ where
                 });
             }
             Ok(None) => break,
-            Err(e) => {
-                eprintln!("HTTP/3 accept error: {}", e);
-                break;
-            }
+            Err(_) => break,
         }
     }
 
@@ -777,10 +774,7 @@ where
                 });
             }
             Ok(None) => break,
-            Err(e) => {
-                eprintln!("HTTP/3 accept error: {}", e);
-                break;
-            }
+            Err(_) => break,
         }
     }
 
@@ -807,10 +801,14 @@ where
         return Ok(());
     }
 
-    let protocol_header = request
-        .extensions()
-        .get::<h3::ext::Protocol>()
-        .map(|p| p.as_str().to_string());
+    let protocol_header =
+        request
+            .extensions()
+            .get::<h3::ext::Protocol>()
+            .map(|p| match p.as_str() {
+                "webtransport" => "websocket".to_string(),
+                other => other.to_string(),
+            });
 
     let mut ws_req = ExtendedConnectRequest::from_request(&request)
         .ok_or_else(|| Error::HandshakeFailed("invalid CONNECT request"))?;
@@ -863,10 +861,14 @@ where
         return Ok(());
     }
 
-    let protocol_header = request
-        .extensions()
-        .get::<h3::ext::Protocol>()
-        .map(|p| p.as_str().to_string());
+    let protocol_header =
+        request
+            .extensions()
+            .get::<h3::ext::Protocol>()
+            .map(|p| match p.as_str() {
+                "webtransport" => "websocket".to_string(),
+                other => other.to_string(),
+            });
 
     let mut ws_req = ExtendedConnectRequest::from_request(&request)
         .ok_or_else(|| Error::HandshakeFailed("invalid CONNECT request"))?;

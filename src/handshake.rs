@@ -75,15 +75,11 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>
                     "sec-websocket-extensions" => extensions = Some(value),
                     "host" => host = Some(value),
                     "origin" => origin = Some(value),
-                    "upgrade" => {
-                        if value.to_ascii_lowercase().contains("websocket") {
-                            upgrade = true;
-                        }
+                    "upgrade" if value.to_ascii_lowercase().contains("websocket") => {
+                        upgrade = true;
                     }
-                    "connection" => {
-                        if value.to_ascii_lowercase().contains("upgrade") {
-                            connection_upgrade = true;
-                        }
+                    "connection" if value.to_ascii_lowercase().contains("upgrade") => {
+                        connection_upgrade = true;
                     }
                     _ => {}
                 }

@@ -14,10 +14,12 @@ path = "src/lib.rs"
 [[bin]]
 name = "sockudo-bench"
 path = "src/bin/bench.rs"
+required-features = ["tokio-runtime"]
 
 [[bin]]
 name = "autobahn-server"
 path = "autobahn/server.rs"
+required-features = ["tokio-runtime", "permessage-deflate"]
 
 [features]
 default = ["simd", "tokio-runtime", "permessage-deflate", "fastrand"]
@@ -33,7 +35,18 @@ neon = ["simd"]
 nightly = []
 
 # Async runtime
-tokio-runtime = ["tokio", "tokio-util"]
+tokio-runtime = [
+    "dep:tokio",
+    "tokio/rt-multi-thread",
+    "tokio/net",
+    "tokio/io-util",
+    "tokio/sync",
+    "tokio/macros",
+    "tokio/time",
+    "dep:tokio-util",
+    "tokio-util/codec",
+]
+compio-runtime = ["dep:compio"]
 
 # Framework integrations
 axum-integration = ["axum", "hyper", "hyper-util", "tokio-runtime"]
@@ -71,13 +84,30 @@ getrandom = ["dep:getrandom"]
 rand_rng = ["dep:rand"]
 
 # HTTP/2 WebSocket support (RFC 8441)
-http2 = ["h2", "http", "tokio-runtime"]
+http2 = [
+    "dep:h2",
+    "dep:http",
+    "dep:tokio",
+    "tokio/io-util",
+    "dep:tokio-util",
+    "tokio-util/compat",
+    "compio?/io-compat",
+]
 
 # HTTP/3 WebSocket support (RFC 9220)
-http3 = ["quinn", "h3", "h3-quinn", "http", "dep:rustls", "tokio-runtime"]
+http3 = [
+    "dep:quinn",
+    "dep:h3",
+    "dep:h3-quinn",
+    "dep:http",
+    "dep:rustls",
+    "compio?/h3",
+    "compio?/rustls",
+    "compio?/ring",
+]
 
 # io_uring support (Linux only)
-io-uring = ["tokio-uring"]
+io-uring = ["dep:tokio-uring"]
 
 # All transport features
 all-transports = ["http2", "http3", "io-uring"]
@@ -86,12 +116,15 @@ all-transports = ["http2", "http3", "io-uring"]
 mimalloc = ["dep:mimalloc"]
 
 # Full feature set
-full = ["simd", "tokio-runtime", "axum-integration", "permessage-deflate", "all-transports", "fastrand"]
+full = ["simd", "tokio-runtime", "compio-runtime", "axum-integration", "permessage-deflate", "all-transports", "fastrand"]
 
 [dependencies]
 # Tokio async runtime
-tokio = { version = "^1.48", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"], optional = true }
-tokio-util = { version = "^0.7", features = ["codec"], optional = true }
+tokio = { version = "^1.48", default-features = false, optional = true }
+tokio-util = { version = "^0.7", default-features = false, optional = true }
+
+# Compio completion-based async runtime
+compio = { version = "^0.18", default-features = false, features = ["net", "macros", "bytes", "sync"], optional = true }
 
 # Fast synchronization primitives for pub/sub
 parking_lot = "^0.12"
@@ -166,11 +199,12 @@ h3 = { version = "^0.0.8", optional = true }
 h3-quinn = { version = "^0.0.10", optional = true }
 rustls = { version = "^0.23", default-features = false, features = ["ring", "std"], optional = true }
 
-# io_uring support (Linux only)
-tokio-uring = { version = "^0.5", optional = true }
-
 # High-performance allocator
 mimalloc = { version = "^0.1", default-features = false, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# io_uring support (Linux only)
+tokio-uring = { version = "^0.5", optional = true }
 
 [dev-dependencies]
 criterion = "^0.5"
@@ -186,20 +220,74 @@ rcgen = "^0.13"
 rustls-pemfile = "^2.0"
 
 [[example]]
+name = "axum_deflate"
+required-features = ["axum-integration", "permessage-deflate"]
+
+[[example]]
+name = "axum_deflate_custom"
+required-features = ["axum-integration", "permessage-deflate"]
+
+[[example]]
+name = "axum_echo"
+required-features = ["axum-integration"]
+
+[[example]]
+name = "axum_pubsub_chat"
+required-features = ["axum-integration"]
+
+[[example]]
+name = "axum_split"
+required-features = ["axum-integration"]
+
+[[example]]
+name = "axum_split_deflate"
+required-features = ["axum-integration", "permessage-deflate"]
+
+[[example]]
 name = "http2_echo"
-required-features = ["http2"]
+required-features = ["tokio-runtime", "http2"]
 
 [[example]]
 name = "http3_echo"
-required-features = ["http3"]
+required-features = ["tokio-runtime", "http3"]
+
+[[example]]
+name = "pubsub_echo"
+required-features = ["tokio-runtime"]
+
+[[example]]
+name = "simple_echo"
+required-features = ["tokio-runtime"]
+
+[[example]]
+name = "split_echo"
+required-features = ["tokio-runtime"]
+
+[[example]]
+name = "test_axum_split_client"
+required-features = ["tokio-runtime"]
+
+[[example]]
+name = "test_large_message"
+required-features = ["tokio-runtime"]
+
+[[example]]
+name = "test_split_concurrent"
+required-features = ["tokio-runtime"]
+
+[[example]]
+name = "wtx_bench_echo"
+required-features = ["tokio-runtime"]
 
 [[bench]]
 name = "websocket_bench"
 harness = false
+required-features = ["tokio-runtime"]
 
 [[bench]]
 name = "comparison_bench"
 harness = false
+required-features = ["tokio-runtime"]
 
 [profile.release]
 opt-level = 3

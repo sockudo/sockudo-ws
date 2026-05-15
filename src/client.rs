@@ -386,9 +386,6 @@ impl WebSocketClient<Http2> {
 
         let mut req_builder = Request::builder().method(Method::CONNECT).uri(&full_uri);
 
-        // Add :protocol pseudo-header for Extended CONNECT (RFC 8441)
-        req_builder = req_builder.header(":protocol", "websocket");
-
         // Add WebSocket-specific headers
         if let Some(proto) = protocol {
             req_builder = req_builder.header("sec-websocket-protocol", proto);
@@ -403,9 +400,12 @@ impl WebSocketClient<Http2> {
             }
         }
 
-        let request = req_builder
+        let mut request = req_builder
             .body(())
             .map_err(|_| Error::HandshakeFailed("failed to build request"))?;
+        request
+            .extensions_mut()
+            .insert(h2::ext::Protocol::from_static("websocket"));
 
         // Send the Extended CONNECT request
         let (response_future, send_stream) = send_request
@@ -586,8 +586,7 @@ impl WebSocketClient<Http3> {
 
         // Spawn driver task to handle HTTP/3 connection management
         tokio::spawn(async move {
-            let err = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
-            eprintln!("H3 connection closed: {}", err);
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
 
         // Build Extended CONNECT request per RFC 9220
@@ -623,7 +622,11 @@ impl WebSocketClient<Http3> {
         // Check response status per RFC 9220
         match response.status() {
             StatusCode::OK => {
-                let h3_stream = Stream::<Http3>::from_h3_client(stream);
+                let h3_stream = Stream::<Http3>::from_h3_client_with_handles(
+                    stream,
+                    Some(endpoint),
+                    Some(send_request.clone()),
+                );
 
                 Ok(WebSocketStream::from_raw(
                     h3_stream,
@@ -671,11 +674,11 @@ impl WebSocketClient<Http3> {
 
         // Spawn driver
         tokio::spawn(async move {
-            let err = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
-            eprintln!("H3 connection closed: {}", err);
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
 
         Ok(MultiplexedConnection::new_http3(
+            endpoint,
             connection,
             send_request,
             server_name.to_string(),

@@ -85,6 +85,7 @@ enum MultiplexInner<T: Transport> {
     Http2 { send_request: SendRequest<Bytes> },
     #[cfg(feature = "http3")]
     Http3 {
+        endpoint: quinn::Endpoint,
         connection: quinn::Connection,
         send_request: h3::client::SendRequest<h3_quinn::OpenStreams, H3Bytes>,
         server_name: String,
@@ -140,18 +141,18 @@ impl MultiplexedConnection<Http2> {
 
         let mut req_builder = Request::builder().method(Method::CONNECT).uri(&full_uri);
 
-        // Add :protocol pseudo-header for Extended CONNECT
-        req_builder = req_builder.header(":protocol", "websocket");
-
         if let Some(proto) = protocol {
             req_builder = req_builder.header("sec-websocket-protocol", proto);
         }
 
         req_builder = req_builder.header("sec-websocket-version", "13");
 
-        let request = req_builder
+        let mut request = req_builder
             .body(())
             .map_err(|_| Error::HandshakeFailed("failed to build request"))?;
+        request
+            .extensions_mut()
+            .insert(h2::ext::Protocol::from_static("websocket"));
 
         let (response_future, send_stream) = send_request
             .send_request(request, false)
@@ -189,6 +190,7 @@ impl MultiplexedConnection<Http2> {
 impl MultiplexedConnection<Http3> {
     /// Create a new HTTP/3 multiplexed connection (internal use)
     pub(crate) fn new_http3(
+        endpoint: quinn::Endpoint,
         connection: quinn::Connection,
         send_request: h3::client::SendRequest<h3_quinn::OpenStreams, H3Bytes>,
         server_name: String,
@@ -197,6 +199,7 @@ impl MultiplexedConnection<Http3> {
     ) -> Self {
         Self {
             inner: MultiplexInner::Http3 {
+                endpoint,
                 connection,
                 send_request,
                 server_name,
@@ -219,15 +222,22 @@ impl MultiplexedConnection<Http3> {
     ) -> Result<WebSocketStream<H3Stream<Http3>>> {
         use http::{Method, Request};
 
-        let (send_request, server_name, server_port) = match &mut self.inner {
+        let (send_request, endpoint, server_name, server_port) = match &mut self.inner {
             MultiplexInner::Http3 {
+                endpoint,
                 send_request,
                 server_name,
                 server_port,
                 ..
-            } => (send_request, server_name.clone(), *server_port),
+            } => (
+                send_request,
+                endpoint.clone(),
+                server_name.clone(),
+                *server_port,
+            ),
             _ => unreachable!(),
         };
+        let send_request_guard = send_request.clone();
 
         let uri = format!("https://{}:{}{}", server_name, server_port, path);
 
@@ -256,7 +266,11 @@ impl MultiplexedConnection<Http3> {
             return Err(Error::HandshakeFailed("server rejected WebSocket upgrade"));
         }
 
-        let h3_stream = H3Stream::<Http3>::from_h3_client(stream);
+        let h3_stream = H3Stream::<Http3>::from_h3_client_with_handles(
+            stream,
+            Some(endpoint),
+            Some(send_request_guard),
+        );
 
         Ok(WebSocketStream::from_raw(
             h3_stream,

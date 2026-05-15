@@ -59,22 +59,29 @@ pub mod frame;
 pub mod handshake;
 pub mod mask;
 pub mod protocol;
+#[cfg(feature = "tokio-runtime")]
 pub mod pubsub;
 pub mod queue;
 pub mod simd;
+#[cfg(feature = "tokio-runtime")]
 pub mod stream;
 pub mod utf8;
+
+#[cfg(feature = "compio-runtime")]
+pub mod compio;
 
 // Transport and Extended CONNECT modules
 #[cfg(any(feature = "http2", feature = "http3"))]
 pub mod extended_connect;
 pub mod transport;
 
+#[cfg(feature = "tokio-runtime")]
 pub mod server;
 
+#[cfg(feature = "tokio-runtime")]
 pub mod client;
 
-#[cfg(any(feature = "http2", feature = "http3"))]
+#[cfg(all(feature = "tokio-runtime", any(feature = "http2", feature = "http3")))]
 pub mod multiplex;
 
 #[cfg(feature = "permessage-deflate")]
@@ -99,12 +106,22 @@ pub mod io_uring;
 pub use error::{Error, Result};
 pub use frame::{Frame, OpCode};
 pub use handshake::HandshakeResult;
-pub use protocol::{Message, Role};
+pub use protocol::{Message, RawMessage, Role};
+#[cfg(feature = "tokio-runtime")]
 pub use pubsub::{PubSub, PubSubState, PublishResult, SubscriberId};
+#[cfg(feature = "tokio-runtime")]
 pub use stream::{SplitReader, SplitWriter, Stream, WebSocketStream};
 
-#[cfg(feature = "permessage-deflate")]
+#[cfg(all(feature = "permessage-deflate", feature = "tokio-runtime"))]
 pub use stream::CompressedWebSocketStream;
+
+#[cfg(feature = "compio-runtime")]
+pub use compio::{CompioSplitReader, CompioSplitWriter, CompioWebSocketStream};
+
+#[cfg(all(feature = "compio-runtime", feature = "permessage-deflate"))]
+pub use compio::{
+    CompioCompressedSplitReader, CompioCompressedSplitWriter, CompioCompressedWebSocketStream,
+};
 
 // Transport re-exports
 pub use transport::{Http1, Http2, Http3, Transport};
@@ -118,13 +135,13 @@ pub use extended_connect::{
 pub use extended_connect::{build_extended_connect_error, build_extended_connect_response};
 
 // Server/Client re-exports
-#[cfg(any(feature = "http2", feature = "http3"))]
+#[cfg(all(feature = "tokio-runtime", any(feature = "http2", feature = "http3")))]
 pub use server::WebSocketServer;
 
-#[cfg(any(feature = "http2", feature = "http3"))]
+#[cfg(all(feature = "tokio-runtime", any(feature = "http2", feature = "http3")))]
 pub use client::WebSocketClient;
 
-#[cfg(any(feature = "http2", feature = "http3"))]
+#[cfg(all(feature = "tokio-runtime", any(feature = "http2", feature = "http3")))]
 pub use multiplex::MultiplexedConnection;
 
 // Re-export config types at top level for convenience
@@ -699,19 +716,232 @@ pub mod prelude {
     pub use crate::error::{Error, Result};
     pub use crate::frame::{Frame, OpCode};
     pub use crate::protocol::{Message, Role};
+    #[cfg(feature = "tokio-runtime")]
     pub use crate::pubsub::{PubSub, PublishResult, SubscriberId};
+    #[cfg(feature = "tokio-runtime")]
     pub use crate::stream::WebSocketStream;
     pub use crate::transport::{Http1, Http2, Http3, Transport};
 
-    #[cfg(any(feature = "http2", feature = "http3"))]
+    #[cfg(feature = "compio-runtime")]
+    pub use crate::compio::CompioWebSocketStream;
+
+    #[cfg(all(feature = "tokio-runtime", any(feature = "http2", feature = "http3")))]
     pub use crate::extended_connect::ExtendedConnectRequest;
 
-    #[cfg(any(feature = "http2", feature = "http3"))]
+    #[cfg(all(feature = "tokio-runtime", any(feature = "http2", feature = "http3")))]
     pub use crate::server::WebSocketServer;
 
-    #[cfg(any(feature = "http2", feature = "http3"))]
+    #[cfg(all(feature = "tokio-runtime", any(feature = "http2", feature = "http3")))]
     pub use crate::client::WebSocketClient;
 
-    #[cfg(any(feature = "http2", feature = "http3"))]
+    #[cfg(all(feature = "tokio-runtime", any(feature = "http2", feature = "http3")))]
     pub use crate::multiplex::MultiplexedConnection;
+}
+
+#[cfg(all(test, feature = "tokio-runtime", feature = "http2"))]
+mod tokio_http2_tests {
+    use futures_util::{SinkExt, StreamExt};
+
+    use crate::{Config, Http2, Message, WebSocketClient, WebSocketServer};
+
+    #[tokio::test]
+    async fn tokio_http2_echo_round_trip() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let server_task = tokio::spawn(async move {
+            let server = WebSocketServer::<Http2>::new(Config::default());
+            server
+                .serve(server_io, |mut ws, req| async move {
+                    assert_eq!(req.path, "/h2");
+                    let msg = ws.next().await.unwrap().unwrap();
+                    assert!(matches!(&msg, Message::Text(text) if text == "h2"));
+                    ws.send(msg).await.unwrap();
+                })
+                .await
+                .unwrap();
+        });
+
+        let client = WebSocketClient::<Http2>::new(Config::default());
+        let mut ws = client
+            .connect(client_io, "https://localhost/h2", None)
+            .await
+            .unwrap();
+
+        ws.send(Message::text("h2")).await.unwrap();
+        let echoed = ws.next().await.unwrap().unwrap();
+        assert!(matches!(echoed, Message::Text(text) if text == "h2"));
+
+        drop(ws);
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tokio_http2_multiplexed_round_trip() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let server_task = tokio::spawn(async move {
+            let server = WebSocketServer::<Http2>::new(Config::default());
+            server
+                .serve(server_io, |mut ws, req| async move {
+                    assert!(matches!(req.path.as_str(), "/one" | "/two"));
+                    let msg = ws.next().await.unwrap().unwrap();
+                    ws.send(msg).await.unwrap();
+                })
+                .await
+                .unwrap();
+        });
+
+        let client = WebSocketClient::<Http2>::new(Config::default());
+        let mut mux = client.connect_multiplexed(client_io).await.unwrap();
+        let mut one = mux
+            .open_websocket("https://localhost/one", None)
+            .await
+            .unwrap();
+        let mut two = mux
+            .open_websocket("https://localhost/two", None)
+            .await
+            .unwrap();
+
+        one.send(Message::text("one")).await.unwrap();
+        two.send(Message::text("two")).await.unwrap();
+
+        let echoed = one.next().await.unwrap().unwrap();
+        assert!(matches!(echoed, Message::Text(text) if text == "one"));
+        let echoed = two.next().await.unwrap().unwrap();
+        assert!(matches!(echoed, Message::Text(text) if text == "two"));
+
+        drop(one);
+        drop(two);
+        drop(mux);
+        server_task.await.unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "tokio-runtime", feature = "http3"))]
+mod tokio_http3_tests {
+    use std::sync::Arc;
+
+    use futures_util::{SinkExt, StreamExt};
+
+    use crate::{Config, Http3, Message, WebSocketClient, WebSocketServer};
+
+    fn install_test_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    #[tokio::test]
+    async fn tokio_http3_echo_round_trip() {
+        install_test_crypto_provider();
+
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
+
+        let server_tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
+        let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).unwrap();
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let server = WebSocketServer::<Http3>::from_endpoint(endpoint.clone(), Config::default());
+
+        let server_task = tokio::spawn(async move {
+            server
+                .serve(|mut ws, req| async move {
+                    assert_eq!(req.path, "/h3");
+                    let msg = ws.next().await.unwrap().unwrap();
+                    assert!(matches!(&msg, Message::Text(text) if text == "h3"));
+                    ws.send(msg).await.unwrap();
+                })
+                .await
+                .unwrap();
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let client_tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+        let client = WebSocketClient::<Http3>::new(Config::default());
+        let mut ws = client
+            .connect(addr, "localhost", "/h3", client_tls)
+            .await
+            .unwrap();
+
+        ws.send(Message::text("h3")).await.unwrap();
+        let echoed = ws.next().await.unwrap().unwrap();
+        assert!(matches!(echoed, Message::Text(text) if text == "h3"));
+
+        drop(ws);
+        endpoint.close(quinn::VarInt::from_u32(0x100), b"done");
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tokio_http3_multiplexed_round_trip() {
+        install_test_crypto_provider();
+
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
+
+        let server_tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
+        let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).unwrap();
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let server = WebSocketServer::<Http3>::from_endpoint(endpoint.clone(), Config::default());
+
+        let server_task = tokio::spawn(async move {
+            server
+                .serve(|mut ws, req| async move {
+                    assert!(matches!(req.path.as_str(), "/one" | "/two"));
+                    let msg = ws.next().await.unwrap().unwrap();
+                    ws.send(msg).await.unwrap();
+                })
+                .await
+                .unwrap();
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let client_tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+        let client = WebSocketClient::<Http3>::new(Config::default());
+        let mut mux = client
+            .connect_multiplexed(addr, "localhost", client_tls)
+            .await
+            .unwrap();
+
+        let mut one = mux.open_websocket("/one", None).await.unwrap();
+        let mut two = mux.open_websocket("/two", None).await.unwrap();
+
+        one.send(Message::text("one")).await.unwrap();
+        two.send(Message::text("two")).await.unwrap();
+
+        let echoed = one.next().await.unwrap().unwrap();
+        assert!(matches!(echoed, Message::Text(text) if text == "one"));
+        let echoed = two.next().await.unwrap().unwrap();
+        assert!(matches!(echoed, Message::Text(text) if text == "two"));
+
+        drop(one);
+        drop(two);
+        drop(mux);
+        endpoint.close(quinn::VarInt::from_u32(0x100), b"done");
+        server_task.await.unwrap();
+    }
 }

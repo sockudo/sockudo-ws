@@ -817,8 +817,10 @@ mod tests {
         use crate::deflate::DeflateConfig;
 
         // Test with deflate enabled
-        let mut config = Config::default();
-        config.deflate = Some(DeflateConfig::default());
+        let config = Config {
+            deflate: Some(DeflateConfig::default()),
+            ..Default::default()
+        };
 
         assert!(config.deflate.is_some());
 
@@ -848,8 +850,10 @@ mod tests {
         #[cfg(feature = "permessage-deflate")]
         {
             use crate::deflate::DeflateConfig;
-            let mut test_config = Config::default();
-            test_config.deflate = Some(DeflateConfig::default());
+            let test_config = Config {
+                deflate: Some(DeflateConfig::default()),
+                ..Default::default()
+            };
             assert!(test_config.deflate.is_some());
         }
     }
@@ -1011,16 +1015,18 @@ mod tests {
 
         // When both deflate config and compression mode are set,
         // deflate config should take priority
-        let mut config = Config::default();
-        config.compression = Compression::Window4KB;
-        config.deflate = Some(DeflateConfig {
-            server_max_window_bits: 15,
-            client_max_window_bits: 15,
-            server_no_context_takeover: false,
-            client_no_context_takeover: false,
-            compression_level: 9,
-            compression_threshold: 16,
-        });
+        let config = Config {
+            compression: Compression::Window4KB,
+            deflate: Some(DeflateConfig {
+                server_max_window_bits: 15,
+                client_max_window_bits: 15,
+                server_no_context_takeover: false,
+                client_no_context_takeover: false,
+                compression_level: 9,
+                compression_threshold: 16,
+            }),
+            ..Default::default()
+        };
 
         // Simulate the negotiation logic from on_upgrade
         let deflate_config = config

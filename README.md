@@ -1,6 +1,6 @@
 # sockudo-ws
 
-Ultra-low latency WebSocket library for Rust, designed for high-frequency trading (HFT) applications and real-time systems. Fully compatible with Tokio and Axum.
+Ultra-low latency WebSocket library for Rust, designed for high-frequency trading (HFT) applications and real-time systems. Fully compatible with Tokio, Compio, and Axum.
 
 Will be used in [Sockudo](https://github.com/RustNSparks/sockudo), a high-performance Pusher-compatible WebSocket server.
 
@@ -77,6 +77,7 @@ sockudo-ws matches or exceeds uWebSockets performance while providing a safe, er
 - **Write Batching (Corking)**: Minimizes syscalls via vectored I/O
 - **permessage-deflate**: Full compression support with shared/dedicated compressors
 - **Lock-Free Split Streams**: True concurrent read/write using OS-level stream splitting (zero mutex contention)
+- **Runtime-Separated APIs**: Tokio support via `tokio-runtime`, native Compio support via `compio-runtime`
 - **Pub/Sub System**: High-performance topic-based messaging with sender exclusion
 - **HTTP/2 WebSocket**: RFC 8441 Extended CONNECT protocol support
 - **HTTP/3 WebSocket**: RFC 9220 WebSocket over QUIC support
@@ -103,6 +104,13 @@ sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["h
 
 # With io_uring (Linux only)
 sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["io-uring"] }
+
+# With native Compio runtime support
+sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", default-features = false, features = ["compio-runtime", "fastrand"] }
+
+# With Compio and HTTP/2 or HTTP/3 transports
+sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", default-features = false, features = ["compio-runtime", "http2", "fastrand"] }
+sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", default-features = false, features = ["compio-runtime", "http3", "fastrand"] }
 
 # With TLS (rustls)
 sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["rustls-webpki-roots"] }
@@ -189,6 +197,48 @@ async fn handle(stream: TcpStream) {
 - ✅ **OS-level splitting** - leverages tokio's optimized `ReadHalf` and `WriteHalf`
 - ✅ **True concurrency** - can read and write simultaneously without blocking
 - ✅ **Control frame coordination** - Ping/Pong/Close handled via lightweight mpsc channel
+
+### Native Compio Runtime
+
+Compio uses completion-based I/O, so sockudo-ws exposes a native async-method API behind `compio-runtime`:
+
+```rust
+use sockudo_ws::compio::{accept_async, connect_async, net::{TcpListener, TcpStream}};
+use sockudo_ws::{Config, Message};
+
+#[sockudo_ws::compio::main]
+async fn main() -> sockudo_ws::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:9001").await?;
+
+    let server = sockudo_ws::compio::runtime::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (mut ws, _) = accept_async(stream, Config::default()).await.unwrap();
+
+        while let Some(msg) = ws.next().await {
+            let msg = msg.unwrap();
+            if matches!(msg, Message::Close(_)) {
+                break;
+            }
+            ws.send(msg).await.unwrap();
+        }
+    });
+
+    let stream = TcpStream::connect("127.0.0.1:9001").await?;
+    let (mut ws, _) = connect_async(
+        stream,
+        "127.0.0.1:9001",
+        "/",
+        None,
+        Config::default(),
+    )
+    .await?;
+    ws.send_text("hello").await?;
+    let _ = ws.next().await;
+
+    server.await.unwrap();
+    Ok(())
+}
+```
 
 ### Pub/Sub System
 
@@ -602,6 +652,7 @@ let config = Config::builder()
 |---------|---------|-------------|
 | `simd` | ✅ | SIMD acceleration for masking and UTF-8 |
 | `tokio-runtime` | ✅ | Tokio async runtime support |
+| `compio-runtime` | ❌ | Native Compio runtime support |
 | `permessage-deflate` | ✅ | Compression support (RFC 7692) |
 | `fastrand` | ✅ | Fast PRNG for client mask generation |
 
@@ -645,6 +696,8 @@ For client mask generation:
 | `rand_rng` | Use rand crate |
 
 ### Transport Features
+
+Transport features are runtime-neutral. Pair `http2` or `http3` with either `tokio-runtime` or `compio-runtime`.
 
 | Feature | Description |
 |---------|-------------|
@@ -783,6 +836,8 @@ cargo test
 ```bash
 cargo test --features http2
 cargo test --features http3
+cargo test --no-default-features --features compio-runtime,http2
+cargo test --no-default-features --features compio-runtime,http3
 cargo test --features full
 ```
 
@@ -839,10 +894,10 @@ cargo run --example split_echo
 cargo run --example axum_echo
 
 # HTTP/2 WebSocket server
-cargo run --example http2_echo --features http2
+cargo run --example http2_echo --features tokio-runtime,http2
 
 # HTTP/3 WebSocket server
-cargo run --example http3_echo --features http3
+cargo run --example http3_echo --features tokio-runtime,http3
 ```
 
 ## Architecture

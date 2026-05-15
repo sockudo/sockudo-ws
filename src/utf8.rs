@@ -47,13 +47,13 @@ pub fn validate_utf8(data: &[u8]) -> bool {
         target_arch = "wasm32",
     ))]
     {
-        return simdutf8::basic::from_utf8(data).is_ok();
+        simdutf8::basic::from_utf8(data).is_ok()
     }
 
     // For LoongArch64 with nightly, use custom SIMD implementation
     #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
     {
-        return validate_utf8_loongarch(data);
+        validate_utf8_loongarch(data)
     }
 
     // For PowerPC with nightly, use custom SIMD implementation
@@ -62,13 +62,13 @@ pub fn validate_utf8(data: &[u8]) -> bool {
         feature = "nightly"
     ))]
     {
-        return validate_utf8_powerpc(data);
+        validate_utf8_powerpc(data)
     }
 
     // For s390x with nightly, use custom SIMD implementation
     #[cfg(all(target_arch = "s390x", feature = "nightly"))]
     {
-        return validate_utf8_s390x(data);
+        validate_utf8_s390x(data)
     }
 
     // Fallback to simdutf8 (which falls back to std on unsupported platforms)

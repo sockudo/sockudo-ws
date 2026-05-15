@@ -60,18 +60,23 @@
 //! }
 //! ```
 
+#[cfg(feature = "tokio-runtime")]
 pub mod stream;
 
 // Re-export stream type
+#[cfg(feature = "tokio-runtime")]
 pub use stream::Http2Stream;
 
 // Re-export unified types with Http2 transport
+#[cfg(feature = "tokio-runtime")]
 pub use crate::client::WebSocketClient;
 pub use crate::extended_connect::{
     ExtendedConnectConfig, ExtendedConnectRequest, ExtendedConnectResponse,
 };
 pub use crate::extended_connect::{build_extended_connect_error, build_extended_connect_response};
+#[cfg(feature = "tokio-runtime")]
 pub use crate::multiplex::MultiplexedConnection;
+#[cfg(feature = "tokio-runtime")]
 pub use crate::server::WebSocketServer;
 pub use crate::transport::Http2;
 

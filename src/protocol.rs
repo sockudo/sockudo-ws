@@ -43,6 +43,63 @@ pub enum Message {
     Close(Option<CloseReason>),
 }
 
+/// WebSocket message without text UTF-8 validation.
+///
+/// This is intended for protocol adapters and benchmarks that need to echo or
+/// route already-framed payloads without interpreting text contents. Use
+/// [`Message`] for normal application handling.
+#[derive(Debug, Clone)]
+pub enum RawMessage {
+    /// Text message bytes, not UTF-8 validated
+    Text(Bytes),
+    /// Binary message bytes
+    Binary(Bytes),
+    /// Ping control frame
+    Ping(Bytes),
+    /// Pong control frame
+    Pong(Bytes),
+    /// Close message
+    Close(Option<CloseReason>),
+}
+
+impl RawMessage {
+    /// Returns the opcode that should be used to encode this message.
+    #[inline]
+    pub fn opcode(&self) -> OpCode {
+        match self {
+            RawMessage::Text(_) => OpCode::Text,
+            RawMessage::Binary(_) => OpCode::Binary,
+            RawMessage::Ping(_) => OpCode::Ping,
+            RawMessage::Pong(_) => OpCode::Pong,
+            RawMessage::Close(_) => OpCode::Close,
+        }
+    }
+
+    /// Returns the payload bytes for data and ping/pong messages.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            RawMessage::Text(b)
+            | RawMessage::Binary(b)
+            | RawMessage::Ping(b)
+            | RawMessage::Pong(b) => b,
+            RawMessage::Close(_) => &[],
+        }
+    }
+
+    /// Converts this raw message into its payload bytes.
+    #[inline]
+    pub fn into_bytes(self) -> Bytes {
+        match self {
+            RawMessage::Text(b)
+            | RawMessage::Binary(b)
+            | RawMessage::Ping(b)
+            | RawMessage::Pong(b) => b,
+            RawMessage::Close(_) => Bytes::new(),
+        }
+    }
+}
+
 impl Message {
     /// Create a text message from a string
     #[inline]
@@ -293,6 +350,41 @@ impl Protocol {
         Ok(())
     }
 
+    /// Process incoming data and return complete raw messages.
+    ///
+    /// Unlike [`Protocol::process`], this path does not validate text payloads
+    /// as UTF-8. It is useful for low-level adapters that only need to proxy or
+    /// echo frames and want to avoid extra payload scans.
+    #[inline]
+    pub fn process_raw(&mut self, buf: &mut BytesMut) -> Result<Vec<RawMessage>> {
+        let mut messages = Vec::new();
+        self.process_raw_into(buf, &mut messages)?;
+        Ok(messages)
+    }
+
+    /// Process incoming data into a reusable raw message buffer.
+    #[inline]
+    pub fn process_raw_into(
+        &mut self,
+        buf: &mut BytesMut,
+        messages: &mut Vec<RawMessage>,
+    ) -> Result<()> {
+        messages.clear();
+
+        while !buf.is_empty() {
+            match self.parser.parse(buf)? {
+                Some(frame) => {
+                    if let Some(msg) = self.handle_raw_frame(frame)? {
+                        messages.push(msg);
+                    }
+                }
+                None => break,
+            }
+        }
+
+        Ok(())
+    }
+
     /// Handle a single parsed frame
     fn handle_frame(&mut self, frame: Frame) -> Result<Option<Message>> {
         match frame.header.opcode {
@@ -302,6 +394,21 @@ impl Protocol {
             OpCode::Close => self.handle_close(frame),
             OpCode::Ping => self.handle_ping(frame),
             OpCode::Pong => self.handle_pong(frame),
+        }
+    }
+
+    /// Handle a single parsed frame without text validation.
+    fn handle_raw_frame(&mut self, frame: Frame) -> Result<Option<RawMessage>> {
+        match frame.header.opcode {
+            OpCode::Continuation => self.handle_raw_continuation(frame),
+            OpCode::Text => self.handle_raw_text(frame),
+            OpCode::Binary => self.handle_raw_binary(frame),
+            OpCode::Close => match self.handle_close(frame)? {
+                Some(Message::Close(reason)) => Ok(Some(RawMessage::Close(reason))),
+                _ => Ok(None),
+            },
+            OpCode::Ping => Ok(Some(RawMessage::Ping(frame.payload))),
+            OpCode::Pong => Ok(Some(RawMessage::Pong(frame.payload))),
         }
     }
 
@@ -341,6 +448,34 @@ impl Protocol {
         }
     }
 
+    /// Handle text frame without UTF-8 validation.
+    fn handle_raw_text(&mut self, frame: Frame) -> Result<Option<RawMessage>> {
+        if self.fragment_opcode.is_some() {
+            return Err(Error::Protocol("expected continuation frame"));
+        }
+
+        if frame.header.fin {
+            Ok(Some(RawMessage::Text(frame.payload)))
+        } else {
+            self.start_raw_fragment(OpCode::Text, frame.payload)?;
+            Ok(None)
+        }
+    }
+
+    /// Handle binary frame for raw processing.
+    fn handle_raw_binary(&mut self, frame: Frame) -> Result<Option<RawMessage>> {
+        if self.fragment_opcode.is_some() {
+            return Err(Error::Protocol("expected continuation frame"));
+        }
+
+        if frame.header.fin {
+            Ok(Some(RawMessage::Binary(frame.payload)))
+        } else {
+            self.start_raw_fragment(OpCode::Binary, frame.payload)?;
+            Ok(None)
+        }
+    }
+
     /// Handle continuation frame
     fn handle_continuation(&mut self, frame: Frame) -> Result<Option<Message>> {
         let opcode = self
@@ -370,6 +505,26 @@ impl Protocol {
         }
     }
 
+    /// Handle continuation frame without UTF-8 validation.
+    fn handle_raw_continuation(&mut self, frame: Frame) -> Result<Option<RawMessage>> {
+        let opcode = self
+            .fragment_opcode
+            .ok_or(Error::Protocol("unexpected continuation frame"))?;
+
+        let new_size = self.fragment_buf.len() + frame.payload.len();
+        if new_size > self.max_message_size {
+            return Err(Error::MessageTooLarge);
+        }
+
+        self.fragment_buf.extend_from_slice(&frame.payload);
+
+        if frame.header.fin {
+            self.complete_raw_fragment(opcode)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Start a fragmented message
     pub(crate) fn start_fragment(&mut self, opcode: OpCode, payload: Bytes) -> Result<()> {
         if payload.len() > self.max_message_size {
@@ -391,6 +546,18 @@ impl Protocol {
         Ok(())
     }
 
+    /// Start a fragmented raw message without UTF-8 validation.
+    fn start_raw_fragment(&mut self, opcode: OpCode, payload: Bytes) -> Result<()> {
+        if payload.len() > self.max_message_size {
+            return Err(Error::MessageTooLarge);
+        }
+
+        self.fragment_opcode = Some(opcode);
+        self.fragment_buf.clear();
+        self.fragment_buf.extend_from_slice(&payload);
+        Ok(())
+    }
+
     /// Complete a fragmented message
     fn complete_fragment(&mut self, opcode: OpCode) -> Result<Option<Message>> {
         self.fragment_opcode = None;
@@ -405,6 +572,18 @@ impl Protocol {
                 Ok(Some(Message::Text(data)))
             }
             OpCode::Binary => Ok(Some(Message::Binary(data))),
+            _ => Err(Error::Protocol("invalid fragment opcode")),
+        }
+    }
+
+    /// Complete a fragmented raw message without UTF-8 validation.
+    fn complete_raw_fragment(&mut self, opcode: OpCode) -> Result<Option<RawMessage>> {
+        self.fragment_opcode = None;
+        let data = self.fragment_buf.split().freeze();
+
+        match opcode {
+            OpCode::Text => Ok(Some(RawMessage::Text(data))),
+            OpCode::Binary => Ok(Some(RawMessage::Binary(data))),
             _ => Err(Error::Protocol("invalid fragment opcode")),
         }
     }
@@ -1269,5 +1448,23 @@ mod tests {
         assert_eq!(buf[0], 0x81); // FIN + Text
         assert_eq!(buf[1], 0x04); // Length 4 (no mask for server)
         assert_eq!(&buf[2..], b"test");
+    }
+
+    #[test]
+    fn test_raw_text_skips_utf8_validation() {
+        let mut raw_protocol = Protocol::new(Role::Server, 1024 * 1024, 64 * 1024 * 1024);
+        let mut validated_protocol = Protocol::new(Role::Server, 1024 * 1024, 64 * 1024 * 1024);
+        let mask = [0, 0, 0, 0];
+
+        let mut raw_buf = BytesMut::new();
+        encode_frame(&mut raw_buf, OpCode::Text, &[0xff], true, Some(mask));
+        let mut validated_buf = raw_buf.clone();
+
+        let raw_messages = raw_protocol.process_raw(&mut raw_buf).unwrap();
+        assert_eq!(raw_messages.len(), 1);
+        assert!(matches!(&raw_messages[0], RawMessage::Text(bytes) if bytes.as_ref() == [0xff]));
+
+        let validated = validated_protocol.process(&mut validated_buf);
+        assert!(matches!(validated, Err(Error::InvalidUtf8)));
     }
 }

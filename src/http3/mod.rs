@@ -104,18 +104,23 @@
 //! on Linux when available, providing optimal performance without
 //! any extra configuration.
 
+#[cfg(feature = "tokio-runtime")]
 pub mod stream;
 
 // Re-export stream types
+#[cfg(feature = "tokio-runtime")]
 pub use stream::{Http3ClientStream, Http3ServerStream, Http3Stream};
 
 // Re-export unified types with Http3 transport
+#[cfg(feature = "tokio-runtime")]
 pub use crate::client::WebSocketClient;
 pub use crate::extended_connect::{
     ExtendedConnectConfig, ExtendedConnectRequest, ExtendedConnectResponse,
 };
 pub use crate::extended_connect::{build_extended_connect_error, build_extended_connect_response};
+#[cfg(feature = "tokio-runtime")]
 pub use crate::multiplex::MultiplexedConnection;
+#[cfg(feature = "tokio-runtime")]
 pub use crate::server::WebSocketServer;
 pub use crate::transport::Http3;
 

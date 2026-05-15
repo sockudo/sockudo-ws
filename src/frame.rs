@@ -843,6 +843,44 @@ pub fn encode_frame(
     encode_frame_with_rsv(buf, opcode, payload, fin, mask, false)
 }
 
+/// Encode only a WebSocket frame header into a buffer.
+///
+/// This is useful for zero-copy writes where the header and payload are sent
+/// with vectored I/O instead of copying the payload into a combined buffer.
+#[inline]
+pub fn encode_frame_header(
+    buf: &mut BytesMut,
+    opcode: OpCode,
+    payload_len: usize,
+    fin: bool,
+    mask: Option<[u8; 4]>,
+) {
+    encode_frame_header_with_rsv(buf, opcode, payload_len, fin, mask, false)
+}
+
+/// Encode only a WebSocket frame header with RSV1 bit control.
+#[inline]
+pub fn encode_frame_header_with_rsv(
+    buf: &mut BytesMut,
+    opcode: OpCode,
+    payload_len: usize,
+    fin: bool,
+    mask: Option<[u8; 4]>,
+    rsv1: bool,
+) {
+    let header = FrameHeader {
+        fin,
+        rsv1,
+        rsv2: false,
+        rsv3: false,
+        opcode,
+        masked: mask.is_some(),
+        payload_len: payload_len as u64,
+        mask,
+    };
+    header.encode(buf);
+}
+
 /// Encode a frame with RSV1 bit control (for compression)
 ///
 /// When `rsv1` is true, sets the RSV1 bit indicating compressed data.
@@ -1033,6 +1071,19 @@ mod tests {
         assert_eq!(buf[0], 0x81); // FIN + Text
         assert_eq!(buf[1], 0x05); // Length 5
         assert_eq!(&buf[2..], b"hello");
+    }
+
+    #[test]
+    fn test_encode_frame_header_matches_frame_prefix() {
+        let payload = vec![0x42; 8192];
+        let mut frame = BytesMut::new();
+        let mut header = BytesMut::new();
+
+        encode_frame(&mut frame, OpCode::Binary, &payload, true, None);
+        encode_frame_header(&mut header, OpCode::Binary, payload.len(), true, None);
+
+        assert_eq!(&frame[..header.len()], &header[..]);
+        assert_eq!(&frame[header.len()..], &payload);
     }
 
     #[test]
