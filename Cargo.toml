@@ -46,7 +46,7 @@ tokio-runtime = [
     "dep:tokio-util",
     "tokio-util/codec",
 ]
-compio-runtime = ["dep:compio"]
+compio-runtime = ["dep:compio", "compio/polling"]
 
 # Framework integrations
 axum-integration = ["axum", "hyper", "hyper-util", "tokio-runtime"]

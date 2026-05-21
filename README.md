@@ -96,11 +96,15 @@ sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws" }
 # With compression
 sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["permessage-deflate"] }
 
-# With HTTP/2 support
+# Default Tokio runtime with HTTP/2 support
 sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["http2"] }
 
-# With HTTP/3 support
+# Default Tokio runtime with HTTP/3 support
 sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["http3"] }
+
+# Tokio runtime without default features
+sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", default-features = false, features = ["tokio-runtime", "http2", "fastrand"] }
+sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", default-features = false, features = ["tokio-runtime", "http3", "fastrand"] }
 
 # With io_uring (Linux only)
 sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["io-uring"] }
@@ -127,6 +131,17 @@ sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["f
 # With mimalloc allocator (recommended for production)
 sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["mimalloc"] }
 ```
+
+### Runtime and Transport Features
+
+Runtime selection is independent from protocol selection. Enable exactly the runtime API you want, then add `http2` and/or `http3` for extended CONNECT transports.
+
+| Runtime feature | HTTP/1.1 WebSocket | HTTP/2 WebSocket | HTTP/3 WebSocket |
+|-----------------|--------------------|------------------|------------------|
+| `tokio-runtime` | `WebSocketStream` / `WebSocketClient<Http1>` | `WebSocketClient<Http2>`, `WebSocketServer<Http2>`, `MultiplexedConnection<Http2>` | `WebSocketClient<Http3>`, `WebSocketServer<Http3>`, `MultiplexedConnection<Http3>` |
+| `compio-runtime` | `compio::accept_async`, `compio::connect_async` | `compio::serve_http2`, `compio::connect_http2`, `compio::connect_http2_multiplexed` | `compio::CompioHttp3Server`, `compio::connect_http3`, `compio::connect_http3_multiplexed` |
+
+The `http2` and `http3` features do not select a runtime. For example, `default-features = false, features = ["compio-runtime", "http2"]` builds Compio HTTP/2 support without enabling the Tokio runtime API.
 
 ## Quick Start
 
@@ -236,6 +251,86 @@ async fn main() -> sockudo_ws::Result<()> {
     let _ = ws.next().await;
 
     server.await.unwrap();
+    Ok(())
+}
+```
+
+### Compio HTTP/2 and HTTP/3
+
+Compio uses the same `http2` and `http3` transport features as Tokio. Only the runtime feature changes.
+
+```rust
+use sockudo_ws::compio::{
+    connect_http2, serve_http2,
+    net::{TcpListener, TcpStream},
+};
+use sockudo_ws::Config;
+
+#[sockudo_ws::compio::main]
+async fn main() -> sockudo_ws::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:9002").await?;
+    let addr = listener.local_addr()?;
+
+    let server = sockudo_ws::compio::runtime::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        serve_http2(stream, Config::default(), |mut ws, _req| async move {
+            if let Some(Ok(msg)) = ws.next().await {
+                ws.send(msg).await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    });
+
+    let stream = TcpStream::connect(addr).await?;
+    let mut ws = connect_http2(
+        stream,
+        &format!("https://localhost:{}/chat", addr.port()),
+        None,
+        Config::default(),
+    )
+    .await?;
+
+    ws.send_text("hello over h2").await?;
+    let _ = ws.next().await;
+
+    server.await.unwrap();
+    Ok(())
+}
+```
+
+```rust
+use sockudo_ws::compio::{CompioHttp3Server, connect_http3_multiplexed};
+use sockudo_ws::Config;
+
+async fn http3_example(
+    server_addr: std::net::SocketAddr,
+    server_tls: rustls::ServerConfig,
+    client_tls: rustls::ClientConfig,
+) -> sockudo_ws::Result<()> {
+    let server = CompioHttp3Server::bind(server_addr, server_tls, Config::default()).await?;
+    let addr = server.local_addr()?;
+
+    let server_task = sockudo_ws::compio::runtime::spawn(async move {
+        server
+            .serve(|mut ws, _req| async move {
+                if let Some(Ok(msg)) = ws.next().await {
+                    ws.send(msg).await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+    });
+
+    let mut mux = connect_http3_multiplexed(addr, "localhost", client_tls, Config::default()).await?;
+    let mut chat = mux.open_websocket("/chat", None).await?;
+    let mut notifications = mux.open_websocket("/notifications", None).await?;
+
+    chat.send_text("hello h3").await?;
+    notifications.send_text("ping").await?;
+
+    mux.close();
+    server_task.await.unwrap();
     Ok(())
 }
 ```
@@ -652,7 +747,7 @@ let config = Config::builder()
 |---------|---------|-------------|
 | `simd` | ✅ | SIMD acceleration for masking and UTF-8 |
 | `tokio-runtime` | ✅ | Tokio async runtime support |
-| `compio-runtime` | ❌ | Native Compio runtime support |
+| `compio-runtime` | ❌ | Native Compio runtime support with a portable polling driver |
 | `permessage-deflate` | ✅ | Compression support (RFC 7692) |
 | `fastrand` | ✅ | Fast PRNG for client mask generation |
 
@@ -841,6 +936,16 @@ cargo test --no-default-features --features compio-runtime,http3
 cargo test --features full
 ```
 
+### End-to-End Transport Tests
+
+These tests bind real loopback TCP/QUIC endpoints and use the public runtime APIs for HTTP/2 and HTTP/3 WebSocket handshakes.
+
+```bash
+cargo test --all-features --test e2e_runtime_transports
+cargo test --no-default-features --features tokio-runtime,http2,http3 --test e2e_runtime_transports
+cargo test --no-default-features --features compio-runtime,http2,http3 --test e2e_runtime_transports
+```
+
 ### Autobahn Test Suite
 
 ```bash
@@ -923,6 +1028,7 @@ sockudo-ws/
 │   ├── client.rs         # WebSocketClient<T: Transport>
 │   ├── multiplex.rs      # MultiplexedConnection
 │   ├── extended_connect.rs # Shared Extended CONNECT logic
+│   ├── compio.rs         # Native Compio HTTP/1.1, HTTP/2, and HTTP/3 runtime support
 │   ├── http2/            # HTTP/2 WebSocket (RFC 8441)
 │   │   ├── mod.rs
 │   │   └── stream.rs     # Http2Stream wrapper
@@ -948,6 +1054,8 @@ sockudo-ws/
 ├── autobahn/
 │   ├── server.rs         # Autobahn test server
 │   └── Makefile          # Build and test automation
+├── tests/
+│   └── e2e_runtime_transports.rs # Tokio and Compio HTTP/2 + HTTP/3 loopback tests
 └── benches/
     └── throughput.rs     # Criterion benchmarks
 ```
