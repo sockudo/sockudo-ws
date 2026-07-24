@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-07-24
+
+### Highlights
+
+- Added native Compio support alongside Tokio, including WebSocket handshakes,
+  plain and compressed streams, split readers/writers, HTTP/2, HTTP/3, and
+  multiplexed connections.
+- Made HTTP/2 and HTTP/3 transport features runtime-neutral so they can be
+  paired with either `tokio-runtime` or `compio-runtime`.
+- Fixed read-only WebSocket consumers so automatic Pong and Close responses
+  are flushed without requiring the caller to drive the Sink side.
+- Activated the existing `auto_ping` and `ping_interval` settings so a polled
+  read loop sends periodic Ping frames even while its peer is silent.
+
+### Added
+
+- `compio-runtime` feature with Compio-native completion-based APIs.
+- Portable Compio polling driver enabled by default through the
+  `compio-runtime` feature.
+- Runtime and transport end-to-end tests for HTTP/1, HTTP/2, HTTP/3, and
+  multiplexed WebSockets across Tokio and Compio.
+- A `wtx_bench_echo` example and expanded runtime/transport documentation.
+
+### Changed
+
+- Runtime selection is separate from transport selection. When default
+  features are disabled, select `tokio-runtime` or `compio-runtime` explicitly
+  and combine it with `http2` or `http3` as needed.
+- HTTP/2 Extended CONNECT requests now use the h2 protocol extension API.
+- HTTP/3 stream construction retains the connection handles needed by
+  multiplexed and long-lived streams.
+- Examples, binaries, and benchmarks declare the runtime features they require.
+- Corrected benchmark reproduction instructions in the README.
+
+### Fixed
+
+- Incoming Ping frames now flush their automatic Pong before `poll_next`
+  yields the Ping to a read-only consumer.
+- Incoming Close frames now flush the Close response before the stream reports
+  itself closed.
+- Compio no longer compiles with a stub driver that panics when creating a
+  runtime.
+
 ## [1.5.1] - 2026-01-02
 
 ### Fixed
@@ -243,6 +286,7 @@ ASCII fast-path strategy: Check if all bytes in a 16/32-byte chunk have high bit
 - Passes all 517 Autobahn test cases
 - Outperforms uWebSockets in benchmarks
 
+[2.0.0]: https://github.com/sockudo/sockudo-ws/compare/v1.7.5...v2.0.0
 [1.5.1]: https://github.com/RustNSparks/sockudo-ws/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/RustNSparks/sockudo-ws/compare/v1.4.3...v1.5.0
 [1.4.3]: https://github.com/RustNSparks/sockudo-ws/compare/v1.4.2...v1.4.3
