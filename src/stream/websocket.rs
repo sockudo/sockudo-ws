@@ -5,8 +5,9 @@
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures_core::Stream;
 use futures_sink::Sink;
 use pin_project_lite::pin_project;
@@ -68,6 +69,12 @@ pin_project! {
         // Pending messages from last process() call
         pending_messages: Vec<Message>,
         pending_index: usize,
+        // A control message is only returned after its automatic response is flushed.
+        pending_control_message: Option<Message>,
+        flush_on_read: bool,
+        close_after_flush: bool,
+        // Created lazily from poll_next so construction does not require a Tokio runtime.
+        auto_ping_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
         // Backpressure thresholds
         high_water_mark: usize,
         low_water_mark: usize,
@@ -103,6 +110,10 @@ where
             config,
             pending_messages: Vec::new(),
             pending_index: 0,
+            pending_control_message: None,
+            flush_on_read: false,
+            close_after_flush: false,
+            auto_ping_sleep: None,
             high_water_mark: DEFAULT_HIGH_WATER_MARK,
             low_water_mark: DEFAULT_LOW_WATER_MARK,
         }
@@ -343,9 +354,51 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
+            // Control responses and automatic pings must be driven by the read path.
+            if self.flush_on_read {
+                match self.as_mut().poll_flush(cx) {
+                    Poll::Ready(Ok(())) => {
+                        let this = self.as_mut().get_mut();
+                        this.flush_on_read = false;
+
+                        if this.close_after_flush {
+                            this.close_after_flush = false;
+                            this.state = StreamState::Closed;
+                        }
+
+                        if let Some(msg) = this.pending_control_message.take() {
+                            return Poll::Ready(Some(Ok(msg)));
+                        }
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
             // Check for connection closed
             if self.state == StreamState::Closed {
                 return Poll::Ready(None);
+            }
+
+            // Register a timer wakeup and send a Ping even when the peer is silent.
+            if self.config.auto_ping && self.config.ping_interval > 0 {
+                let interval = Duration::from_secs(self.config.ping_interval.into());
+                let this = self.as_mut().get_mut();
+                let sleep = this
+                    .auto_ping_sleep
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(interval)));
+
+                if sleep.as_mut().poll(cx).is_ready() {
+                    this.auto_ping_sleep = Some(Box::pin(tokio::time::sleep(interval)));
+                    if let Err(e) = this
+                        .protocol
+                        .encode_message(&Message::Ping(Bytes::new()), this.write_buf.buffer_mut())
+                    {
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    this.flush_on_read = true;
+                    continue;
+                }
             }
 
             // First, return any pending messages
@@ -356,6 +409,9 @@ where
                         // Queue pong response
                         let this = self.as_mut().get_mut();
                         this.protocol.encode_pong(data, this.write_buf.buffer_mut());
+                        this.pending_control_message = Some(msg);
+                        this.flush_on_read = true;
+                        continue;
                     }
                     Message::Close(reason) => {
                         let this = self.as_mut().get_mut();
@@ -363,9 +419,11 @@ where
                             // Send close response
                             this.protocol
                                 .encode_close_response(this.write_buf.buffer_mut());
-                            this.state = StreamState::Closed;
                         }
-                        return Poll::Ready(Some(Ok(Message::Close(reason.clone()))));
+                        this.pending_control_message = Some(Message::Close(reason.clone()));
+                        this.flush_on_read = true;
+                        this.close_after_flush = true;
+                        continue;
                     }
                     _ => {}
                 }
@@ -887,6 +945,10 @@ pin_project! {
         config: Config,
         pending_messages: Vec<Message>,
         pending_index: usize,
+        pending_control_message: Option<Message>,
+        flush_on_read: bool,
+        close_after_flush: bool,
+        auto_ping_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
         high_water_mark: usize,
         low_water_mark: usize,
     }
@@ -914,6 +976,10 @@ where
             config,
             pending_messages: Vec::new(),
             pending_index: 0,
+            pending_control_message: None,
+            flush_on_read: false,
+            close_after_flush: false,
+            auto_ping_sleep: None,
             high_water_mark: DEFAULT_HIGH_WATER_MARK,
             low_water_mark: DEFAULT_LOW_WATER_MARK,
         }
@@ -936,6 +1002,10 @@ where
             config,
             pending_messages: Vec::new(),
             pending_index: 0,
+            pending_control_message: None,
+            flush_on_read: false,
+            close_after_flush: false,
+            auto_ping_sleep: None,
             high_water_mark: DEFAULT_HIGH_WATER_MARK,
             low_water_mark: DEFAULT_LOW_WATER_MARK,
         }
@@ -1082,8 +1152,48 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
+            if self.flush_on_read {
+                match self.as_mut().poll_flush(cx) {
+                    Poll::Ready(Ok(())) => {
+                        let this = self.as_mut().get_mut();
+                        this.flush_on_read = false;
+
+                        if this.close_after_flush {
+                            this.close_after_flush = false;
+                            this.state = StreamState::Closed;
+                        }
+
+                        if let Some(msg) = this.pending_control_message.take() {
+                            return Poll::Ready(Some(Ok(msg)));
+                        }
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
             if self.state == StreamState::Closed {
                 return Poll::Ready(None);
+            }
+
+            if self.config.auto_ping && self.config.ping_interval > 0 {
+                let interval = Duration::from_secs(self.config.ping_interval.into());
+                let this = self.as_mut().get_mut();
+                let sleep = this
+                    .auto_ping_sleep
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(interval)));
+
+                if sleep.as_mut().poll(cx).is_ready() {
+                    this.auto_ping_sleep = Some(Box::pin(tokio::time::sleep(interval)));
+                    if let Err(e) = this
+                        .protocol
+                        .encode_message(&Message::Ping(Bytes::new()), this.write_buf.buffer_mut())
+                    {
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    this.flush_on_read = true;
+                    continue;
+                }
             }
 
             if let Some(msg) = self.as_mut().get_mut().next_pending_message() {
@@ -1091,15 +1201,20 @@ where
                     Message::Ping(data) => {
                         let this = self.as_mut().get_mut();
                         this.protocol.encode_pong(data, this.write_buf.buffer_mut());
+                        this.pending_control_message = Some(msg);
+                        this.flush_on_read = true;
+                        continue;
                     }
                     Message::Close(reason) => {
                         let this = self.as_mut().get_mut();
                         if this.state == StreamState::Open {
                             this.protocol
                                 .encode_close_response(this.write_buf.buffer_mut());
-                            this.state = StreamState::Closed;
                         }
-                        return Poll::Ready(Some(Ok(Message::Close(reason.clone()))));
+                        this.pending_control_message = Some(Message::Close(reason.clone()));
+                        this.flush_on_read = true;
+                        this.close_after_flush = true;
+                        continue;
                     }
                     _ => {}
                 }
@@ -1497,6 +1612,31 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn read_masked_control_frame(
+        io: &mut tokio::io::DuplexStream,
+        expected_opcode: u8,
+        expected_payload: &[u8],
+    ) {
+        let mut header = [0; 2];
+        io.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[0], 0x80 | expected_opcode);
+        assert_ne!(header[1] & 0x80, 0, "client frames must be masked");
+
+        let payload_len = usize::from(header[1] & 0x7f);
+        assert_eq!(payload_len, expected_payload.len());
+
+        let mut mask = [0; 4];
+        io.read_exact(&mut mask).await.unwrap();
+        let mut payload = vec![0; payload_len];
+        io.read_exact(&mut payload).await.unwrap();
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index % 4];
+        }
+        assert_eq!(payload, expected_payload);
+    }
 
     // Tests would require a mock async transport
     // For now, we just verify the types compile correctly
@@ -1507,5 +1647,52 @@ mod tests {
             .role(Role::Server)
             .max_message_size(1024 * 1024)
             .max_frame_size(64 * 1024);
+    }
+
+    #[tokio::test]
+    async fn read_only_stream_flushes_automatic_pong() {
+        let (client_io, mut server_io) = tokio::io::duplex(1024);
+        let mut ws = WebSocketStream::client(client_io, Config::default());
+
+        server_io
+            .write_all(&[0x89, 0x03, b'p', b'i', b'n'])
+            .await
+            .unwrap();
+
+        let message = ws.next().await.unwrap().unwrap();
+        assert!(matches!(message, Message::Ping(data) if data == b"pin"[..]));
+        read_masked_control_frame(&mut server_io, 0x0a, b"pin").await;
+    }
+
+    #[tokio::test]
+    async fn read_only_stream_flushes_close_response() {
+        let (client_io, mut server_io) = tokio::io::duplex(1024);
+        let mut ws = WebSocketStream::client(client_io, Config::default());
+
+        server_io
+            .write_all(&[0x88, 0x02, 0x03, 0xe8])
+            .await
+            .unwrap();
+
+        let message = ws.next().await.unwrap().unwrap();
+        assert!(matches!(message, Message::Close(Some(reason)) if reason.code == 1000));
+        read_masked_control_frame(&mut server_io, 0x08, &[0x03, 0xe8]).await;
+        assert!(ws.is_closed());
+    }
+
+    #[tokio::test]
+    async fn auto_ping_uses_configured_interval_on_read_path() {
+        let (client_io, mut server_io) = tokio::io::duplex(1024);
+        let config = Config::builder().auto_ping(true).ping_interval(1).build();
+        let mut ws = WebSocketStream::client(client_io, config);
+
+        let read_task = tokio::spawn(async move { ws.next().await });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            read_masked_control_frame(&mut server_io, 0x09, b""),
+        )
+        .await
+        .expect("automatic Ping was not sent at the configured interval");
+        read_task.abort();
     }
 }
