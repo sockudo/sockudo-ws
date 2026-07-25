@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added correlated native WebSocket keepalive for Tokio and Compio, including
+  plain/compressed unified streams, split streams, Axum, and generic
+  TCP/TLS/HTTP transport wrappers.
+- Added `Config::{pong_timeout,pong_timeout_close_code,
+  pong_timeout_close_reason,close_timeout}` and their builder methods.
+- Added typed `Error::HeartbeatTimeout` and `Error::IdleTimeout` causes.
+- Added deterministic heartbeat state-machine, Tokio split-driver, Axum
+  plain/permessage-deflate, masking, Close, and Compio control-driver tests.
+
+### Changed
+
+- `ping_interval` is now an inbound-inactivity interval rather than a fixed
+  cadence. One nonce-bearing Ping may be outstanding; only its exact Pong
+  clears the deadline.
+- `idle_timeout` now implements its documented hard inbound-idle deadline.
+  `Config::uws_defaults()` disables that independent deadline so it cannot
+  close before its first keepalive Ping.
+- Split writers are bounded command handles. A connection-scoped driver owns
+  the transport writer and prioritizes automatic Pong, Close, and heartbeat
+  traffic even when the application performs no writes.
+- Split readers expose Ping and Pong messages after automatic protocol work.
+
+### Compatibility
+
+- Existing builder-based configuration and `split()` call sites keep the same
+  method-level API. Tokio split transports must now be `Send + 'static`
+  because the writer driver is connection-scoped Tokio work.
+- Adding public `Config` fields is source-breaking for downstream exhaustive
+  struct literals; use `Config::builder()` or `..Config::default()`. Adding
+  typed public `Error` variants is source-breaking for exhaustive matches.
+  These changes are intentional so timeout causes are not collapsed into EOF.
+
 ## [2.0.0] - 2026-07-24
 
 ### Highlights

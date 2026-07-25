@@ -689,7 +689,11 @@ use sockudo_ws::{Config, Compression};
 let config = Config::builder()
     .compression(Compression::Shared)      // SHARED_COMPRESSOR
     .max_payload_length(16 * 1024)         // 16KB max message
-    .idle_timeout(10)                      // 10 second timeout
+    .ping_interval(30)                     // Ping after 30s inbound inactivity
+    .pong_timeout(10)                      // Matching Pong deadline
+    .pong_timeout_close(4201, "Pong reply not received in time")
+    .idle_timeout(0)                       // Independent hard idle limit disabled
+    .close_timeout(5)                      // Bounded Close flush/shutdown
     .max_backpressure(1024 * 1024)         // 1MB backpressure limit
     .build();
 
@@ -722,11 +726,37 @@ let config = Config::builder()
 | `compression` | `Disabled` | Compression mode |
 | `max_message_size` | 64MB | Maximum message size |
 | `max_frame_size` | 16MB | Maximum single frame size |
-| `idle_timeout` | 120s | Close connection after inactivity (0 = disabled) |
+| `idle_timeout` | 120s | Hard inbound-idle deadline, independent of Pong detection (0 = disabled) |
 | `max_backpressure` | 1MB | Max write buffer before dropping connection |
-| `auto_ping` | true | Automatic ping/pong keepalive |
-| `ping_interval` | 30s | Seconds between pings |
+| `auto_ping` | true | Enable proactive native Ping; automatic Pong/Close responses remain enabled when false |
+| `ping_interval` | 30s | Inbound inactivity before one native Ping (0 = disabled) |
+| `pong_timeout` | 10s | Matching Pong deadline after Ping flush (0 = no deadline and no second Ping until a match) |
+| `pong_timeout_close_code` | 1001 | Close code for a missed Pong |
+| `pong_timeout_close_reason` | `Pong reply not received in time` | Close reason for a missed Pong |
+| `close_timeout` | 5s | Bound for timeout Close flush and transport shutdown |
 | `write_buffer_size` | 16KB | Cork buffer size |
+
+### Native keepalive semantics
+
+Keepalive is driven by valid inbound activity, not a fixed cadence. After
+`ping_interval` with no inbound frame, sockudo-ws writes one RFC 6455 Ping with
+an opaque 8-byte nonce. The Pong timer begins only after that Ping is written
+and flushed. Only a Pong with the exact payload clears it; unsolicited, stale,
+late, or wrong-payload Pongs do not.
+
+Any valid non-Pong inbound frame resets inactivity, including while a Ping is
+outstanding, but it does not extend or satisfy that Ping's Pong deadline. If a
+hard `idle_timeout` and Pong deadline tie, the more specific Pong timeout wins,
+so only one Close and one typed terminal error are produced.
+
+On timeout, the server rejects further application data, attempts one
+configured Close within `close_timeout`, and completes local cleanup even when
+the peer is unreachable. Code 4201 can be observed on a writable path, but no
+implementation can guarantee delivery through an already-dead TCP path.
+
+These semantics are shared by Tokio and Compio, plain and
+permessage-deflate, unified and split APIs. Generic TCP/TLS and HTTP/2/HTTP/3
+streams inherit the state machine from their runtime WebSocket stream.
 
 ### Compression Modes
 
@@ -876,25 +906,27 @@ For concurrent read/write operations with zero mutex contention:
 ```rust
 let (reader, writer) = ws.split();
 
-// SplitReader - operates independently, never blocks writer
+// SplitReader - owns decoding and reports shared terminal state
 reader.next().await  // Receive message
 reader.is_closed()   // Check if closed (non-blocking)
 
-// SplitWriter - operates independently, never blocks reader
+// SplitWriter - bounded command handle to the connection writer driver
 writer.send(msg).await?;
 writer.send_text("hello").await?;
 writer.send_binary(bytes).await?;
 writer.close(1000, "bye").await?;
 writer.is_closed()   // Check if closed (non-blocking)
-writer.flush().await?;  // Flush pending control responses
+writer.flush().await?;  // Flush accepted application writes
 ```
 
 **Implementation Details:**
 - Uses `tokio::io::split()` for OS-level stream splitting
 - Reader owns `ReadHalf<S>` and protocol decoder
-- Writer owns `WriteHalf<S>` and protocol encoder
-- Control frames (Ping/Pong/Close) coordinated via mpsc channel
-- No shared mutex - true concurrent I/O
+- One connection-scoped driver exclusively owns `WriteHalf<S>` and the encoder
+- Bounded control/application queues provide backpressure under Ping floods
+- Pong and Close responses progress without later application `send()`/`flush()`
+- Dropping either half cancels the driver; EOF/Close/timeout propagates to both
+- No lock is held across an await
 
 ### Message Types
 

@@ -57,6 +57,7 @@ pub mod cork;
 pub mod error;
 pub mod frame;
 pub mod handshake;
+mod heartbeat;
 pub mod mask;
 pub mod protocol;
 #[cfg(feature = "tokio-runtime")]
@@ -435,16 +436,31 @@ pub struct Config {
     pub write_buffer_size: usize,
     /// Compression mode (default: Disabled)
     pub compression: Compression,
-    /// Idle timeout in seconds (default: 120, 0 = disabled)
-    /// Connection is closed if no data received within this time
+    /// Hard inbound-idle timeout in seconds (default: 120, 0 = disabled).
+    ///
+    /// Every valid inbound frame resets this independent deadline. When it
+    /// ties a Pong deadline, the more specific Pong timeout wins.
     pub idle_timeout: u32,
     /// Maximum backpressure in bytes before dropping connection (default: 1MB)
     /// If write buffer exceeds this, connection is closed
     pub max_backpressure: usize,
-    /// Send pings automatically to keep connection alive (default: true)
+    /// Send native Pings after inbound inactivity (default: true).
+    ///
+    /// Disabling this does not disable mandatory automatic Pong or Close
+    /// responses.
     pub auto_ping: bool,
-    /// Ping interval in seconds (default: 30)
+    /// Inbound inactivity before a native Ping (default: 30, 0 = disabled).
     pub ping_interval: u32,
+    /// Time to wait for the matching Pong after a native Ping is flushed
+    /// (default: 10 seconds, 0 = no Pong deadline).
+    pub pong_timeout: u32,
+    /// Close code used when a native Pong deadline expires (default: 1001).
+    pub pong_timeout_close_code: u16,
+    /// Close reason used when a native Pong deadline expires.
+    pub pong_timeout_close_reason: String,
+    /// Maximum time spent flushing a timeout/handshake Close and shutting down
+    /// the transport (default: 5 seconds, 0 = immediate best effort).
+    pub close_timeout: u32,
     /// Per-message deflate configuration (requires `permessage-deflate` feature)
     #[cfg(feature = "permessage-deflate")]
     pub deflate: Option<crate::deflate::DeflateConfig>,
@@ -472,6 +488,10 @@ impl Default for Config {
             max_backpressure: 1024 * 1024,
             auto_ping: true,
             ping_interval: 30,
+            pong_timeout: 10,
+            pong_timeout_close_code: crate::error::CloseReason::GOING_AWAY,
+            pong_timeout_close_reason: "Pong reply not received in time".to_string(),
+            close_timeout: 5,
             #[cfg(feature = "permessage-deflate")]
             deflate: None,
             #[cfg(feature = "http2")]
@@ -497,10 +517,17 @@ impl Config {
             max_frame_size: 16 * 1024,
             write_buffer_size: CORK_BUFFER_SIZE,
             compression: Compression::Shared,
-            idle_timeout: 10,
+            // A hard inbound-idle deadline shorter than the first Ping is
+            // surprising. uWS-style defaults therefore leave hard idle
+            // detection disabled and use correlated Ping/Pong detection.
+            idle_timeout: 0,
             max_backpressure: 1024 * 1024,
             auto_ping: true,
             ping_interval: 30,
+            pong_timeout: 10,
+            pong_timeout_close_code: crate::error::CloseReason::GOING_AWAY,
+            pong_timeout_close_reason: "Pong reply not received in time".to_string(),
+            close_timeout: 5,
             #[cfg(feature = "permessage-deflate")]
             deflate: None,
             #[cfg(feature = "http2")]
@@ -580,6 +607,30 @@ impl ConfigBuilder {
     /// Set ping interval in seconds
     pub fn ping_interval(mut self, seconds: u32) -> Self {
         self.config.ping_interval = seconds;
+        self
+    }
+
+    /// Set the matching Pong deadline in seconds.
+    ///
+    /// A value of 0 disables the deadline. The connection still keeps exactly
+    /// one Ping outstanding until its matching Pong arrives.
+    pub fn pong_timeout(mut self, seconds: u32) -> Self {
+        self.config.pong_timeout = seconds;
+        self
+    }
+
+    /// Set the Close code and reason used when the Pong deadline expires.
+    ///
+    /// The reason is truncated to the RFC 6455 control-frame limit when encoded.
+    pub fn pong_timeout_close(mut self, code: u16, reason: impl Into<String>) -> Self {
+        self.config.pong_timeout_close_code = code;
+        self.config.pong_timeout_close_reason = reason.into();
+        self
+    }
+
+    /// Set the bounded Close flush/shutdown deadline in seconds.
+    pub fn close_timeout(mut self, seconds: u32) -> Self {
+        self.config.close_timeout = seconds;
         self
     }
 

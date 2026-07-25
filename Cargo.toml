@@ -46,7 +46,12 @@ tokio-runtime = [
     "dep:tokio-util",
     "tokio-util/codec",
 ]
-compio-runtime = ["dep:compio", "compio/polling"]
+compio-runtime = [
+    "dep:compio",
+    "compio/polling",
+    "dep:futures-channel",
+    "dep:futures-util",
+]
 
 # Framework integrations
 axum-integration = ["axum", "hyper", "hyper-util", "tokio-runtime"]
@@ -124,7 +129,7 @@ tokio = { version = "^1.48", default-features = false, optional = true }
 tokio-util = { version = "^0.7", default-features = false, optional = true }
 
 # Compio completion-based async runtime
-compio = { version = "^0.18", default-features = false, features = ["net", "macros", "bytes", "sync"], optional = true }
+compio = { version = "^0.18", default-features = false, features = ["net", "macros", "bytes", "sync", "time"], optional = true }
 
 # Fast synchronization primitives for pub/sub
 parking_lot = "^0.12"
@@ -164,6 +169,8 @@ pin-project-lite = "^0.2"
 # Futures traits
 futures-core = "^0.3"
 futures-sink = "^0.3"
+futures-channel = { version = "^0.3", features = ["sink"], optional = true }
+futures-util = { version = "^0.3", default-features = false, features = ["async-await", "sink"], optional = true }
 
 # Compression (permessage-deflate, RFC 7692)
 flate2 = { version = "^1.0", default-features = false, features = ["zlib-rs"], optional = true }
@@ -209,7 +216,7 @@ tokio-uring = { version = "^0.5", optional = true }
 [dev-dependencies]
 criterion = "^0.5"
 rand = "^0.9"
-tokio = { version = "^1.48", features = ["full"] }
+tokio = { version = "^1.48", features = ["full", "test-util"] }
 tokio-tungstenite = "^0.26"
 tokio-websockets = { version = "^0.10", features = ["client", "server", "sha1_smol", "fastrand"] }
 futures-util = "^0.3"

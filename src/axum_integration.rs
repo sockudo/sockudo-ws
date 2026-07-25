@@ -704,6 +704,189 @@ mod tests {
         fn _takes_split_writer(_: crate::SplitWriter<UpgradedStream>) {}
     }
 
+    fn heartbeat_test_config() -> Config {
+        Config::builder()
+            .ping_interval(1)
+            .pong_timeout(1)
+            .idle_timeout(0)
+            .close_timeout(1)
+            .pong_timeout_close(4201, "Pong reply not received in time")
+            .build()
+    }
+
+    #[derive(Default)]
+    struct HeartbeatTestState {
+        pong_seen: tokio::sync::Notify,
+    }
+
+    async fn plain_heartbeat_handler(
+        axum::extract::State(state): axum::extract::State<std::sync::Arc<HeartbeatTestState>>,
+        upgrade: WebSocketUpgrade,
+    ) -> impl IntoResponse {
+        upgrade
+            .config(heartbeat_test_config())
+            .on_upgrade(move |socket| async move {
+                let (mut reader, _writer) = socket.split();
+                while let Some(message) = reader.next().await {
+                    if matches!(message, Ok(Message::Pong(_))) {
+                        state.pong_seen.notify_one();
+                    }
+                }
+            })
+    }
+
+    #[cfg(feature = "permessage-deflate")]
+    async fn compressed_heartbeat_handler(
+        axum::extract::State(state): axum::extract::State<std::sync::Arc<HeartbeatTestState>>,
+        upgrade: WebSocketUpgrade,
+    ) -> impl IntoResponse {
+        let config = Config::builder()
+            .ping_interval(1)
+            .pong_timeout(1)
+            .idle_timeout(0)
+            .close_timeout(1)
+            .pong_timeout_close(4201, "Pong reply not received in time")
+            .enable_deflate()
+            .build();
+        upgrade.config(config).on_upgrade(move |socket| async move {
+            let (mut reader, _writer) = socket.split();
+            while let Some(message) = reader.next().await {
+                if matches!(message, Ok(Message::Pong(_))) {
+                    state.pong_seen.notify_one();
+                }
+            }
+        })
+    }
+
+    async fn read_server_control_frame(
+        stream: &mut tokio::net::TcpStream,
+        expected_opcode: u8,
+    ) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+
+        let mut header = [0_u8; 2];
+        stream.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[0], 0x80 | expected_opcode);
+        assert_eq!(header[1] & 0x80, 0, "server frames must be unmasked");
+        let len = usize::from(header[1] & 0x7f);
+        assert!(len <= 125);
+        let mut payload = vec![0; len];
+        stream.read_exact(&mut payload).await.unwrap();
+        payload
+    }
+
+    async fn send_masked_pong(stream: &mut tokio::net::TcpStream, payload: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+
+        let mask = [0x11, 0x22, 0x33, 0x44];
+        let mut frame = Vec::with_capacity(6 + payload.len());
+        frame.push(0x8a);
+        frame.push(0x80 | payload.len() as u8);
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ mask[index % 4]),
+        );
+        stream.write_all(&frame).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    async fn connect_raw_websocket(
+        address: std::net::SocketAddr,
+        path: &str,
+        deflate: bool,
+    ) -> tokio::net::TcpStream {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let extension = if deflate {
+            "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n"
+        } else {
+            ""
+        };
+        let request = format!(
+            "GET {path} HTTP/1.1\r\n\
+             Host: {address}\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             {extension}\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut response = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !response.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            response.push(byte[0]);
+        }
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 101"));
+        if deflate {
+            assert!(
+                response
+                    .to_ascii_lowercase()
+                    .contains("sec-websocket-extensions: permessage-deflate")
+            );
+        }
+        stream
+    }
+
+    async fn assert_axum_split_heartbeat(
+        address: std::net::SocketAddr,
+        path: &str,
+        deflate: bool,
+        state: &HeartbeatTestState,
+    ) {
+        let mut stream = connect_raw_websocket(address, path, deflate).await;
+        tokio::time::pause();
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let first_ping = read_server_control_frame(&mut stream, 0x09).await;
+        assert_eq!(first_ping.len(), 8);
+        send_masked_pong(&mut stream, &first_ping).await;
+        tokio::time::resume();
+        state.pong_seen.notified().await;
+        tokio::time::pause();
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let second_ping = read_server_control_frame(&mut stream, 0x09).await;
+        assert_eq!(second_ping.len(), 8);
+        assert_ne!(first_ping, second_ping);
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let close = read_server_control_frame(&mut stream, 0x08).await;
+        assert_eq!(u16::from_be_bytes([close[0], close[1]]), 4201);
+        assert_eq!(&close[2..], b"Pong reply not received in time");
+        tokio::time::resume();
+    }
+
+    #[cfg(feature = "permessage-deflate")]
+    #[tokio::test]
+    async fn axum_split_native_heartbeat_plain_and_deflate() {
+        use axum::{Router, routing::get};
+
+        let state = std::sync::Arc::new(HeartbeatTestState::default());
+        let app = Router::new()
+            .route("/plain", get(plain_heartbeat_handler))
+            .route("/deflate", get(compressed_heartbeat_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        assert_axum_split_heartbeat(address, "/plain", false, &state).await;
+        assert_axum_split_heartbeat(address, "/deflate", true, &state).await;
+        server.abort();
+    }
+
     #[cfg(feature = "permessage-deflate")]
     #[test]
     fn test_deflate_negotiation_with_client_offer() {
