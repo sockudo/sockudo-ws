@@ -4,12 +4,15 @@
 //! from Tokio's poll-based `AsyncRead` and `AsyncWrite`. This module exposes a
 //! native async-method API for Compio streams instead of adapting through Tokio.
 
+use std::cell::Cell;
 #[cfg(any(feature = "http2", feature = "http3"))]
 use std::future::Future;
 use std::io;
+use std::marker::PhantomData;
 #[cfg(feature = "http2")]
 use std::pin::Pin;
-use std::sync::mpsc;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 #[cfg(any(feature = "http2", feature = "http3"))]
 use ::compio::buf::IoBufMut;
@@ -19,6 +22,8 @@ use ::compio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(any(feature = "http2", feature = "http3"))]
 use bytes::Buf;
 use bytes::{Bytes, BytesMut};
+use futures_channel::{mpsc, oneshot};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 
 use crate::Config;
 use crate::error::{CloseReason, Error, Result};
@@ -26,6 +31,7 @@ use crate::handshake::{
     HandshakeResult, build_request, build_response, generate_accept_key, generate_key,
     parse_request, parse_response, validate_accept_key,
 };
+use crate::heartbeat::{Deadline, Heartbeat, bounded_close_reason};
 use crate::protocol::{Message, Protocol, Role};
 
 #[cfg(any(feature = "http2", feature = "http3"))]
@@ -53,10 +59,77 @@ enum CompioStreamState {
     Closed,
 }
 
+const SPLIT_CONTROL_CAPACITY: usize = 32;
+const SPLIT_APPLICATION_CAPACITY: usize = 32;
+const SPLIT_OPEN: u8 = 0;
+const SPLIT_CLOSING: u8 = 1;
+const SPLIT_CLOSED: u8 = 2;
+
 #[derive(Debug, Clone)]
 enum ControlRequest {
-    Pong(Bytes),
-    CloseResponse,
+    Activity(Instant),
+    Pong(Bytes, Instant),
+    PeerPing(Bytes, Instant),
+    PeerClose,
+    Eof,
+}
+
+#[derive(Debug)]
+enum ApplicationRequest {
+    Send(Message, oneshot::Sender<Result<()>>),
+    Flush(oneshot::Sender<Result<()>>),
+}
+
+enum CompioReadOutcome {
+    Read(io::Result<usize>),
+    Terminal(Option<CompioTerminalCause>),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CompioTerminalCause {
+    ConnectionClosed,
+    HeartbeatTimeout,
+    IdleTimeout,
+}
+
+impl CompioTerminalCause {
+    fn error(self) -> Error {
+        match self {
+            Self::ConnectionClosed => Error::ConnectionClosed,
+            Self::HeartbeatTimeout => Error::HeartbeatTimeout,
+            Self::IdleTimeout => Error::IdleTimeout,
+        }
+    }
+}
+
+struct CompioSplitShared {
+    status: Cell<u8>,
+    terminal: Cell<Option<CompioTerminalCause>>,
+}
+
+impl CompioSplitShared {
+    fn new(closed: bool) -> Rc<Self> {
+        Rc::new(Self {
+            status: Cell::new(if closed { SPLIT_CLOSED } else { SPLIT_OPEN }),
+            terminal: Cell::new(closed.then_some(CompioTerminalCause::ConnectionClosed)),
+        })
+    }
+
+    fn is_open(&self) -> bool {
+        self.status.get() == SPLIT_OPEN
+    }
+
+    fn begin_closing(&self) {
+        if self.is_open() {
+            self.status.set(SPLIT_CLOSING);
+        }
+    }
+
+    fn terminate(&self, cause: CompioTerminalCause) {
+        if self.status.replace(SPLIT_CLOSED) != SPLIT_CLOSED {
+            self.terminal.set(Some(cause));
+        }
+    }
 }
 
 async fn read_more<R>(reader: &mut R, buf: &mut BytesMut) -> io::Result<usize>
@@ -98,6 +171,26 @@ where
 
     writer.flush().await?;
     Ok(())
+}
+
+trait CompioSplitEncoder: 'static {
+    fn encode_message(&mut self, msg: &Message, buf: &mut BytesMut) -> Result<()>;
+    fn encode_pong(&mut self, payload: &[u8], buf: &mut BytesMut);
+    fn encode_close_response(&mut self, buf: &mut BytesMut);
+}
+
+impl CompioSplitEncoder for Protocol {
+    fn encode_message(&mut self, msg: &Message, buf: &mut BytesMut) -> Result<()> {
+        Protocol::encode_message(self, msg, buf)
+    }
+
+    fn encode_pong(&mut self, payload: &[u8], buf: &mut BytesMut) {
+        Protocol::encode_pong(self, payload, buf);
+    }
+
+    fn encode_close_response(&mut self, buf: &mut BytesMut) {
+        Protocol::encode_close_response(self, buf);
+    }
 }
 
 /// Perform a server-side WebSocket handshake over a Compio stream.
@@ -1015,6 +1108,8 @@ pub struct CompioWebSocketStream<S> {
     config: Config,
     pending_messages: Vec<Message>,
     pending_index: usize,
+    clock_epoch: Instant,
+    heartbeat: Heartbeat,
     high_water_mark: usize,
     low_water_mark: usize,
 }
@@ -1040,6 +1135,8 @@ where
             read_buf.extend_from_slice(&leftover);
         }
 
+        let clock_epoch = Instant::now();
+        let heartbeat = Heartbeat::new(&config, 0);
         Self {
             inner,
             protocol: Protocol::new(role, config.max_frame_size, config.max_message_size),
@@ -1049,6 +1146,8 @@ where
             config,
             pending_messages: Vec::new(),
             pending_index: 0,
+            clock_epoch,
+            heartbeat,
             high_water_mark: DEFAULT_HIGH_WATER_MARK,
             low_water_mark: DEFAULT_LOW_WATER_MARK,
         }
@@ -1142,22 +1241,107 @@ where
             }
 
             if let Some(msg) = self.next_pending_message() {
+                let now = self.clock_epoch.elapsed().as_millis() as u64;
+                let pong = match &msg {
+                    Message::Pong(payload) => Some(payload),
+                    _ => None,
+                };
+                self.heartbeat.on_inbound(now, pong);
                 return Some(self.handle_incoming_message(msg).await);
             }
 
             match self.process_read_buf() {
                 Ok(true) => continue,
                 Ok(false) => {}
-                Err(e) => return Some(Err(e)),
+                Err(e) => {
+                    self.heartbeat.stop();
+                    self.state = CompioStreamState::Closed;
+                    return Some(Err(e));
+                }
             }
 
-            match read_more(&mut self.inner, &mut self.read_buf).await {
+            let read_result = if let Some(deadline) = self.heartbeat.next_deadline() {
+                let now = self.clock_epoch.elapsed().as_millis() as u64;
+                let delay = Duration::from_millis(deadline.at().saturating_sub(now));
+                match ::compio::time::timeout(delay, read_more(&mut self.inner, &mut self.read_buf))
+                    .await
+                {
+                    Ok(result) => Some(result),
+                    Err(_) => {
+                        let now = self.clock_epoch.elapsed().as_millis() as u64;
+                        match self.heartbeat.next_deadline() {
+                            Some(Deadline::Ping(at)) if at <= now => {
+                                if let Some(payload) = self.heartbeat.ping_due(now) {
+                                    if let Err(error) = self.protocol.encode_message(
+                                        &Message::Ping(payload),
+                                        &mut self.write_buf,
+                                    ) {
+                                        return Some(Err(error));
+                                    }
+                                    if let Err(error) = self.flush().await {
+                                        return Some(Err(error));
+                                    }
+                                    self.heartbeat.ping_flushed(
+                                        self.clock_epoch.elapsed().as_millis() as u64,
+                                    );
+                                }
+                                None
+                            }
+                            Some(Deadline::Pong(at)) if at <= now => {
+                                self.heartbeat.stop();
+                                self.state = CompioStreamState::CloseSent;
+                                let close = Message::Close(Some(CloseReason::new(
+                                    self.config.pong_timeout_close_code,
+                                    bounded_close_reason(&self.config.pong_timeout_close_reason),
+                                )));
+                                let _ = self.protocol.encode_message(&close, &mut self.write_buf);
+                                let _ = ::compio::time::timeout(
+                                    Duration::from_secs(self.config.close_timeout.into()),
+                                    self.flush(),
+                                )
+                                .await;
+                                self.state = CompioStreamState::Closed;
+                                return Some(Err(Error::HeartbeatTimeout));
+                            }
+                            Some(Deadline::Idle(at)) if at <= now => {
+                                self.heartbeat.stop();
+                                self.state = CompioStreamState::CloseSent;
+                                let close = Message::Close(Some(CloseReason::new(
+                                    CloseReason::GOING_AWAY,
+                                    "Connection idle timeout",
+                                )));
+                                let _ = self.protocol.encode_message(&close, &mut self.write_buf);
+                                let _ = ::compio::time::timeout(
+                                    Duration::from_secs(self.config.close_timeout.into()),
+                                    self.flush(),
+                                )
+                                .await;
+                                self.state = CompioStreamState::Closed;
+                                return Some(Err(Error::IdleTimeout));
+                            }
+                            _ => None,
+                        }
+                    }
+                }
+            } else {
+                Some(read_more(&mut self.inner, &mut self.read_buf).await)
+            };
+
+            let Some(read_result) = read_result else {
+                continue;
+            };
+            match read_result {
                 Ok(0) => {
+                    self.heartbeat.stop();
                     self.state = CompioStreamState::Closed;
                     return None;
                 }
                 Ok(_) => {}
-                Err(e) => return Some(Err(e.into())),
+                Err(e) => {
+                    self.heartbeat.stop();
+                    self.state = CompioStreamState::Closed;
+                    return Some(Err(e.into()));
+                }
             }
         }
     }
@@ -1170,10 +1354,16 @@ where
 
         if msg.is_close() {
             self.state = CompioStreamState::CloseSent;
+            self.heartbeat.stop();
         }
 
         self.protocol.encode_message(&msg, &mut self.write_buf)?;
-        self.flush().await
+        if let Err(error) = self.flush().await {
+            self.heartbeat.stop();
+            self.state = CompioStreamState::Closed;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Send a text message.
@@ -1234,12 +1424,20 @@ where
         match &msg {
             Message::Ping(data) => {
                 self.protocol.encode_pong(data, &mut self.write_buf);
-                self.flush().await?;
+                if let Err(error) = self.flush().await {
+                    self.heartbeat.stop();
+                    self.state = CompioStreamState::Closed;
+                    return Err(error);
+                }
             }
             Message::Close(reason) => {
+                self.heartbeat.stop();
                 if self.state == CompioStreamState::Open {
                     self.protocol.encode_close_response(&mut self.write_buf);
-                    self.flush().await?;
+                    if let Err(error) = self.flush().await {
+                        self.state = CompioStreamState::Closed;
+                        return Err(error);
+                    }
                 }
                 self.state = CompioStreamState::Closed;
                 return Ok(Message::Close(reason.clone()));
@@ -1255,7 +1453,7 @@ impl<S> CompioWebSocketStream<S>
 where
     S: Splittable,
     S::ReadHalf: AsyncRead,
-    S::WriteHalf: AsyncWrite,
+    S::WriteHalf: AsyncWrite + 'static,
 {
     /// Split the WebSocket stream into independent Compio read and write halves.
     pub fn split(
@@ -1265,13 +1463,31 @@ where
         CompioSplitWriter<S::WriteHalf>,
     ) {
         let (reader, writer) = Splittable::split(self.inner);
-        let (control_tx, control_rx) = mpsc::channel();
+        let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
+        let (application_tx, application_rx) = mpsc::channel(SPLIT_APPLICATION_CAPACITY);
+        let (cancel_tx, cancel_rx) = mpsc::unbounded();
+        let (terminal_tx, terminal_rx) = mpsc::unbounded();
+        let shared = CompioSplitShared::new(self.state != CompioStreamState::Open);
 
         let reader_protocol = Protocol::new(
             self.protocol.role,
             self.config.max_frame_size,
             self.config.max_message_size,
         );
+
+        ::compio::runtime::spawn(compio_split_writer_driver(
+            writer,
+            self.protocol,
+            self.config,
+            CompioDriverChannels {
+                control_rx,
+                application_rx,
+                cancel_rx,
+                terminal_tx,
+                shared: shared.clone(),
+            },
+        ))
+        .detach();
 
         (
             CompioSplitReader {
@@ -1281,14 +1497,16 @@ where
                 pending_messages: self.pending_messages,
                 pending_index: self.pending_index,
                 control_tx,
-                closed: self.state == CompioStreamState::Closed,
+                terminal_rx,
+                cancel_tx: cancel_tx.clone(),
+                shared: shared.clone(),
+                terminal_reported: false,
             },
             CompioSplitWriter {
-                writer,
-                protocol: self.protocol,
-                write_buf: BytesMut::with_capacity(self.config.write_buffer_size),
-                control_rx,
-                closed: self.state == CompioStreamState::Closed,
+                application_tx,
+                cancel_tx,
+                shared,
+                _writer: PhantomData,
             },
         )
     }
@@ -1375,27 +1593,39 @@ pub struct CompioSplitReader<R> {
     pending_messages: Vec<Message>,
     pending_index: usize,
     control_tx: mpsc::Sender<ControlRequest>,
-    closed: bool,
+    terminal_rx: mpsc::UnboundedReceiver<CompioTerminalCause>,
+    cancel_tx: mpsc::UnboundedSender<()>,
+    shared: Rc<CompioSplitShared>,
+    terminal_reported: bool,
 }
 
 /// Write half of a split Compio WebSocket stream.
 pub struct CompioSplitWriter<W> {
-    writer: W,
-    protocol: Protocol,
-    write_buf: BytesMut,
-    control_rx: mpsc::Receiver<ControlRequest>,
-    closed: bool,
+    application_tx: mpsc::Sender<ApplicationRequest>,
+    cancel_tx: mpsc::UnboundedSender<()>,
+    shared: Rc<CompioSplitShared>,
+    _writer: PhantomData<fn() -> W>,
 }
 
 impl<R> CompioSplitReader<R>
 where
     R: AsyncRead,
 {
-    /// Receive the next non-control message.
+    /// Receive the next message, including Ping and Pong control frames.
     pub async fn next(&mut self) -> Option<Result<Message>> {
         loop {
-            if self.closed {
-                return None;
+            if self.shared.status.get() == SPLIT_CLOSED {
+                if self.terminal_reported {
+                    return None;
+                }
+                self.terminal_reported = true;
+                return match self.shared.terminal.get() {
+                    Some(CompioTerminalCause::HeartbeatTimeout) => {
+                        Some(Err(Error::HeartbeatTimeout))
+                    }
+                    Some(CompioTerminalCause::IdleTimeout) => Some(Err(Error::IdleTimeout)),
+                    _ => None,
+                };
             }
 
             if self.pending_index < self.pending_messages.len() {
@@ -1407,21 +1637,20 @@ where
                     self.pending_index = 0;
                 }
 
-                match &msg {
-                    Message::Ping(data) => {
-                        let _ = self.control_tx.send(ControlRequest::Pong(data.clone()));
-                        continue;
+                let request = match &msg {
+                    Message::Ping(data) => ControlRequest::PeerPing(data.clone(), Instant::now()),
+                    Message::Pong(data) => ControlRequest::Pong(data.clone(), Instant::now()),
+                    Message::Close(_) => {
+                        self.shared.begin_closing();
+                        ControlRequest::PeerClose
                     }
-                    Message::Close(reason) => {
-                        if !self.closed {
-                            let _ = self.control_tx.send(ControlRequest::CloseResponse);
-                            self.closed = true;
-                        }
-                        return Some(Ok(Message::Close(reason.clone())));
-                    }
-                    Message::Pong(_) => continue,
-                    _ => return Some(Ok(msg)),
+                    _ => ControlRequest::Activity(Instant::now()),
+                };
+                if self.control_tx.send(request).await.is_err() {
+                    self.shared.terminate(CompioTerminalCause::ConnectionClosed);
+                    continue;
                 }
+                return Some(Ok(msg));
             }
 
             if !self.read_buf.is_empty() {
@@ -1432,45 +1661,67 @@ where
                         continue;
                     }
                     Ok(_) => {}
-                    Err(e) => return Some(Err(e)),
+                    Err(e) => {
+                        self.shared.terminate(CompioTerminalCause::ConnectionClosed);
+                        return Some(Err(e));
+                    }
                 }
             }
 
-            match read_more(&mut self.reader, &mut self.read_buf).await {
-                Ok(0) => {
-                    self.closed = true;
-                    return None;
+            let outcome = {
+                let read = read_more(&mut self.reader, &mut self.read_buf).fuse();
+                let terminal = self.terminal_rx.next().fuse();
+                futures_util::pin_mut!(read, terminal);
+                futures_util::select_biased! {
+                    cause = terminal => CompioReadOutcome::Terminal(cause),
+                    result = read => CompioReadOutcome::Read(result),
                 }
-                Ok(_) => {}
-                Err(e) => return Some(Err(e.into())),
+            };
+            match outcome {
+                CompioReadOutcome::Read(Ok(0)) => {
+                    let _ = self.control_tx.send(ControlRequest::Eof).await;
+                    self.shared.terminate(CompioTerminalCause::ConnectionClosed);
+                }
+                CompioReadOutcome::Read(Ok(_)) => {}
+                CompioReadOutcome::Read(Err(error)) => {
+                    self.shared.terminate(CompioTerminalCause::ConnectionClosed);
+                    return Some(Err(error.into()));
+                }
+                CompioReadOutcome::Terminal(cause) => {
+                    if let Some(cause) = cause {
+                        self.shared.terminate(cause);
+                    } else {
+                        self.shared.terminate(CompioTerminalCause::ConnectionClosed);
+                    }
+                }
             }
         }
     }
 
     /// Check whether the reader is closed.
     pub fn is_closed(&self) -> bool {
-        self.closed
+        !self.shared.is_open()
     }
 }
 
-impl<W> CompioSplitWriter<W>
-where
-    W: AsyncWrite,
-{
+impl<R> Drop for CompioSplitReader<R> {
+    fn drop(&mut self) {
+        let _ = self.cancel_tx.unbounded_send(());
+    }
+}
+
+impl<W> CompioSplitWriter<W> {
     /// Send a WebSocket message.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
-        if self.closed {
-            return Err(Error::ConnectionClosed);
+        if !self.shared.is_open() {
+            return Err(self.current_error());
         }
-
-        self.process_control_requests().await?;
-
-        if msg.is_close() {
-            self.closed = true;
-        }
-
-        self.protocol.encode_message(&msg, &mut self.write_buf)?;
-        self.flush().await
+        let (tx, rx) = oneshot::channel();
+        self.application_tx
+            .send(ApplicationRequest::Send(msg, tx))
+            .await
+            .map_err(|_| self.current_error())?;
+        rx.await.map_err(|_| self.current_error())?
     }
 
     /// Send a text message.
@@ -1491,33 +1742,322 @@ where
 
     /// Flush pending data and control responses.
     pub async fn flush(&mut self) -> Result<()> {
-        self.process_control_requests().await?;
-        flush_bytes(&mut self.writer, &mut self.write_buf).await
+        if !self.shared.is_open() {
+            return Err(self.current_error());
+        }
+        let (tx, rx) = oneshot::channel();
+        self.application_tx
+            .send(ApplicationRequest::Flush(tx))
+            .await
+            .map_err(|_| self.current_error())?;
+        rx.await.map_err(|_| self.current_error())?
     }
 
     /// Check whether the writer is closed.
     pub fn is_closed(&self) -> bool {
-        self.closed
+        !self.shared.is_open()
     }
 
-    async fn process_control_requests(&mut self) -> Result<()> {
-        while let Ok(req) = self.control_rx.try_recv() {
-            match req {
-                ControlRequest::Pong(data) => {
-                    self.protocol.encode_pong(&data, &mut self.write_buf);
+    fn current_error(&self) -> Error {
+        self.shared
+            .terminal
+            .get()
+            .map_or(Error::ConnectionClosed, CompioTerminalCause::error)
+    }
+}
+
+impl<W> Drop for CompioSplitWriter<W> {
+    fn drop(&mut self) {
+        let _ = self.cancel_tx.unbounded_send(());
+    }
+}
+
+enum CompioDriverWake {
+    Cancel,
+    Control(Option<ControlRequest>),
+    Application(Option<ApplicationRequest>),
+    Timer,
+}
+
+struct CompioDriverChannels {
+    control_rx: mpsc::Receiver<ControlRequest>,
+    application_rx: mpsc::Receiver<ApplicationRequest>,
+    cancel_rx: mpsc::UnboundedReceiver<()>,
+    terminal_tx: mpsc::UnboundedSender<CompioTerminalCause>,
+    shared: Rc<CompioSplitShared>,
+}
+
+async fn compio_split_writer_driver<W, E>(
+    mut writer: W,
+    mut encoder: E,
+    config: Config,
+    channels: CompioDriverChannels,
+) where
+    W: AsyncWrite,
+    E: CompioSplitEncoder,
+{
+    let CompioDriverChannels {
+        mut control_rx,
+        mut application_rx,
+        mut cancel_rx,
+        terminal_tx,
+        shared,
+    } = channels;
+    let epoch = Instant::now();
+    let mut heartbeat = Heartbeat::new(&config, 0);
+    let mut closing_deadline: Option<Instant> = None;
+    let mut local_close_sent = false;
+    let mut write_buf = BytesMut::with_capacity(config.write_buffer_size);
+
+    loop {
+        let now_ms = epoch.elapsed().as_millis() as u64;
+        let heartbeat_delay = heartbeat
+            .next_deadline()
+            .map(|deadline| Duration::from_millis(deadline.at().saturating_sub(now_ms)))
+            .unwrap_or(Duration::from_secs(365 * 24 * 60 * 60));
+        let close_delay = closing_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_secs(365 * 24 * 60 * 60));
+        let timer_delay = heartbeat_delay.min(close_delay);
+
+        let wake = {
+            let cancel = cancel_rx.next().fuse();
+            let control = control_rx.next().fuse();
+            let application = application_rx.next().fuse();
+            let timer = ::compio::time::sleep(timer_delay).fuse();
+            futures_util::pin_mut!(cancel, control, application, timer);
+            futures_util::select_biased! {
+                _ = cancel => CompioDriverWake::Cancel,
+                request = control => CompioDriverWake::Control(request),
+                request = application => CompioDriverWake::Application(request),
+                _ = timer => CompioDriverWake::Timer,
+            }
+        };
+
+        match wake {
+            CompioDriverWake::Cancel => {
+                compio_terminate(&shared, &terminal_tx, CompioTerminalCause::ConnectionClosed);
+                break;
+            }
+            CompioDriverWake::Control(None) => {
+                compio_terminate(&shared, &terminal_tx, CompioTerminalCause::ConnectionClosed);
+                break;
+            }
+            CompioDriverWake::Control(Some(request)) => match request {
+                ControlRequest::Activity(received_at) => {
+                    let received_ms =
+                        received_at.saturating_duration_since(epoch).as_millis() as u64;
+                    heartbeat.on_inbound(received_ms, None);
                 }
-                ControlRequest::CloseResponse => {
-                    self.protocol.encode_close_response(&mut self.write_buf);
-                    self.closed = true;
+                ControlRequest::Pong(payload, received_at) => {
+                    let received_ms =
+                        received_at.saturating_duration_since(epoch).as_millis() as u64;
+                    heartbeat.on_inbound(received_ms, Some(&payload));
+                }
+                ControlRequest::PeerPing(payload, received_at) => {
+                    let received_ms =
+                        received_at.saturating_duration_since(epoch).as_millis() as u64;
+                    heartbeat.on_inbound(received_ms, None);
+                    write_buf.clear();
+                    encoder.encode_pong(&payload, &mut write_buf);
+                    if compio_cancellable_flush(&mut writer, &mut write_buf, &mut cancel_rx)
+                        .await
+                        .is_err()
+                    {
+                        compio_terminate(
+                            &shared,
+                            &terminal_tx,
+                            CompioTerminalCause::ConnectionClosed,
+                        );
+                        break;
+                    }
+                }
+                ControlRequest::PeerClose => {
+                    heartbeat.stop();
+                    if !local_close_sent {
+                        write_buf.clear();
+                        encoder.encode_close_response(&mut write_buf);
+                        let _ = ::compio::time::timeout(
+                            Duration::from_secs(config.close_timeout.into()),
+                            flush_bytes(&mut writer, &mut write_buf),
+                        )
+                        .await;
+                    }
+                    compio_terminate(&shared, &terminal_tx, CompioTerminalCause::ConnectionClosed);
+                    break;
+                }
+                ControlRequest::Eof => {
+                    heartbeat.stop();
+                    compio_terminate(&shared, &terminal_tx, CompioTerminalCause::ConnectionClosed);
+                    break;
+                }
+            },
+            CompioDriverWake::Application(None) => {
+                compio_terminate(&shared, &terminal_tx, CompioTerminalCause::ConnectionClosed);
+                break;
+            }
+            CompioDriverWake::Application(Some(request)) => match request {
+                ApplicationRequest::Send(message, completion) => {
+                    if !shared.is_open() {
+                        let _ = completion.send(Err(Error::ConnectionClosed));
+                        continue;
+                    }
+                    let is_close = message.is_close();
+                    if is_close {
+                        shared.begin_closing();
+                        heartbeat.stop();
+                        local_close_sent = true;
+                    }
+                    write_buf.clear();
+                    let result = match encoder.encode_message(&message, &mut write_buf) {
+                        Ok(()) => {
+                            compio_cancellable_flush(&mut writer, &mut write_buf, &mut cancel_rx)
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    let failed = result.is_err();
+                    let _ = completion.send(result);
+                    if failed {
+                        compio_terminate(
+                            &shared,
+                            &terminal_tx,
+                            CompioTerminalCause::ConnectionClosed,
+                        );
+                        break;
+                    }
+                    if is_close {
+                        closing_deadline =
+                            Some(Instant::now() + Duration::from_secs(config.close_timeout.into()));
+                    }
+                }
+                ApplicationRequest::Flush(completion) => {
+                    write_buf.clear();
+                    let result =
+                        compio_cancellable_flush(&mut writer, &mut write_buf, &mut cancel_rx).await;
+                    let failed = result.is_err();
+                    let _ = completion.send(result);
+                    if failed {
+                        compio_terminate(
+                            &shared,
+                            &terminal_tx,
+                            CompioTerminalCause::ConnectionClosed,
+                        );
+                        break;
+                    }
+                }
+            },
+            CompioDriverWake::Timer => {
+                if closing_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+                    compio_terminate(&shared, &terminal_tx, CompioTerminalCause::ConnectionClosed);
+                    break;
+                }
+
+                let now_ms = epoch.elapsed().as_millis() as u64;
+                match heartbeat.next_deadline() {
+                    Some(Deadline::Ping(at)) if at <= now_ms => {
+                        if let Some(payload) = heartbeat.ping_due(now_ms) {
+                            write_buf.clear();
+                            let result =
+                                encoder.encode_message(&Message::Ping(payload), &mut write_buf);
+                            if result.is_err()
+                                || compio_cancellable_flush(
+                                    &mut writer,
+                                    &mut write_buf,
+                                    &mut cancel_rx,
+                                )
+                                .await
+                                .is_err()
+                            {
+                                compio_terminate(
+                                    &shared,
+                                    &terminal_tx,
+                                    CompioTerminalCause::ConnectionClosed,
+                                );
+                                break;
+                            }
+                            heartbeat.ping_flushed(epoch.elapsed().as_millis() as u64);
+                        }
+                    }
+                    Some(Deadline::Pong(at)) if at <= now_ms => {
+                        compio_timeout_close(
+                            &mut writer,
+                            &mut encoder,
+                            &config,
+                            config.pong_timeout_close_code,
+                            &config.pong_timeout_close_reason,
+                        )
+                        .await;
+                        compio_terminate(
+                            &shared,
+                            &terminal_tx,
+                            CompioTerminalCause::HeartbeatTimeout,
+                        );
+                        break;
+                    }
+                    Some(Deadline::Idle(at)) if at <= now_ms => {
+                        compio_timeout_close(
+                            &mut writer,
+                            &mut encoder,
+                            &config,
+                            CloseReason::GOING_AWAY,
+                            "Connection idle timeout",
+                        )
+                        .await;
+                        compio_terminate(&shared, &terminal_tx, CompioTerminalCause::IdleTimeout);
+                        break;
+                    }
+                    _ => {}
                 }
             }
         }
+    }
+}
 
-        if !self.write_buf.is_empty() {
-            flush_bytes(&mut self.writer, &mut self.write_buf).await?;
-        }
+async fn compio_cancellable_flush<W>(
+    writer: &mut W,
+    buf: &mut BytesMut,
+    cancel_rx: &mut mpsc::UnboundedReceiver<()>,
+) -> Result<()>
+where
+    W: AsyncWrite,
+{
+    let write = flush_bytes(writer, buf).fuse();
+    let cancel = cancel_rx.next().fuse();
+    futures_util::pin_mut!(write, cancel);
+    match futures_util::future::select(write, cancel).await {
+        futures_util::future::Either::Left((result, _)) => result,
+        futures_util::future::Either::Right((_, _)) => Err(Error::ConnectionClosed),
+    }
+}
 
-        Ok(())
+fn compio_terminate(
+    shared: &CompioSplitShared,
+    terminal_tx: &mpsc::UnboundedSender<CompioTerminalCause>,
+    cause: CompioTerminalCause,
+) {
+    shared.terminate(cause);
+    let _ = terminal_tx.unbounded_send(cause);
+}
+
+async fn compio_timeout_close<W, E>(
+    writer: &mut W,
+    encoder: &mut E,
+    config: &Config,
+    code: u16,
+    reason: &str,
+) where
+    W: AsyncWrite,
+    E: CompioSplitEncoder,
+{
+    let mut buf = BytesMut::with_capacity(128);
+    let close = Message::Close(Some(CloseReason::new(code, bounded_close_reason(reason))));
+    if encoder.encode_message(&close, &mut buf).is_ok() {
+        let _ = ::compio::time::timeout(
+            Duration::from_secs(config.close_timeout.into()),
+            flush_bytes(writer, &mut buf),
+        )
+        .await;
     }
 }
 
@@ -1530,6 +2070,21 @@ use crate::deflate::DeflateConfig;
 #[cfg(feature = "permessage-deflate")]
 use crate::protocol::{CompressedProtocol, CompressedReaderProtocol, CompressedWriterProtocol};
 
+#[cfg(feature = "permessage-deflate")]
+impl CompioSplitEncoder for CompressedWriterProtocol {
+    fn encode_message(&mut self, msg: &Message, buf: &mut BytesMut) -> Result<()> {
+        CompressedWriterProtocol::encode_message(self, msg, buf)
+    }
+
+    fn encode_pong(&mut self, payload: &[u8], buf: &mut BytesMut) {
+        CompressedWriterProtocol::encode_pong(self, payload, buf);
+    }
+
+    fn encode_close_response(&mut self, buf: &mut BytesMut) {
+        CompressedWriterProtocol::encode_close_response(self, buf);
+    }
+}
+
 /// A compressed WebSocket stream over a native Compio transport.
 #[cfg(feature = "permessage-deflate")]
 pub struct CompioCompressedWebSocketStream<S> {
@@ -1541,6 +2096,8 @@ pub struct CompioCompressedWebSocketStream<S> {
     config: Config,
     pending_messages: Vec<Message>,
     pending_index: usize,
+    clock_epoch: Instant,
+    heartbeat: Heartbeat,
     high_water_mark: usize,
     low_water_mark: usize,
 }
@@ -1567,6 +2124,8 @@ where
             read_buf.extend_from_slice(&leftover);
         }
 
+        let clock_epoch = Instant::now();
+        let heartbeat = Heartbeat::new(&config, 0);
         Self {
             inner,
             protocol: CompressedProtocol::server(
@@ -1580,6 +2139,8 @@ where
             config,
             pending_messages: Vec::new(),
             pending_index: 0,
+            clock_epoch,
+            heartbeat,
             high_water_mark: DEFAULT_HIGH_WATER_MARK,
             low_water_mark: DEFAULT_LOW_WATER_MARK,
         }
@@ -1602,6 +2163,8 @@ where
             read_buf.extend_from_slice(&leftover);
         }
 
+        let clock_epoch = Instant::now();
+        let heartbeat = Heartbeat::new(&config, 0);
         Self {
             inner,
             protocol: CompressedProtocol::client(
@@ -1615,6 +2178,8 @@ where
             config,
             pending_messages: Vec::new(),
             pending_index: 0,
+            clock_epoch,
+            heartbeat,
             high_water_mark: DEFAULT_HIGH_WATER_MARK,
             low_water_mark: DEFAULT_LOW_WATER_MARK,
         }
@@ -1628,22 +2193,106 @@ where
             }
 
             if let Some(msg) = self.next_pending_message() {
+                let now = self.clock_epoch.elapsed().as_millis() as u64;
+                let pong = match &msg {
+                    Message::Pong(payload) => Some(payload),
+                    _ => None,
+                };
+                self.heartbeat.on_inbound(now, pong);
                 return Some(self.handle_incoming_message(msg).await);
             }
 
             match self.process_read_buf() {
                 Ok(true) => continue,
                 Ok(false) => {}
-                Err(e) => return Some(Err(e)),
+                Err(e) => {
+                    self.heartbeat.stop();
+                    self.state = CompioStreamState::Closed;
+                    return Some(Err(e));
+                }
             }
 
-            match read_more(&mut self.inner, &mut self.read_buf).await {
+            let read_result = if let Some(deadline) = self.heartbeat.next_deadline() {
+                let now = self.clock_epoch.elapsed().as_millis() as u64;
+                let delay = Duration::from_millis(deadline.at().saturating_sub(now));
+                match ::compio::time::timeout(delay, read_more(&mut self.inner, &mut self.read_buf))
+                    .await
+                {
+                    Ok(result) => Some(result),
+                    Err(_) => {
+                        let now = self.clock_epoch.elapsed().as_millis() as u64;
+                        match self.heartbeat.next_deadline() {
+                            Some(Deadline::Ping(at)) if at <= now => {
+                                if let Some(payload) = self.heartbeat.ping_due(now) {
+                                    if let Err(error) = self.protocol.encode_message(
+                                        &Message::Ping(payload),
+                                        &mut self.write_buf,
+                                    ) {
+                                        return Some(Err(error));
+                                    }
+                                    if let Err(error) = self.flush().await {
+                                        return Some(Err(error));
+                                    }
+                                    self.heartbeat.ping_flushed(
+                                        self.clock_epoch.elapsed().as_millis() as u64,
+                                    );
+                                }
+                                None
+                            }
+                            Some(Deadline::Pong(at)) if at <= now => {
+                                self.heartbeat.stop();
+                                self.state = CompioStreamState::CloseSent;
+                                let close = Message::Close(Some(CloseReason::new(
+                                    self.config.pong_timeout_close_code,
+                                    bounded_close_reason(&self.config.pong_timeout_close_reason),
+                                )));
+                                let _ = self.protocol.encode_message(&close, &mut self.write_buf);
+                                let _ = ::compio::time::timeout(
+                                    Duration::from_secs(self.config.close_timeout.into()),
+                                    self.flush(),
+                                )
+                                .await;
+                                self.state = CompioStreamState::Closed;
+                                return Some(Err(Error::HeartbeatTimeout));
+                            }
+                            Some(Deadline::Idle(at)) if at <= now => {
+                                self.heartbeat.stop();
+                                self.state = CompioStreamState::CloseSent;
+                                let close = Message::Close(Some(CloseReason::new(
+                                    CloseReason::GOING_AWAY,
+                                    "Connection idle timeout",
+                                )));
+                                let _ = self.protocol.encode_message(&close, &mut self.write_buf);
+                                let _ = ::compio::time::timeout(
+                                    Duration::from_secs(self.config.close_timeout.into()),
+                                    self.flush(),
+                                )
+                                .await;
+                                self.state = CompioStreamState::Closed;
+                                return Some(Err(Error::IdleTimeout));
+                            }
+                            _ => None,
+                        }
+                    }
+                }
+            } else {
+                Some(read_more(&mut self.inner, &mut self.read_buf).await)
+            };
+            let Some(read_result) = read_result else {
+                continue;
+            };
+            match read_result {
                 Ok(0) => {
+                    self.heartbeat.stop();
                     self.state = CompioStreamState::Closed;
                     return None;
                 }
                 Ok(_) => {}
-                Err(e) => return Some(Err(e.into())),
+                Err(e) => {
+                    self.heartbeat.stop();
+                    self.state = CompioStreamState::Closed;
+                    return Some(Err(e.into()));
+                }
             }
         }
     }
@@ -1656,10 +2305,16 @@ where
 
         if msg.is_close() {
             self.state = CompioStreamState::CloseSent;
+            self.heartbeat.stop();
         }
 
         self.protocol.encode_message(&msg, &mut self.write_buf)?;
-        self.flush().await
+        if let Err(error) = self.flush().await {
+            self.heartbeat.stop();
+            self.state = CompioStreamState::Closed;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Send a text message.
@@ -1745,12 +2400,20 @@ where
         match &msg {
             Message::Ping(data) => {
                 self.protocol.encode_pong(data, &mut self.write_buf);
-                self.flush().await?;
+                if let Err(error) = self.flush().await {
+                    self.heartbeat.stop();
+                    self.state = CompioStreamState::Closed;
+                    return Err(error);
+                }
             }
             Message::Close(reason) => {
+                self.heartbeat.stop();
                 if self.state == CompioStreamState::Open {
                     self.protocol.encode_close_response(&mut self.write_buf);
-                    self.flush().await?;
+                    if let Err(error) = self.flush().await {
+                        self.state = CompioStreamState::Closed;
+                        return Err(error);
+                    }
                 }
                 self.state = CompioStreamState::Closed;
                 return Ok(Message::Close(reason.clone()));
@@ -1767,7 +2430,7 @@ impl<S> CompioCompressedWebSocketStream<S>
 where
     S: Splittable,
     S::ReadHalf: AsyncRead,
-    S::WriteHalf: AsyncWrite,
+    S::WriteHalf: AsyncWrite + 'static,
 {
     /// Split the compressed WebSocket stream into Compio read and write halves.
     pub fn split(
@@ -1777,10 +2440,28 @@ where
         CompioCompressedSplitWriter<S::WriteHalf>,
     ) {
         let (reader, writer) = Splittable::split(self.inner);
-        let (control_tx, control_rx) = mpsc::channel();
+        let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
+        let (application_tx, application_rx) = mpsc::channel(SPLIT_APPLICATION_CAPACITY);
+        let (cancel_tx, cancel_rx) = mpsc::unbounded();
+        let (terminal_tx, terminal_rx) = mpsc::unbounded();
+        let shared = CompioSplitShared::new(self.state != CompioStreamState::Open);
         let (reader_protocol, writer_protocol) = self
             .protocol
             .split(self.config.max_frame_size, self.config.max_message_size);
+
+        ::compio::runtime::spawn(compio_split_writer_driver(
+            writer,
+            writer_protocol,
+            self.config,
+            CompioDriverChannels {
+                control_rx,
+                application_rx,
+                cancel_rx,
+                terminal_tx,
+                shared: shared.clone(),
+            },
+        ))
+        .detach();
 
         (
             CompioCompressedSplitReader {
@@ -1790,14 +2471,16 @@ where
                 pending_messages: self.pending_messages,
                 pending_index: self.pending_index,
                 control_tx,
-                closed: self.state == CompioStreamState::Closed,
+                terminal_rx,
+                cancel_tx: cancel_tx.clone(),
+                shared: shared.clone(),
+                terminal_reported: false,
             },
             CompioCompressedSplitWriter {
-                writer,
-                protocol: writer_protocol,
-                write_buf: BytesMut::with_capacity(self.config.write_buffer_size),
-                control_rx,
-                closed: self.state == CompioStreamState::Closed,
+                application_tx,
+                cancel_tx,
+                shared,
+                _writer: PhantomData,
             },
         )
     }
@@ -1812,17 +2495,19 @@ pub struct CompioCompressedSplitReader<R> {
     pending_messages: Vec<Message>,
     pending_index: usize,
     control_tx: mpsc::Sender<ControlRequest>,
-    closed: bool,
+    terminal_rx: mpsc::UnboundedReceiver<CompioTerminalCause>,
+    cancel_tx: mpsc::UnboundedSender<()>,
+    shared: Rc<CompioSplitShared>,
+    terminal_reported: bool,
 }
 
 /// Write half of a split compressed Compio WebSocket stream.
 #[cfg(feature = "permessage-deflate")]
 pub struct CompioCompressedSplitWriter<W> {
-    writer: W,
-    protocol: CompressedWriterProtocol,
-    write_buf: BytesMut,
-    control_rx: mpsc::Receiver<ControlRequest>,
-    closed: bool,
+    application_tx: mpsc::Sender<ApplicationRequest>,
+    cancel_tx: mpsc::UnboundedSender<()>,
+    shared: Rc<CompioSplitShared>,
+    _writer: PhantomData<fn() -> W>,
 }
 
 #[cfg(feature = "permessage-deflate")]
@@ -1833,8 +2518,18 @@ where
     /// Receive the next non-control message.
     pub async fn next(&mut self) -> Option<Result<Message>> {
         loop {
-            if self.closed {
-                return None;
+            if self.shared.status.get() == SPLIT_CLOSED {
+                if self.terminal_reported {
+                    return None;
+                }
+                self.terminal_reported = true;
+                return match self.shared.terminal.get() {
+                    Some(CompioTerminalCause::HeartbeatTimeout) => {
+                        Some(Err(Error::HeartbeatTimeout))
+                    }
+                    Some(CompioTerminalCause::IdleTimeout) => Some(Err(Error::IdleTimeout)),
+                    _ => None,
+                };
             }
 
             if self.pending_index < self.pending_messages.len() {
@@ -1846,21 +2541,20 @@ where
                     self.pending_index = 0;
                 }
 
-                match &msg {
-                    Message::Ping(data) => {
-                        let _ = self.control_tx.send(ControlRequest::Pong(data.clone()));
-                        continue;
+                let request = match &msg {
+                    Message::Ping(data) => ControlRequest::PeerPing(data.clone(), Instant::now()),
+                    Message::Pong(data) => ControlRequest::Pong(data.clone(), Instant::now()),
+                    Message::Close(_) => {
+                        self.shared.begin_closing();
+                        ControlRequest::PeerClose
                     }
-                    Message::Close(reason) => {
-                        if !self.closed {
-                            let _ = self.control_tx.send(ControlRequest::CloseResponse);
-                            self.closed = true;
-                        }
-                        return Some(Ok(Message::Close(reason.clone())));
-                    }
-                    Message::Pong(_) => continue,
-                    _ => return Some(Ok(msg)),
+                    _ => ControlRequest::Activity(Instant::now()),
+                };
+                if self.control_tx.send(request).await.is_err() {
+                    self.shared.terminate(CompioTerminalCause::ConnectionClosed);
+                    continue;
                 }
+                return Some(Ok(msg));
             }
 
             if !self.read_buf.is_empty() {
@@ -1871,46 +2565,69 @@ where
                         continue;
                     }
                     Ok(_) => {}
-                    Err(e) => return Some(Err(e)),
+                    Err(e) => {
+                        self.shared.terminate(CompioTerminalCause::ConnectionClosed);
+                        return Some(Err(e));
+                    }
                 }
             }
 
-            match read_more(&mut self.reader, &mut self.read_buf).await {
-                Ok(0) => {
-                    self.closed = true;
-                    return None;
+            let outcome = {
+                let read = read_more(&mut self.reader, &mut self.read_buf).fuse();
+                let terminal = self.terminal_rx.next().fuse();
+                futures_util::pin_mut!(read, terminal);
+                futures_util::select_biased! {
+                    cause = terminal => CompioReadOutcome::Terminal(cause),
+                    result = read => CompioReadOutcome::Read(result),
                 }
-                Ok(_) => {}
-                Err(e) => return Some(Err(e.into())),
+            };
+            match outcome {
+                CompioReadOutcome::Read(Ok(0)) => {
+                    let _ = self.control_tx.send(ControlRequest::Eof).await;
+                    self.shared.terminate(CompioTerminalCause::ConnectionClosed);
+                }
+                CompioReadOutcome::Read(Ok(_)) => {}
+                CompioReadOutcome::Read(Err(error)) => {
+                    self.shared.terminate(CompioTerminalCause::ConnectionClosed);
+                    return Some(Err(error.into()));
+                }
+                CompioReadOutcome::Terminal(cause) => {
+                    if let Some(cause) = cause {
+                        self.shared.terminate(cause);
+                    } else {
+                        self.shared.terminate(CompioTerminalCause::ConnectionClosed);
+                    }
+                }
             }
         }
     }
 
     /// Check whether the reader is closed.
     pub fn is_closed(&self) -> bool {
-        self.closed
+        !self.shared.is_open()
     }
 }
 
 #[cfg(feature = "permessage-deflate")]
-impl<W> CompioCompressedSplitWriter<W>
-where
-    W: AsyncWrite,
-{
+impl<R> Drop for CompioCompressedSplitReader<R> {
+    fn drop(&mut self) {
+        let _ = self.cancel_tx.unbounded_send(());
+    }
+}
+
+#[cfg(feature = "permessage-deflate")]
+impl<W> CompioCompressedSplitWriter<W> {
     /// Send a WebSocket message.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
-        if self.closed {
-            return Err(Error::ConnectionClosed);
+        if !self.shared.is_open() {
+            return Err(self.current_error());
         }
-
-        self.process_control_requests().await?;
-
-        if msg.is_close() {
-            self.closed = true;
-        }
-
-        self.protocol.encode_message(&msg, &mut self.write_buf)?;
-        self.flush().await
+        let (tx, rx) = oneshot::channel();
+        self.application_tx
+            .send(ApplicationRequest::Send(msg, tx))
+            .await
+            .map_err(|_| self.current_error())?;
+        rx.await.map_err(|_| self.current_error())?
     }
 
     /// Send a text message.
@@ -1931,33 +2648,34 @@ where
 
     /// Flush pending data and control responses.
     pub async fn flush(&mut self) -> Result<()> {
-        self.process_control_requests().await?;
-        flush_bytes(&mut self.writer, &mut self.write_buf).await
+        if !self.shared.is_open() {
+            return Err(self.current_error());
+        }
+        let (tx, rx) = oneshot::channel();
+        self.application_tx
+            .send(ApplicationRequest::Flush(tx))
+            .await
+            .map_err(|_| self.current_error())?;
+        rx.await.map_err(|_| self.current_error())?
     }
 
     /// Check whether the writer is closed.
     pub fn is_closed(&self) -> bool {
-        self.closed
+        !self.shared.is_open()
     }
 
-    async fn process_control_requests(&mut self) -> Result<()> {
-        while let Ok(req) = self.control_rx.try_recv() {
-            match req {
-                ControlRequest::Pong(data) => {
-                    self.protocol.encode_pong(&data, &mut self.write_buf);
-                }
-                ControlRequest::CloseResponse => {
-                    self.protocol.encode_close_response(&mut self.write_buf);
-                    self.closed = true;
-                }
-            }
-        }
+    fn current_error(&self) -> Error {
+        self.shared
+            .terminal
+            .get()
+            .map_or(Error::ConnectionClosed, CompioTerminalCause::error)
+    }
+}
 
-        if !self.write_buf.is_empty() {
-            flush_bytes(&mut self.writer, &mut self.write_buf).await?;
-        }
-
-        Ok(())
+#[cfg(feature = "permessage-deflate")]
+impl<W> Drop for CompioCompressedSplitWriter<W> {
+    fn drop(&mut self) {
+        let _ = self.cancel_tx.unbounded_send(());
     }
 }
 
@@ -2030,6 +2748,41 @@ mod tests {
         let echoed = client.next().await.unwrap().unwrap();
         assert!(matches!(echoed, Message::Binary(bytes) if bytes.as_ref() == b"payload"));
 
+        server.await.unwrap();
+    }
+
+    #[compio::test]
+    async fn compio_split_driver_replies_to_ping_without_application_write() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = ::compio::runtime::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let config = Config::builder().auto_ping(false).idle_timeout(0).build();
+            let (ws, _) = accept_async(stream, config).await.unwrap();
+            let (mut reader, _writer) = ws.split();
+
+            assert!(matches!(
+                reader.next().await,
+                Some(Ok(Message::Ping(payload))) if payload == b"pin"[..]
+            ));
+            assert!(matches!(reader.next().await, Some(Ok(Message::Close(_)))));
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let config = Config::builder().auto_ping(false).idle_timeout(0).build();
+        let (mut client, _) = connect_async(stream, &addr.to_string(), "/", None, config)
+            .await
+            .unwrap();
+        client
+            .send(Message::Ping(Bytes::from_static(b"pin")))
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.next().await,
+            Some(Ok(Message::Pong(payload))) if payload == b"pin"[..]
+        ));
+        client.close(1000, "").await.unwrap();
         server.await.unwrap();
     }
 
@@ -2269,6 +3022,41 @@ mod tests {
         let echoed = client.next().await.unwrap().unwrap();
         assert!(matches!(echoed, Message::Text(text) if text == "compressed"));
 
+        server.await.unwrap();
+    }
+
+    #[cfg(feature = "permessage-deflate")]
+    #[compio::test]
+    async fn compio_compressed_split_driver_replies_to_ping() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = ::compio::runtime::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let config = Config::builder().auto_ping(false).idle_timeout(0).build();
+            let ws =
+                CompioCompressedWebSocketStream::server(stream, config, DeflateConfig::default());
+            let (mut reader, _writer) = ws.split();
+            assert!(matches!(
+                reader.next().await,
+                Some(Ok(Message::Ping(payload))) if payload == b"pin"[..]
+            ));
+            assert!(matches!(reader.next().await, Some(Ok(Message::Close(_)))));
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let config = Config::builder().auto_ping(false).idle_timeout(0).build();
+        let mut client =
+            CompioCompressedWebSocketStream::client(stream, config, DeflateConfig::default());
+        client
+            .send(Message::Ping(Bytes::from_static(b"pin")))
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.next().await,
+            Some(Ok(Message::Pong(payload))) if payload == b"pin"[..]
+        ));
+        client.close(1000, "").await.unwrap();
         server.await.unwrap();
     }
 }

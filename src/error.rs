@@ -43,6 +43,10 @@ pub enum Error {
     Capacity(&'static str),
     /// Compression/decompression error
     Compression(String),
+    /// The matching Pong for a native keepalive Ping was not received in time.
+    HeartbeatTimeout,
+    /// No valid inbound frame was received before the configured hard idle deadline.
+    IdleTimeout,
 
     // ========================================================================
     // Transport-specific errors
@@ -165,6 +169,7 @@ impl Error {
             Error::InvalidCloseCode(_) => ErrorKind::Validation,
             Error::Capacity(_) => ErrorKind::Capacity,
             Error::Compression(_) => ErrorKind::Compression,
+            Error::HeartbeatTimeout | Error::IdleTimeout => ErrorKind::Connection,
             #[cfg(feature = "http2")]
             Error::Http2(_) => ErrorKind::Transport,
             #[cfg(feature = "http3")]
@@ -194,6 +199,8 @@ impl Error {
                 | Error::MessageTooLarge
                 | Error::StreamReset
                 | Error::InvalidCloseCode(_)
+                | Error::HeartbeatTimeout
+                | Error::IdleTimeout
         )
     }
 
@@ -211,10 +218,8 @@ impl Error {
     /// `tokio::time::timeout`, but some transport errors may indicate timeouts.
     #[inline]
     pub fn is_timeout(&self) -> bool {
-        if let Error::Io(e) = self {
-            return e.kind() == io::ErrorKind::TimedOut;
-        }
-        false
+        matches!(self, Error::HeartbeatTimeout | Error::IdleTimeout)
+            || matches!(self, Error::Io(e) if e.kind() == io::ErrorKind::TimedOut)
     }
 
     /// Check if this error is a connection error
@@ -252,6 +257,8 @@ impl Error {
             Error::InvalidCloseCode(_) => "invalid_close_code",
             Error::Capacity(_) => "capacity_exceeded",
             Error::Compression(_) => "compression_error",
+            Error::HeartbeatTimeout => "heartbeat_timeout",
+            Error::IdleTimeout => "idle_timeout",
             #[cfg(feature = "http2")]
             Error::Http2(_) => "http2_error",
             #[cfg(feature = "http3")]
@@ -308,6 +315,8 @@ impl fmt::Display for Error {
             Error::InvalidCloseCode(code) => write!(f, "Invalid close code: {}", code),
             Error::Capacity(msg) => write!(f, "Capacity exceeded: {}", msg),
             Error::Compression(msg) => write!(f, "Compression error: {}", msg),
+            Error::HeartbeatTimeout => write!(f, "WebSocket Pong deadline expired"),
+            Error::IdleTimeout => write!(f, "WebSocket inbound idle deadline expired"),
             #[cfg(feature = "http2")]
             Error::Http2(e) => write!(f, "HTTP/2 error: {}", e),
             #[cfg(feature = "http3")]

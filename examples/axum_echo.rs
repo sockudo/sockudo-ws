@@ -77,7 +77,11 @@ where
     // Create sockudo-ws WebSocketStream with our config
     let config = Config::builder()
         .max_payload_length(16 * 1024)
-        .idle_timeout(60)
+        .ping_interval(30)
+        .pong_timeout(10)
+        .pong_timeout_close(4201, "Pong reply not received in time")
+        .idle_timeout(0)
+        .close_timeout(5)
         .build();
 
     let mut ws = WebSocketStream::server(stream, config);
