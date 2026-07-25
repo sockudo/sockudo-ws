@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-07-25
+
 ### Added
 
 - Added correlated native WebSocket keepalive for Tokio and Compio, including
@@ -320,6 +322,7 @@ ASCII fast-path strategy: Check if all bytes in a 16/32-byte chunk have high bit
 - Passes all 517 Autobahn test cases
 - Outperforms uWebSockets in benchmarks
 
+[2.0.1]: https://github.com/sockudo/sockudo-ws/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/sockudo/sockudo-ws/compare/v1.7.5...v2.0.0
 [1.5.1]: https://github.com/RustNSparks/sockudo-ws/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/RustNSparks/sockudo-ws/compare/v1.4.3...v1.5.0
