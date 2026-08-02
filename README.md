@@ -2,7 +2,7 @@
 
 Ultra-low latency WebSocket library for Rust, designed for high-frequency trading (HFT) applications and real-time systems. Fully compatible with Tokio, Compio, and Axum.
 
-Will be used in [Sockudo](https://github.com/RustNSparks/sockudo), a high-performance Pusher-compatible WebSocket server.
+Will be used in [Sockudo](https://github.com/sockudo/sockudo), a high-performance Pusher-compatible WebSocket server.
 
 ## Performance
 
@@ -91,45 +91,45 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws" }
+sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws" }
 
 # With compression
-sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["permessage-deflate"] }
+sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", features = ["permessage-deflate"] }
 
 # Default Tokio runtime with HTTP/2 support
-sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["http2"] }
+sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", features = ["http2"] }
 
 # Default Tokio runtime with HTTP/3 support
-sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["http3"] }
+sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", features = ["http3"] }
 
 # Tokio runtime without default features
-sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", default-features = false, features = ["tokio-runtime", "http2", "fastrand"] }
-sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", default-features = false, features = ["tokio-runtime", "http3", "fastrand"] }
+sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", default-features = false, features = ["tokio-runtime", "http2", "fastrand"] }
+sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", default-features = false, features = ["tokio-runtime", "http3", "fastrand"] }
 
 # With io_uring (Linux only)
-sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["io-uring"] }
+sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", features = ["io-uring"] }
 
 # With native Compio runtime support
-sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", default-features = false, features = ["compio-runtime", "fastrand"] }
+sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", default-features = false, features = ["compio-runtime", "fastrand"] }
 
 # With Compio and HTTP/2 or HTTP/3 transports
-sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", default-features = false, features = ["compio-runtime", "http2", "fastrand"] }
-sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", default-features = false, features = ["compio-runtime", "http3", "fastrand"] }
+sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", default-features = false, features = ["compio-runtime", "http2", "fastrand"] }
+sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", default-features = false, features = ["compio-runtime", "http3", "fastrand"] }
 
 # With TLS (rustls)
-sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["rustls-webpki-roots"] }
+sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", features = ["rustls-webpki-roots"] }
 
 # With TLS (native-tls)
-sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["native-tls"] }
+sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", features = ["native-tls"] }
 
 # All transports
-sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["all-transports"] }
+sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", features = ["all-transports"] }
 
 # Everything
-sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["full"] }
+sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", features = ["full"] }
 
 # With mimalloc allocator (recommended for production)
-sockudo-ws = { git = "https://github.com/RustNSparks/sockudo-ws", features = ["mimalloc"] }
+sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", features = ["mimalloc"] }
 ```
 
 ### Runtime and Transport Features
