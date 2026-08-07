@@ -191,7 +191,7 @@ native-tls = { version = "^0.2", optional = true }
 tokio-native-tls = { version = "^0.3", optional = true }
 
 # TLS support via rustls
-tokio-rustls = { version = "^0.26", optional = true }
+tokio-rustls = { version = "^0.26", default-features = false, features = ["logging", "tls12"], optional = true }
 webpki-roots = { version = "^1.0", optional = true }
 rustls-native-certs = { version = "^0.8", optional = true }
 rustls-platform-verifier = { version = "^0.6", optional = true }
@@ -204,7 +204,7 @@ http = { version = "^1.0", optional = true }
 quinn = { version = "^0.11", optional = true }
 h3 = { version = "^0.0.8", optional = true }
 h3-quinn = { version = "^0.0.10", optional = true }
-rustls = { version = "^0.23", default-features = false, features = ["ring", "std"], optional = true }
+rustls = { version = "^0.23", default-features = false, features = ["std"], optional = true }
 
 # High-performance allocator
 mimalloc = { version = "^0.1", default-features = false, optional = true }
@@ -224,6 +224,7 @@ axum = "^0.8"
 hyper = { version = "^1.0", features = ["full"] }
 hyper-util = { version = "^0.1", features = ["tokio"] }
 rcgen = "^0.13"
+rustls = { version = "^0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "^2.0"
 
 [[example]]
