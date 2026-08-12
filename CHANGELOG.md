@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserved WebSocket frame bytes read together with Tokio HTTP/1.1 upgrade requests or responses.
+
 ## [2.0.1] - 2026-07-25
 
 ### Added

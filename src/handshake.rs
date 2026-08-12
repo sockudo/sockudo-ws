@@ -347,7 +347,11 @@ pub struct HandshakeResult {
     pub protocol: Option<String>,
     /// Negotiated extensions
     pub extensions: Option<String>,
-    /// Leftover data after HTTP request (if any)
+    /// Bytes read beyond the end of the HTTP handshake.
+    ///
+    /// High-level `connect*` and `accept*` methods automatically replay these
+    /// bytes through the returned WebSocket stream. Direct handshake callers
+    /// remain responsible for preserving them.
     pub leftover: Option<Bytes>,
 }
 
