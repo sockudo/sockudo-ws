@@ -512,6 +512,67 @@ pub fn parse_deflate_offer(value: &str) -> Option<Vec<(&str, Option<&str>)>> {
 mod tests {
     use super::*;
 
+    /// Deterministic high-entropy bytes, standing in for already-compressed
+    /// payloads (audio, video, images) that deflate cannot shrink.
+    fn incompressible(n: usize) -> Vec<u8> {
+        let mut s: u64 = 0x2545_F491_4F6C_DD1D;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// One message as the protocol layer sends and receives it: a compressed
+    /// result travels with RSV1 set and reaches the peer's inflater, while a
+    /// `None` result is sent verbatim with RSV1 clear and never reaches it.
+    fn round_trip(
+        enc: &mut DeflateContext,
+        dec: &mut DeflateContext,
+        msg: &[u8],
+    ) -> Result<Vec<u8>> {
+        match enc.compress(msg)? {
+            Some(compressed) => dec.decompress(&compressed, 1 << 20).map(|b| b.to_vec()),
+            None => Ok(msg.to_vec()),
+        }
+    }
+
+    #[test]
+    fn test_undersized_compression_does_not_desync_context_takeover() {
+        let config = DeflateConfig {
+            server_no_context_takeover: false,
+            client_no_context_takeover: false,
+            compression_threshold: 16,
+            ..Default::default()
+        };
+        let mut server = DeflateContext::server(config.clone());
+        let mut client = DeflateContext::client(config);
+
+        let text = b"{\"channel\":\"presence-room\",\"event\":\"client-typing\"}".repeat(8);
+
+        // Warm both LZ77 windows with a message that does compress.
+        let first = round_trip(&mut server, &mut client, &text).expect("first message");
+        assert_eq!(first, text);
+
+        // A message that does not shrink is sent verbatim, so the peer's window
+        // never sees it. The encoder must not retain it either.
+        let opaque = incompressible(4096);
+        let second = round_trip(&mut server, &mut client, &opaque).expect("second message");
+        assert_eq!(second, opaque);
+
+        // Repeat the first message. With context takeover the encoder emits a
+        // back-reference into its window; if that window still holds `opaque`,
+        // the distance is wrong on the peer and the message decodes to garbage.
+        let third = round_trip(&mut server, &mut client, &text).expect("third message decodes");
+        assert_eq!(
+            third, text,
+            "window desynchronised after an uncompressed message"
+        );
+    }
+
     #[test]
     fn test_compress_decompress() {
         let config = DeflateConfig::default();
