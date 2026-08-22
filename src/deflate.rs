@@ -276,8 +276,11 @@ impl DeflateEncoder {
             output.truncate(output.len() - 4);
         }
 
-        // Only use compression if it actually reduces size
-        if output.len() >= data.len() {
+        // Only skip where the encoder resets per message. Otherwise the caller
+        // sends these bytes raw, so they stay in our window without ever
+        // entering the peer's, and every later back-reference resolves against
+        // different history: corrupt messages, or a connection that dies.
+        if self.no_context_takeover && output.len() >= data.len() {
             return Ok(None);
         }
 
