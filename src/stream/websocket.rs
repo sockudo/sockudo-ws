@@ -64,6 +64,8 @@ pin_project! {
         inner: S,
         protocol: Protocol,
         read_buf: BytesMut,
+        // Leftover handshake bytes must be processed once before the first read.
+        has_unprocessed_read_data: bool,
         write_buf: CorkBuffer,
         state: StreamState,
         config: Config,
@@ -103,14 +105,30 @@ where
 {
     /// Create a new WebSocket stream from an already-upgraded connection
     pub fn from_raw(inner: S, role: Role, config: Config) -> Self {
+        Self::from_raw_with_leftover(inner, role, config, None)
+    }
+
+    /// Create a WebSocket stream with bytes already read after the HTTP handshake.
+    pub fn from_raw_with_leftover(
+        inner: S,
+        role: Role,
+        config: Config,
+        leftover: Option<Bytes>,
+    ) -> Self {
         let protocol = Protocol::new(role, config.max_frame_size, config.max_message_size);
+        let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);
+        if let Some(leftover) = leftover {
+            read_buf.extend_from_slice(&leftover);
+        }
+        let has_unprocessed_read_data = !read_buf.is_empty();
         let clock_epoch = tokio::time::Instant::now();
         let heartbeat = Heartbeat::new(&config, 0);
 
         Self {
             inner,
             protocol,
-            read_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
+            read_buf,
+            has_unprocessed_read_data,
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
             state: StreamState::Open,
             config,
@@ -330,6 +348,7 @@ where
         let messages = self.protocol.process(&mut self.read_buf)?;
 
         if !messages.is_empty() {
+            debug_assert!(self.pending_messages.is_empty());
             self.pending_messages = messages;
             self.pending_index = 0;
         }
@@ -514,6 +533,22 @@ where
                 return Poll::Ready(Some(Ok(msg)));
             }
 
+            // Process handshake leftover once before waiting for transport data.
+            if self.has_unprocessed_read_data {
+                self.as_mut().get_mut().has_unprocessed_read_data = false;
+                match self.as_mut().get_mut().process_read_buf() {
+                    Ok(()) if !self.pending_messages.is_empty() => continue,
+                    Ok(()) => {}
+                    Err(e) => {
+                        let this = self.as_mut().get_mut();
+                        this.state = StreamState::Closed;
+                        this.heartbeat.stop();
+                        this.heartbeat_sleep = None;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                }
+            }
+
             // Try to read more data
             match self.as_mut().poll_read_more(cx) {
                 Poll::Ready(Ok(0)) => {
@@ -522,19 +557,16 @@ where
                     self.as_mut().get_mut().heartbeat.stop();
                     return Poll::Ready(None);
                 }
-                Poll::Ready(Ok(_n)) => {
-                    // Process the new data
-                    match self.as_mut().get_mut().process_read_buf() {
-                        Ok(()) => continue, // Loop to check for messages
-                        Err(e) => {
-                            let this = self.as_mut().get_mut();
-                            this.state = StreamState::Closed;
-                            this.heartbeat.stop();
-                            this.heartbeat_sleep = None;
-                            return Poll::Ready(Some(Err(e)));
-                        }
+                Poll::Ready(Ok(_n)) => match self.as_mut().get_mut().process_read_buf() {
+                    Ok(()) => continue,
+                    Err(e) => {
+                        let this = self.as_mut().get_mut();
+                        this.state = StreamState::Closed;
+                        this.heartbeat.stop();
+                        this.heartbeat_sleep = None;
+                        return Poll::Ready(Some(Err(e)));
                     }
-                }
+                },
                 Poll::Ready(Err(e)) => {
                     let this = self.as_mut().get_mut();
                     this.state = StreamState::Closed;
@@ -854,6 +886,7 @@ pub struct SplitReader<S> {
     reader: ReadHalf<S>,
     protocol: Protocol,
     read_buf: BytesMut,
+    has_unprocessed_read_data: bool,
     pending_messages: Vec<Message>,
     pending_index: usize,
     control_tx: mpsc::Sender<ControlRequest>,
@@ -905,6 +938,7 @@ where
                 reader,
                 protocol: reader_protocol,
                 read_buf: self.read_buf,
+                has_unprocessed_read_data: self.has_unprocessed_read_data,
                 pending_messages: self.pending_messages,
                 pending_index: self.pending_index,
                 control_tx,
@@ -961,6 +995,23 @@ where
                     continue;
                 }
                 return Some(Ok(msg));
+            }
+
+            if self.has_unprocessed_read_data {
+                self.has_unprocessed_read_data = false;
+                match self.protocol.process(&mut self.read_buf) {
+                    Ok(messages) if !messages.is_empty() => {
+                        debug_assert!(self.pending_messages.is_empty());
+                        self.pending_messages = messages;
+                        self.pending_index = 0;
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        self.shared.terminate(TerminalCause::ConnectionClosed);
+                        return Some(Err(error));
+                    }
+                }
             }
 
             if self.read_buf.capacity() - self.read_buf.len() < 4096 {
@@ -1541,6 +1592,7 @@ where
         let messages = self.protocol.process(&mut self.read_buf)?;
 
         if !messages.is_empty() {
+            debug_assert!(self.pending_messages.is_empty());
             self.pending_messages = messages;
             self.pending_index = 0;
         }

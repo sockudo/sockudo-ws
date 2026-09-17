@@ -130,7 +130,7 @@ impl WebSocketClient<Http1> {
     /// ```
     pub async fn connect<S>(
         &self,
-        mut stream: S,
+        stream: S,
         host: &str,
         path: &str,
         protocol: Option<&str>,
@@ -138,15 +138,70 @@ impl WebSocketClient<Http1> {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        self.connect_with_headers(stream, host, path, protocol, None)
+            .await
+    }
+
+    /// Connect to a WebSocket server with additional HTTP headers.
+    ///
+    /// Headers managed by the HTTP upgrade handshake cannot be overridden.
+    /// Once writing begins, cancelling this future leaves the stream in an
+    /// indeterminate handshake state and the stream should not be reused.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use sockudo_ws::{Config, Http1};
+    /// use sockudo_ws::client::WebSocketClient;
+    /// use tokio::net::TcpStream;
+    ///
+    /// let stream = TcpStream::connect("example.com:80").await?;
+    /// let headers = vec![
+    ///     ("Authorization".to_string(), "Bearer token".to_string()),
+    ///     ("User-Agent".to_string(), "my-client".to_string()),
+    /// ];
+    /// let client = WebSocketClient::<Http1>::new(Config::default());
+    /// let (websocket, handshake) = client
+    ///     .connect_with_headers(
+    ///         stream,
+    ///         "example.com",
+    ///         "/ws",
+    ///         None,
+    ///         Some(&headers),
+    ///     )
+    ///     .await?;
+    /// ```
+    pub async fn connect_with_headers<S>(
+        &self,
+        mut stream: S,
+        host: &str,
+        path: &str,
+        protocol: Option<&str>,
+        extra_headers: Option<&[(String, String)]>,
+    ) -> Result<(WebSocketStream<Stream<Http1>>, HandshakeResult)>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         // Perform the HTTP/1.1 WebSocket handshake
-        let handshake_result =
-            handshake::client_handshake(&mut stream, host, path, protocol).await?;
+        let handshake_result = handshake::client_handshake_with_headers(
+            &mut stream,
+            host,
+            path,
+            protocol,
+            extra_headers,
+        )
+        .await?;
 
         // Wrap in Stream<Http1>
         let stream = Stream::<Http1>::new(stream);
 
-        // Create WebSocketStream
-        let ws = WebSocketStream::from_raw(stream, Role::Client, self.config.clone());
+        // Preserve frame bytes read together with the HTTP upgrade response.
+        let ws = WebSocketStream::from_raw_with_leftover(
+            stream,
+            Role::Client,
+            self.config.clone(),
+            handshake_result.leftover.clone(),
+        );
 
         Ok((ws, handshake_result))
     }
@@ -180,7 +235,7 @@ impl WebSocketClient<Http1> {
     /// ```
     pub async fn connect_raw<S>(
         &self,
-        mut stream: S,
+        stream: S,
         host: &str,
         path: &str,
         protocol: Option<&str>,
@@ -188,12 +243,43 @@ impl WebSocketClient<Http1> {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        // Perform the HTTP/1.1 WebSocket handshake
-        let handshake_result =
-            handshake::client_handshake(&mut stream, host, path, protocol).await?;
+        self.connect_raw_with_headers(stream, host, path, protocol, None)
+            .await
+    }
 
-        // Create WebSocketStream directly without Stream<T> wrapper
-        let ws = WebSocketStream::from_raw(stream, Role::Client, self.config.clone());
+    /// Connect without type erasure and include additional HTTP headers.
+    ///
+    /// Headers managed by the HTTP upgrade handshake cannot be overridden.
+    /// Once writing begins, cancelling this future leaves the stream in an
+    /// indeterminate handshake state and the stream should not be reused.
+    pub async fn connect_raw_with_headers<S>(
+        &self,
+        mut stream: S,
+        host: &str,
+        path: &str,
+        protocol: Option<&str>,
+        extra_headers: Option<&[(String, String)]>,
+    ) -> Result<(WebSocketStream<S>, HandshakeResult)>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        // Perform the HTTP/1.1 WebSocket handshake
+        let handshake_result = handshake::client_handshake_with_headers(
+            &mut stream,
+            host,
+            path,
+            protocol,
+            extra_headers,
+        )
+        .await?;
+
+        // Preserve frame bytes read together with the HTTP upgrade response.
+        let ws = WebSocketStream::from_raw_with_leftover(
+            stream,
+            Role::Client,
+            self.config.clone(),
+            handshake_result.leftover.clone(),
+        );
 
         Ok((ws, handshake_result))
     }
@@ -215,6 +301,21 @@ impl WebSocketClient<Http1> {
         &self,
         url: &str,
         protocol: Option<&str>,
+    ) -> Result<(WebSocketStream<Stream<Http1>>, HandshakeResult)> {
+        self.connect_to_url_with_headers(url, protocol, None).await
+    }
+
+    /// Connect to a WebSocket server using a URI and additional HTTP headers.
+    ///
+    /// This is the custom-header counterpart to [`Self::connect_to_url`].
+    /// Headers managed by the HTTP upgrade handshake cannot be overridden.
+    /// Once writing begins, cancelling this future leaves the stream in an
+    /// indeterminate handshake state and the stream should not be reused.
+    pub async fn connect_to_url_with_headers(
+        &self,
+        url: &str,
+        protocol: Option<&str>,
+        extra_headers: Option<&[(String, String)]>,
     ) -> Result<(WebSocketStream<Stream<Http1>>, HandshakeResult)> {
         use tokio::net::TcpStream;
 
@@ -259,7 +360,8 @@ impl WebSocketClient<Http1> {
         let stream = TcpStream::connect(&addr).await.map_err(Error::Io)?;
 
         // Perform handshake
-        self.connect(stream, host, path, protocol).await
+        self.connect_with_headers(stream, host, path, protocol, extra_headers)
+            .await
     }
 }
 

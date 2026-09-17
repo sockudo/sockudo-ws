@@ -213,6 +213,40 @@ async fn handle(stream: TcpStream) {
 - ✅ **True concurrency** - can read and write simultaneously without blocking
 - ✅ **Control frame coordination** - Ping/Pong/Close handled via lightweight mpsc channel
 
+### HTTP/1.1 Custom Headers
+
+HTTP/1.1 clients can attach application headers to the WebSocket upgrade request. Sockudo validates
+header syntax and rejects attempts to override handshake-managed headers such as `Host`, `Upgrade`,
+and `Sec-WebSocket-Key`.
+
+```rust
+use sockudo_ws::{Config, Http1};
+use sockudo_ws::client::WebSocketClient;
+use tokio::net::TcpStream;
+
+async fn connect() -> sockudo_ws::Result<()> {
+    let stream = TcpStream::connect("example.com:80").await?;
+    let headers = vec![
+        ("Authorization".to_string(), "Bearer token".to_string()),
+        ("User-Agent".to_string(), "my-client".to_string()),
+    ];
+    let client = WebSocketClient::<Http1>::new(Config::default());
+    let (_websocket, _handshake) = client
+        .connect_with_headers(
+            stream,
+            "example.com",
+            "/ws",
+            None,
+            Some(&headers),
+        )
+        .await?;
+    Ok(())
+}
+```
+
+Compio applications can use `sockudo_ws::compio::connect_async_with_headers` with the same header
+representation and validation rules.
+
 ### Native Compio Runtime
 
 Compio uses completion-based I/O, so sockudo-ws exposes a native async-method API behind `compio-runtime`:

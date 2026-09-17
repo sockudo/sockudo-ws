@@ -15,6 +15,15 @@ use crate::error::{Error, Result};
 
 /// Maximum HTTP header size (8KB should be enough for any reasonable request)
 const MAX_HEADER_SIZE: usize = 8192;
+const RESERVED_HANDSHAKE_HEADERS: &[&str] = &[
+    "host",
+    "upgrade",
+    "connection",
+    "sec-websocket-key",
+    "sec-websocket-version",
+    "sec-websocket-protocol",
+    "sec-websocket-extensions",
+];
 
 /// WebSocket handshake request (server-side)
 #[derive(Debug)]
@@ -166,6 +175,97 @@ pub fn build_request(
     protocol: Option<&str>,
     extensions: Option<&str>,
 ) -> Bytes {
+    build_request_inner(host, path, key, protocol, extensions, None)
+}
+
+/// Build a WebSocket upgrade request with additional HTTP headers.
+///
+/// Custom headers are emitted in the supplied order. Header names must use the
+/// HTTP token syntax, and values must not contain disallowed control bytes.
+/// Headers managed by the WebSocket handshake cannot be overridden.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidHttp`] if a header name or value is invalid, or if
+/// a custom header conflicts with a handshake-managed header.
+pub fn build_request_with_headers(
+    host: &str,
+    path: &str,
+    key: &str,
+    protocol: Option<&str>,
+    extensions: Option<&str>,
+    extra_headers: Option<&[(String, String)]>,
+) -> Result<Bytes> {
+    if let Some(headers) = extra_headers {
+        validate_extra_headers(headers)?;
+    }
+
+    Ok(build_request_inner(
+        host,
+        path,
+        key,
+        protocol,
+        extensions,
+        extra_headers,
+    ))
+}
+
+fn validate_extra_headers(headers: &[(String, String)]) -> Result<()> {
+    for (name, value) in headers {
+        if name.is_empty() || !name.bytes().all(is_header_name_byte) {
+            return Err(Error::InvalidHttp("invalid header name"));
+        }
+
+        if RESERVED_HANDSHAKE_HEADERS
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+        {
+            return Err(Error::InvalidHttp("reserved handshake header"));
+        }
+
+        if !value.bytes().all(is_header_value_byte) {
+            return Err(Error::InvalidHttp("invalid header value"));
+        }
+    }
+
+    Ok(())
+}
+
+fn is_header_value_byte(byte: u8) -> bool {
+    // Keep HTTP/1 validation independent of the optional HTTP/2 and HTTP/3
+    // `http` dependency. RFC 9110 permits HTAB, visible bytes, and obs-text.
+    byte == b'\t' || (byte >= b' ' && byte != 0x7f)
+}
+
+fn is_header_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn build_request_inner(
+    host: &str,
+    path: &str,
+    key: &str,
+    protocol: Option<&str>,
+    extensions: Option<&str>,
+    extra_headers: Option<&[(String, String)]>,
+) -> Bytes {
     let mut buf = BytesMut::with_capacity(512);
 
     buf.put_slice(b"GET ");
@@ -191,6 +291,15 @@ pub fn build_request(
         buf.put_slice(b"Sec-WebSocket-Extensions: ");
         buf.put_slice(ext.as_bytes());
         buf.put_slice(b"\r\n");
+    }
+
+    if let Some(headers) = extra_headers {
+        for (name, value) in headers {
+            buf.put_slice(name.as_bytes());
+            buf.put_slice(b": ");
+            buf.put_slice(value.as_bytes());
+            buf.put_slice(b"\r\n");
+        }
     }
 
     buf.put_slice(b"\r\n");
@@ -347,7 +456,11 @@ pub struct HandshakeResult {
     pub protocol: Option<String>,
     /// Negotiated extensions
     pub extensions: Option<String>,
-    /// Leftover data after HTTP request (if any)
+    /// Bytes read beyond the end of the HTTP handshake.
+    ///
+    /// High-level `connect*` and `accept*` methods automatically replay these
+    /// bytes through the returned WebSocket stream. Direct handshake callers
+    /// remain responsible for preserving them.
     pub leftover: Option<Bytes>,
 }
 
@@ -362,11 +475,33 @@ pub async fn client_handshake<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    client_handshake_with_headers(stream, host, path, protocol, None).await
+}
+
+/// Perform a client-side handshake with additional HTTP headers.
+///
+/// Header names and values are validated before any bytes are written. Headers
+/// managed by the WebSocket handshake cannot be supplied through
+/// `extra_headers`.
+///
+/// Once writing begins, cancelling this future leaves the stream in an
+/// indeterminate handshake state and the stream should not be reused.
+#[cfg(feature = "tokio-runtime")]
+pub async fn client_handshake_with_headers<S>(
+    stream: &mut S,
+    host: &str,
+    path: &str,
+    protocol: Option<&str>,
+    extra_headers: Option<&[(String, String)]>,
+) -> Result<HandshakeResult>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // Generate key and build request
     let key = generate_key();
-    let request = build_request(host, path, &key, protocol, None);
+    let request = build_request_with_headers(host, path, &key, protocol, None, extra_headers)?;
 
     // Send request
     stream.write_all(&request).await?;
