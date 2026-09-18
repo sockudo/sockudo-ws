@@ -28,7 +28,7 @@ use futures_util::{FutureExt, SinkExt, StreamExt};
 use crate::Config;
 use crate::error::{CloseReason, Error, Result};
 use crate::handshake::{
-    HandshakeResult, build_request, build_response, generate_accept_key, generate_key,
+    HandshakeResult, build_request_with_headers, build_response, generate_accept_key, generate_key,
     parse_request, parse_response, validate_accept_key,
 };
 use crate::heartbeat::{Deadline, Heartbeat, bounded_close_reason};
@@ -261,8 +261,29 @@ pub async fn client_handshake<S>(
 where
     S: AsyncRead + AsyncWrite + ?Sized,
 {
+    client_handshake_with_headers(stream, host, path, protocol, None).await
+}
+
+/// Perform a client-side handshake with additional HTTP headers.
+///
+/// Header names and values are validated before any bytes are written. Headers
+/// managed by the WebSocket handshake cannot be supplied through
+/// `extra_headers`.
+///
+/// Once writing begins, cancelling this future leaves the stream in an
+/// indeterminate handshake state and the stream should not be reused.
+pub async fn client_handshake_with_headers<S>(
+    stream: &mut S,
+    host: &str,
+    path: &str,
+    protocol: Option<&str>,
+    extra_headers: Option<&[(String, String)]>,
+) -> Result<HandshakeResult>
+where
+    S: AsyncRead + AsyncWrite + ?Sized,
+{
     let key = generate_key();
-    let request = build_request(host, path, &key, protocol, None);
+    let request = build_request_with_headers(host, path, &key, protocol, None, extra_headers)?;
 
     write_all_owned(stream, request).await?;
     stream.flush().await?;
@@ -322,7 +343,7 @@ where
 
 /// Connect an already-connected Compio transport as a client WebSocket.
 pub async fn connect_async<S>(
-    mut stream: S,
+    stream: S,
     host: &str,
     path: &str,
     protocol: Option<&str>,
@@ -331,7 +352,27 @@ pub async fn connect_async<S>(
 where
     S: AsyncRead + AsyncWrite,
 {
-    let handshake = client_handshake(&mut stream, host, path, protocol).await?;
+    connect_async_with_headers(stream, host, path, protocol, None, config).await
+}
+
+/// Connect an already-connected Compio transport with additional HTTP headers.
+///
+/// Headers managed by the HTTP upgrade handshake cannot be overridden.
+/// Once writing begins, cancelling this future leaves the stream in an
+/// indeterminate handshake state and the stream should not be reused.
+pub async fn connect_async_with_headers<S>(
+    mut stream: S,
+    host: &str,
+    path: &str,
+    protocol: Option<&str>,
+    extra_headers: Option<&[(String, String)]>,
+    config: Config,
+) -> Result<(CompioWebSocketStream<S>, HandshakeResult)>
+where
+    S: AsyncRead + AsyncWrite,
+{
+    let handshake =
+        client_handshake_with_headers(&mut stream, host, path, protocol, extra_headers).await?;
     let ws =
         CompioWebSocketStream::client_with_leftover(stream, config, handshake.leftover.clone());
     Ok((ws, handshake))
@@ -2716,6 +2757,50 @@ mod tests {
         let echoed = client.next().await.unwrap().unwrap();
         assert!(matches!(echoed, Message::Text(text) if text == "hello"));
 
+        server.await.unwrap();
+    }
+
+    #[compio::test]
+    async fn compio_http1_client_sends_custom_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = ::compio::runtime::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = BytesMut::with_capacity(4096);
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                assert!(read_more(&mut stream, &mut request).await.unwrap() > 0);
+            }
+            let request = std::str::from_utf8(&request).unwrap();
+            assert!(request.contains("Authorization: Bearer token\r\n"));
+
+            let key = request
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("Sec-WebSocket-Key")
+                        .then(|| value.trim())
+                })
+                .unwrap();
+            let response = build_response(&generate_accept_key(key), None, None);
+            write_all_owned(&mut stream, response).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+        let headers = vec![("Authorization".to_string(), "Bearer token".to_string())];
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (_, handshake) = connect_async_with_headers(
+            stream,
+            &addr.to_string(),
+            "/ws",
+            None,
+            Some(&headers),
+            Config::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(handshake.path, "/ws");
         server.await.unwrap();
     }
 

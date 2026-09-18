@@ -175,8 +175,13 @@ impl WebSocketServer<Http1> {
         // Wrap in Stream<Http1>
         let stream = Stream::<Http1>::new(stream);
 
-        // Create WebSocketStream
-        let ws = WebSocketStream::from_raw(stream, Role::Server, self.config.clone());
+        // Preserve frame bytes read together with the HTTP upgrade request.
+        let ws = WebSocketStream::from_raw_with_leftover(
+            stream,
+            Role::Server,
+            self.config.clone(),
+            handshake_result.leftover.clone(),
+        );
 
         Ok((ws, handshake_result))
     }
@@ -220,8 +225,13 @@ impl WebSocketServer<Http1> {
         // Perform the HTTP/1.1 WebSocket handshake
         let handshake_result = handshake::server_handshake(&mut stream).await?;
 
-        // Create WebSocketStream directly without Stream<T> wrapper
-        let ws = WebSocketStream::from_raw(stream, Role::Server, self.config.clone());
+        // Preserve frame bytes read together with the HTTP upgrade request.
+        let ws = WebSocketStream::from_raw_with_leftover(
+            stream,
+            Role::Server,
+            self.config.clone(),
+            handshake_result.leftover.clone(),
+        );
 
         Ok((ws, handshake_result))
     }

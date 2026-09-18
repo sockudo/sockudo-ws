@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added custom HTTP headers to Tokio and Compio HTTP/1.1 client handshakes, with validation that
+  prevents malformed fields and conflicts with handshake-managed headers.
+
+### Fixed
+
+- Preserved WebSocket frame bytes read together with Tokio HTTP/1.1 upgrade requests or responses.
+
 ## [2.0.2] - 2026-09-19
 
 ### Fixed
