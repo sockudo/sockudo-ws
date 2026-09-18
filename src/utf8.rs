@@ -477,6 +477,152 @@ fn validate_utf8_scalar(data: &[u8]) -> bool {
 }
 
 // ============================================================================
+// Incremental UTF-8 validation (chunked, SIMD per chunk)
+// ============================================================================
+
+/// Incremental UTF-8 validator for data that arrives in chunks.
+///
+/// Each chunk is validated with the SIMD validator except for an incomplete
+/// trailing sequence (at most 3 bytes), which is carried over and checked once
+/// the following chunk supplies the rest. Validating a message chunk by chunk
+/// is therefore a single linear pass regardless of how it is fragmented, and an
+/// invalid sequence is reported as soon as the chunk containing it is pushed.
+#[derive(Debug, Clone, Default)]
+pub struct Utf8Stream {
+    carry: [u8; 4],
+    carry_len: u8,
+}
+
+impl Utf8Stream {
+    /// Create a validator with no pending bytes.
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            carry: [0; 4],
+            carry_len: 0,
+        }
+    }
+
+    /// Forget any pending bytes and start validating a new message.
+    #[inline]
+    pub fn reset(&mut self) {
+        self.carry_len = 0;
+    }
+
+    /// Validate the next chunk of the message.
+    ///
+    /// Returns `false` as soon as an invalid sequence is complete enough to be
+    /// rejected. A `true` result means everything so far is valid, possibly
+    /// with an incomplete sequence still pending (see [`Utf8Stream::finish`]).
+    #[inline]
+    pub fn push(&mut self, mut chunk: &[u8]) -> bool {
+        if self.carry_len > 0 {
+            let width = utf8_sequence_width(self.carry[0]);
+            let have = self.carry_len as usize;
+            let take = (width - have).min(chunk.len());
+            self.carry[have..have + take].copy_from_slice(&chunk[..take]);
+            self.carry_len += take as u8;
+            chunk = &chunk[take..];
+
+            if (self.carry_len as usize) < width {
+                // Still incomplete: reject as early as the prefix is hopeless.
+                return incomplete_prefix_may_be_valid(&self.carry[..self.carry_len as usize]);
+            }
+            if std::str::from_utf8(&self.carry[..width]).is_err() {
+                return false;
+            }
+            self.carry_len = 0;
+        }
+
+        let complete = complete_prefix_len(chunk);
+        if !validate_utf8(&chunk[..complete]) {
+            return false;
+        }
+
+        let tail = &chunk[complete..];
+        self.carry[..tail.len()].copy_from_slice(tail);
+        self.carry_len = tail.len() as u8;
+        // Fail fast (RFC 6455 §8.1): an incomplete sequence that cannot become
+        // valid is an error now, not once the rest of the bytes arrive.
+        incomplete_prefix_may_be_valid(tail)
+    }
+
+    /// Returns `true` if no incomplete sequence is pending, i.e. the message
+    /// validated so far is complete and valid UTF-8.
+    #[inline]
+    pub fn finish(&self) -> bool {
+        self.carry_len == 0
+    }
+
+    /// Number of bytes held back as an incomplete trailing sequence.
+    #[inline]
+    pub fn pending(&self) -> usize {
+        self.carry_len as usize
+    }
+}
+
+/// Encoded length of the UTF-8 sequence introduced by `lead` (0 if `lead` is
+/// not a valid leading byte).
+#[inline]
+fn utf8_sequence_width(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 0,
+    }
+}
+
+/// Returns true if `prefix` (an incomplete multi-byte sequence: a lead byte and
+/// zero or more continuation bytes) can still be completed into valid UTF-8.
+///
+/// Implements the second-byte constraints of RFC 3629 (no overlong forms, no
+/// surrogates, nothing above U+10FFFF) so that e.g. `F4 90` or `ED A0` are
+/// rejected without waiting for the remaining bytes.
+#[inline]
+fn incomplete_prefix_may_be_valid(prefix: &[u8]) -> bool {
+    let Some(&lead) = prefix.first() else {
+        return true;
+    };
+    let second_range: (u8, u8) = match lead {
+        0xC2..=0xDF => (0x80, 0xBF),
+        0xE0 => (0xA0, 0xBF),
+        0xE1..=0xEC | 0xEE..=0xEF => (0x80, 0xBF),
+        0xED => (0x80, 0x9F),
+        0xF0 => (0x90, 0xBF),
+        0xF1..=0xF3 => (0x80, 0xBF),
+        0xF4 => (0x80, 0x8F),
+        _ => return false,
+    };
+    if let Some(&second) = prefix.get(1)
+        && !(second_range.0..=second_range.1).contains(&second)
+    {
+        return false;
+    }
+    prefix.iter().skip(2).all(|&b| (0x80..=0xBF).contains(&b))
+}
+
+/// Length of the prefix of `chunk` that does not end in the middle of a
+/// multi-byte sequence. Only well-formed incomplete tails are held back;
+/// anything else is left in the prefix for the validator to reject.
+#[inline]
+fn complete_prefix_len(chunk: &[u8]) -> usize {
+    let n = chunk.len();
+    for back in 1..=n.min(3) {
+        let b = chunk[n - back];
+        if b < 0x80 {
+            return n;
+        }
+        if b >= 0xC0 {
+            let width = utf8_sequence_width(b);
+            return if width > back { n - back } else { n };
+        }
+    }
+    n
+}
+
+// ============================================================================
 // Streaming UTF-8 Validation (for fragmented messages)
 // ============================================================================
 
@@ -672,6 +818,78 @@ mod tests {
         let (valid, incomplete) = validate_utf8_incomplete(&data);
         assert!(valid);
         assert_eq!(incomplete, 2);
+    }
+
+    #[test]
+    fn test_utf8_stream_chunked_matches_whole() {
+        let text = "Hello, 世界! 🎉 κόσμε éà ".repeat(50);
+        let bytes = text.as_bytes();
+        for chunk in [1usize, 2, 3, 5, 7, 16, 64, 1000] {
+            let mut v = Utf8Stream::new();
+            for part in bytes.chunks(chunk) {
+                assert!(v.push(part), "chunk size {chunk}");
+            }
+            assert!(v.finish(), "chunk size {chunk}");
+        }
+    }
+
+    #[test]
+    fn test_utf8_stream_rejects_invalid_split_anywhere() {
+        // valid, then a complete invalid 4-byte sequence, then valid
+        let mut data = "κόσμε".as_bytes().to_vec();
+        data.extend_from_slice(&[0xF4, 0x90, 0x80, 0x80]);
+        data.extend_from_slice(b"edited");
+        for chunk in 1..=data.len() {
+            let mut v = Utf8Stream::new();
+            let mut rejected = false;
+            for part in data.chunks(chunk) {
+                if !v.push(part) {
+                    rejected = true;
+                    break;
+                }
+            }
+            assert!(rejected, "chunk size {chunk}");
+        }
+        // Rejection must happen as soon as the invalid sequence is complete.
+        let mut v = Utf8Stream::new();
+        assert!(v.push("κόσμε".as_bytes()));
+        assert!(!v.push(&[0xF4, 0x90, 0x80, 0x80]));
+    }
+
+    #[test]
+    fn test_utf8_stream_incomplete_tail() {
+        let mut v = Utf8Stream::new();
+        assert!(v.push(&[0xE4, 0xB8]));
+        assert_eq!(v.pending(), 2);
+        assert!(!v.finish());
+        assert!(v.push(&[0xAD]));
+        assert!(v.finish());
+
+        // hopeless prefixes are rejected before the sequence completes
+        let mut v = Utf8Stream::new();
+        assert!(!v.push(&[0xED, 0xA0])); // surrogate
+        let mut v = Utf8Stream::new();
+        assert!(!v.push(&[0xF4, 0x90])); // > U+10FFFF
+        let mut v = Utf8Stream::new();
+        assert!(v.push(&[0xF4]));
+        assert!(!v.push(&[0x90]));
+        let mut v = Utf8Stream::new();
+        assert!(!v.push(&[0xE0, 0x80])); // overlong
+        let mut v = Utf8Stream::new();
+        assert!(!v.push(&[0xC0])); // overlong lead
+        let mut v = Utf8Stream::new();
+        assert!(!v.push(&[0xE4, 0x41])); // non-continuation
+        // valid prefixes are accepted and completed
+        let mut v = Utf8Stream::new();
+        assert!(v.push(&[0xF4, 0x8F]));
+        assert!(v.push(&[0xBF, 0xBF]));
+        assert!(v.finish());
+
+        // invalid lead byte is rejected immediately, not carried
+        let mut v = Utf8Stream::new();
+        assert!(!v.push(&[0xFF]));
+        let mut v = Utf8Stream::new();
+        assert!(!v.push(b"ab\x80"));
     }
 
     #[test]

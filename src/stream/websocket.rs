@@ -3,6 +3,7 @@
 //! This module provides the main `WebSocketStream` type.
 
 use std::io;
+use std::io::IoSlice;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -24,6 +25,9 @@ const DEFAULT_HIGH_WATER_MARK: usize = 64 * 1024;
 
 /// Default low water mark for backpressure (16KB)
 const DEFAULT_LOW_WATER_MARK: usize = 16 * 1024;
+
+/// Maximum number of IoSlices handed to one vectored write (stack allocated)
+const MAX_WRITE_SLICES: usize = 16;
 
 pin_project! {
     /// A WebSocket stream over an async transport
@@ -69,7 +73,8 @@ pin_project! {
         config: Config,
         // Pending messages from last process() call
         pending_messages: Vec<Message>,
-        pending_index: usize,
+        // Deadline (ms since clock_epoch) the heartbeat timer is currently armed for
+        heartbeat_armed_ms: u64,
         // A control message is only returned after its automatic response is flushed.
         pending_control_message: Option<Message>,
         pending_terminal_error: Option<Error>,
@@ -115,7 +120,7 @@ where
             state: StreamState::Open,
             config,
             pending_messages: Vec::new(),
-            pending_index: 0,
+            heartbeat_armed_ms: 0,
             pending_control_message: None,
             pending_terminal_error: None,
             flush_on_read: false,
@@ -258,12 +263,13 @@ where
         use tokio::io::AsyncWriteExt;
 
         while self.write_buf.has_data() {
-            let slices = self.write_buf.get_write_slices();
-            if slices.is_empty() {
+            let mut slices = [IoSlice::new(&[]); MAX_WRITE_SLICES];
+            let count = self.write_buf.fill_write_slices(&mut slices);
+            if count == 0 {
                 break;
             }
 
-            let n = self.inner.write_vectored(&slices).await?;
+            let n = self.inner.write_vectored(&slices[..count]).await?;
             if n == 0 {
                 return Err(Error::ConnectionClosed);
             }
@@ -280,7 +286,7 @@ where
 
         // Ensure we have space in the buffer
         if this.read_buf.capacity() - this.read_buf.len() < 4096 {
-            this.read_buf.reserve(8192);
+            this.read_buf.reserve(crate::RECV_BUFFER_SIZE);
         }
 
         // Get a slice of uninitialized memory
@@ -327,32 +333,48 @@ where
             return Ok(());
         }
 
-        let messages = self.protocol.process(&mut self.read_buf)?;
-
-        if !messages.is_empty() {
-            self.pending_messages = messages;
-            self.pending_index = 0;
-        }
+        // Reuse the message Vec across reads (no allocation per read). Messages
+        // are popped from the back, so store them in reverse order.
+        debug_assert!(self.pending_messages.is_empty());
+        self.protocol
+            .process_into(&mut self.read_buf, &mut self.pending_messages)?;
+        self.pending_messages.reverse();
 
         Ok(())
     }
 
-    /// Get the next pending message
+    /// Get the next pending message (moved out, no clone)
+    #[inline]
     fn next_pending_message(&mut self) -> Option<Message> {
-        if self.pending_index < self.pending_messages.len() {
-            let msg = self.pending_messages[self.pending_index].clone();
-            self.pending_index += 1;
+        self.pending_messages.pop()
+    }
 
-            // Clear when all consumed
-            if self.pending_index >= self.pending_messages.len() {
-                self.pending_messages.clear();
-                self.pending_index = 0;
+    /// Poll the heartbeat timer for `deadline_ms`, (re)arming it only when needed.
+    ///
+    /// Inbound traffic only ever moves the deadline later, so the timer is left
+    /// untouched on every message and re-armed lazily when it fires. It is reset
+    /// eagerly only when the deadline moves earlier (e.g. a Pong deadline starts).
+    fn poll_heartbeat_timer(&mut self, cx: &mut Context<'_>, deadline_ms: u64) -> Poll<()> {
+        let target = self.clock_epoch + Duration::from_millis(deadline_ms);
+        match self.heartbeat_sleep.as_mut() {
+            Some(sleep) => {
+                if deadline_ms < self.heartbeat_armed_ms
+                    || (deadline_ms != self.heartbeat_armed_ms && sleep.is_elapsed())
+                {
+                    sleep.as_mut().reset(target);
+                    self.heartbeat_armed_ms = deadline_ms;
+                }
             }
-
-            Some(msg)
-        } else {
-            None
+            None => {
+                self.heartbeat_sleep = Some(Box::pin(tokio::time::sleep_until(target)));
+                self.heartbeat_armed_ms = deadline_ms;
+            }
         }
+        self.heartbeat_sleep
+            .as_mut()
+            .expect("heartbeat timer armed above")
+            .as_mut()
+            .poll(cx)
     }
 }
 
@@ -373,8 +395,9 @@ where
                         if this.ping_flush_pending {
                             this.ping_flush_pending = false;
                             let now = this.clock_epoch.elapsed().as_millis() as u64;
+                            // The Pong deadline is earlier than the armed one; the
+                            // timer is reset on the next poll.
                             this.heartbeat.ping_flushed(now);
-                            this.heartbeat_sleep = None;
                         }
 
                         if this.close_after_flush {
@@ -461,14 +484,13 @@ where
                     continue;
                 }
 
-                let delay = Duration::from_millis(deadline.at().saturating_sub(now));
-                let sleep = self
+                if self
                     .as_mut()
                     .get_mut()
-                    .heartbeat_sleep
-                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(delay)));
-                if sleep.as_mut().poll(cx).is_ready() {
-                    self.as_mut().get_mut().heartbeat_sleep = None;
+                    .poll_heartbeat_timer(cx, deadline.at())
+                    .is_ready()
+                {
+                    // Fired: loop back to re-evaluate the (possibly moved) deadline.
                     continue;
                 }
             }
@@ -481,8 +503,9 @@ where
                     Message::Pong(payload) => Some(payload),
                     _ => None,
                 };
+                // Inbound traffic only pushes deadlines later; the armed timer is
+                // left alone and re-armed lazily when it fires.
                 this.heartbeat.on_inbound(now, pong);
-                this.heartbeat_sleep = None;
 
                 // Handle control frames
                 match &msg {
@@ -589,12 +612,13 @@ where
 
         // Write all pending data
         while this.write_buf.has_data() {
-            let slices = this.write_buf.get_write_slices();
-            if slices.is_empty() {
+            let mut slices = [IoSlice::new(&[]); MAX_WRITE_SLICES];
+            let count = this.write_buf.fill_write_slices(&mut slices);
+            if count == 0 {
                 break;
             }
 
-            match Pin::new(&mut this.inner).poll_write_vectored(cx, &slices) {
+            match Pin::new(&mut this.inner).poll_write_vectored(cx, &slices[..count]) {
                 Poll::Ready(Ok(0)) => {
                     this.state = StreamState::Closed;
                     this.heartbeat.stop();
@@ -747,7 +771,7 @@ impl Default for WebSocketStreamBuilder {
 
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -778,7 +802,6 @@ impl TerminalCause {
 
 #[derive(Debug)]
 enum ControlRequest {
-    Activity(tokio::time::Instant),
     Ping(Bytes, tokio::time::Instant),
     Pong(Bytes, tokio::time::Instant),
     PeerClose,
@@ -795,6 +818,10 @@ struct SplitShared {
     status: AtomicU8,
     terminal_tx: watch::Sender<Option<TerminalCause>>,
     cancel: CancellationToken,
+    /// Clock epoch shared by the reader and the writer driver
+    epoch: tokio::time::Instant,
+    /// Milliseconds since `epoch` of the last inbound data frame (reader -> driver)
+    last_inbound_ms: AtomicU64,
 }
 
 impl SplitShared {
@@ -804,7 +831,15 @@ impl SplitShared {
             status: AtomicU8::new(if closed { SPLIT_CLOSED } else { SPLIT_OPEN }),
             terminal_tx,
             cancel: CancellationToken::new(),
+            epoch: tokio::time::Instant::now(),
+            last_inbound_ms: AtomicU64::new(0),
         })
+    }
+
+    #[inline]
+    fn note_inbound(&self) {
+        let now_ms = self.epoch.elapsed().as_millis() as u64;
+        self.last_inbound_ms.fetch_max(now_ms, Ordering::Relaxed);
     }
 
     fn begin_closing(&self) -> bool {
@@ -855,7 +890,6 @@ pub struct SplitReader<S> {
     protocol: Protocol,
     read_buf: BytesMut,
     pending_messages: Vec<Message>,
-    pending_index: usize,
     control_tx: mpsc::Sender<ControlRequest>,
     terminal_rx: watch::Receiver<Option<TerminalCause>>,
     shared: Arc<SplitShared>,
@@ -906,7 +940,6 @@ where
                 protocol: reader_protocol,
                 read_buf: self.read_buf,
                 pending_messages: self.pending_messages,
-                pending_index: self.pending_index,
                 control_tx,
                 terminal_rx,
                 shared: shared.clone(),
@@ -935,14 +968,7 @@ where
                 return result;
             }
 
-            if self.pending_index < self.pending_messages.len() {
-                let msg = self.pending_messages[self.pending_index].clone();
-                self.pending_index += 1;
-                if self.pending_index >= self.pending_messages.len() {
-                    self.pending_messages.clear();
-                    self.pending_index = 0;
-                }
-
+            if let Some(msg) = self.pending_messages.pop() {
                 let request = match &msg {
                     Message::Ping(data) => {
                         ControlRequest::Ping(data.clone(), tokio::time::Instant::now())
@@ -954,7 +980,12 @@ where
                         self.shared.begin_closing();
                         ControlRequest::PeerClose
                     }
-                    _ => ControlRequest::Activity(tokio::time::Instant::now()),
+                    _ => {
+                        // Data frames only need to refresh the inactivity clock; a
+                        // relaxed store avoids a channel round trip per message.
+                        self.shared.note_inbound();
+                        return Some(Ok(msg));
+                    }
                 };
                 if self.control_tx.send(request).await.is_err() {
                     self.shared.terminate(TerminalCause::ConnectionClosed);
@@ -964,7 +995,7 @@ where
             }
 
             if self.read_buf.capacity() - self.read_buf.len() < 4096 {
-                self.read_buf.reserve(8192);
+                self.read_buf.reserve(crate::RECV_BUFFER_SIZE);
             }
 
             tokio::select! {
@@ -980,12 +1011,11 @@ where
                             let _ = self.control_tx.send(ControlRequest::Eof).await;
                             self.shared.terminate(TerminalCause::ConnectionClosed);
                         }
-                        Ok(_) => match self.protocol.process(&mut self.read_buf) {
-                            Ok(messages) if !messages.is_empty() => {
-                                self.pending_messages = messages;
-                                self.pending_index = 0;
-                            }
-                            Ok(_) => {}
+                        Ok(_) => match self
+                            .protocol
+                            .process_into(&mut self.read_buf, &mut self.pending_messages)
+                        {
+                            Ok(()) => self.pending_messages.reverse(),
                             Err(error) => {
                                 self.shared.terminate(TerminalCause::ConnectionClosed);
                                 return Some(Err(error));
@@ -1101,18 +1131,40 @@ async fn split_writer_driver<W, E>(
     W: AsyncWrite + Unpin,
     E: SplitEncoder,
 {
-    let epoch = tokio::time::Instant::now();
+    let epoch = shared.epoch;
     let mut heartbeat = Heartbeat::new(&config, 0);
     let mut closing_deadline = None;
     let mut local_close_sent = false;
     let mut write_buf = BytesMut::with_capacity(config.write_buffer_size);
 
+    // One timer for the whole connection: re-armed lazily when it fires or when
+    // the deadline moves earlier, never per message.
+    let mut heartbeat_sleep = Box::pin(tokio::time::sleep_until(epoch + Duration::from_secs(3600)));
+    let mut heartbeat_armed_ms: Option<u64> = None;
+    let mut last_synced_inbound_ms = 0u64;
+
     loop {
-        let now_ms = epoch.elapsed().as_millis() as u64;
+        // Pick up data-frame activity published by the reader without a channel.
+        let observed_inbound = shared.last_inbound_ms.load(Ordering::Relaxed);
+        if observed_inbound > last_synced_inbound_ms {
+            last_synced_inbound_ms = observed_inbound;
+            heartbeat.on_inbound(observed_inbound, None);
+        }
+
         let heartbeat_deadline = heartbeat.next_deadline();
-        let heartbeat_delay = heartbeat_deadline
-            .map(|deadline| Duration::from_millis(deadline.at().saturating_sub(now_ms)))
-            .unwrap_or(Duration::from_secs(365 * 24 * 60 * 60));
+        if let Some(deadline) = heartbeat_deadline {
+            let at = deadline.at();
+            let rearm = match heartbeat_armed_ms {
+                None => true,
+                Some(armed) => at < armed || (at != armed && heartbeat_sleep.is_elapsed()),
+            };
+            if rearm {
+                heartbeat_sleep
+                    .as_mut()
+                    .reset(epoch + Duration::from_millis(at));
+                heartbeat_armed_ms = Some(at);
+            }
+        }
         let close_delay = closing_deadline
             .map(|deadline: tokio::time::Instant| {
                 deadline.saturating_duration_since(tokio::time::Instant::now())
@@ -1131,11 +1183,6 @@ async fn split_writer_driver<W, E>(
                     break;
                 };
                 match request {
-                    ControlRequest::Activity(received_at) => {
-                        let received_ms =
-                            received_at.saturating_duration_since(epoch).as_millis() as u64;
-                        heartbeat.on_inbound(received_ms, None);
-                    }
                     ControlRequest::Ping(payload, received_at) => {
                         let received_ms =
                             received_at.saturating_duration_since(epoch).as_millis() as u64;
@@ -1228,7 +1275,7 @@ async fn split_writer_driver<W, E>(
                 shared.terminate(TerminalCause::ConnectionClosed);
                 break;
             }
-            _ = tokio::time::sleep(heartbeat_delay), if heartbeat_deadline.is_some() && shared.is_open() => {
+            _ = &mut heartbeat_sleep, if heartbeat_deadline.is_some() && shared.is_open() => {
                 let now_ms = epoch.elapsed().as_millis() as u64;
                 match heartbeat.next_deadline() {
                     Some(Deadline::Ping(at)) if at <= now_ms => {
@@ -1351,7 +1398,8 @@ pin_project! {
         state: StreamState,
         config: Config,
         pending_messages: Vec<Message>,
-        pending_index: usize,
+        // Deadline (ms since clock_epoch) the heartbeat timer is currently armed for
+        heartbeat_armed_ms: u64,
         pending_control_message: Option<Message>,
         pending_terminal_error: Option<Error>,
         flush_on_read: bool,
@@ -1388,7 +1436,7 @@ where
             state: StreamState::Open,
             config,
             pending_messages: Vec::new(),
-            pending_index: 0,
+            heartbeat_armed_ms: 0,
             pending_control_message: None,
             pending_terminal_error: None,
             flush_on_read: false,
@@ -1420,7 +1468,7 @@ where
             state: StreamState::Open,
             config,
             pending_messages: Vec::new(),
-            pending_index: 0,
+            heartbeat_armed_ms: 0,
             pending_control_message: None,
             pending_terminal_error: None,
             flush_on_read: false,
@@ -1472,12 +1520,13 @@ where
         use tokio::io::AsyncWriteExt;
 
         while self.write_buf.has_data() {
-            let slices = self.write_buf.get_write_slices();
-            if slices.is_empty() {
+            let mut slices = [IoSlice::new(&[]); MAX_WRITE_SLICES];
+            let count = self.write_buf.fill_write_slices(&mut slices);
+            if count == 0 {
                 break;
             }
 
-            let n = self.inner.write_vectored(&slices).await?;
+            let n = self.inner.write_vectored(&slices[..count]).await?;
             if n == 0 {
                 return Err(Error::ConnectionClosed);
             }
@@ -1493,7 +1542,7 @@ where
         let this = self.project();
 
         if this.read_buf.capacity() - this.read_buf.len() < 4096 {
-            this.read_buf.reserve(8192);
+            this.read_buf.reserve(crate::RECV_BUFFER_SIZE);
         }
 
         let buf_len = this.read_buf.len();
@@ -1538,31 +1587,44 @@ where
             return Ok(());
         }
 
-        let messages = self.protocol.process(&mut self.read_buf)?;
-
-        if !messages.is_empty() {
-            self.pending_messages = messages;
-            self.pending_index = 0;
-        }
+        // Reuse the message Vec across reads (no allocation per read). Messages
+        // are popped from the back, so store them in reverse order.
+        debug_assert!(self.pending_messages.is_empty());
+        self.protocol
+            .process_into(&mut self.read_buf, &mut self.pending_messages)?;
+        self.pending_messages.reverse();
 
         Ok(())
     }
 
-    /// Get the next pending message
+    /// Get the next pending message (moved out, no clone)
+    #[inline]
     fn next_pending_message(&mut self) -> Option<Message> {
-        if self.pending_index < self.pending_messages.len() {
-            let msg = self.pending_messages[self.pending_index].clone();
-            self.pending_index += 1;
+        self.pending_messages.pop()
+    }
 
-            if self.pending_index >= self.pending_messages.len() {
-                self.pending_messages.clear();
-                self.pending_index = 0;
+    /// See [`WebSocketStream::poll_heartbeat_timer`].
+    fn poll_heartbeat_timer(&mut self, cx: &mut Context<'_>, deadline_ms: u64) -> Poll<()> {
+        let target = self.clock_epoch + Duration::from_millis(deadline_ms);
+        match self.heartbeat_sleep.as_mut() {
+            Some(sleep) => {
+                if deadline_ms < self.heartbeat_armed_ms
+                    || (deadline_ms != self.heartbeat_armed_ms && sleep.is_elapsed())
+                {
+                    sleep.as_mut().reset(target);
+                    self.heartbeat_armed_ms = deadline_ms;
+                }
             }
-
-            Some(msg)
-        } else {
-            None
+            None => {
+                self.heartbeat_sleep = Some(Box::pin(tokio::time::sleep_until(target)));
+                self.heartbeat_armed_ms = deadline_ms;
+            }
         }
+        self.heartbeat_sleep
+            .as_mut()
+            .expect("heartbeat timer armed above")
+            .as_mut()
+            .poll(cx)
     }
 }
 
@@ -1583,8 +1645,9 @@ where
                         if this.ping_flush_pending {
                             this.ping_flush_pending = false;
                             let now = this.clock_epoch.elapsed().as_millis() as u64;
+                            // The Pong deadline is earlier than the armed one; the
+                            // timer is reset on the next poll.
                             this.heartbeat.ping_flushed(now);
-                            this.heartbeat_sleep = None;
                         }
 
                         if this.close_after_flush {
@@ -1668,14 +1731,13 @@ where
                     continue;
                 }
 
-                let delay = Duration::from_millis(deadline.at().saturating_sub(now));
-                let sleep = self
+                if self
                     .as_mut()
                     .get_mut()
-                    .heartbeat_sleep
-                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(delay)));
-                if sleep.as_mut().poll(cx).is_ready() {
-                    self.as_mut().get_mut().heartbeat_sleep = None;
+                    .poll_heartbeat_timer(cx, deadline.at())
+                    .is_ready()
+                {
+                    // Fired: loop back to re-evaluate the (possibly moved) deadline.
                     continue;
                 }
             }
@@ -1687,8 +1749,9 @@ where
                     Message::Pong(payload) => Some(payload),
                     _ => None,
                 };
+                // Inbound traffic only pushes deadlines later; the armed timer is
+                // left alone and re-armed lazily when it fires.
                 this.heartbeat.on_inbound(now, pong);
-                this.heartbeat_sleep = None;
 
                 match &msg {
                     Message::Ping(data) => {
@@ -1784,12 +1847,13 @@ where
         let this = self.as_mut().get_mut();
 
         while this.write_buf.has_data() {
-            let slices = this.write_buf.get_write_slices();
-            if slices.is_empty() {
+            let mut slices = [IoSlice::new(&[]); MAX_WRITE_SLICES];
+            let count = this.write_buf.fill_write_slices(&mut slices);
+            if count == 0 {
                 break;
             }
 
-            match Pin::new(&mut this.inner).poll_write_vectored(cx, &slices) {
+            match Pin::new(&mut this.inner).poll_write_vectored(cx, &slices[..count]) {
                 Poll::Ready(Ok(0)) => {
                     this.state = StreamState::Closed;
                     this.heartbeat.stop();
@@ -1868,7 +1932,6 @@ pub struct CompressedSplitReader<S> {
     read_buf: BytesMut,
     /// Pending messages from last decode
     pending_messages: Vec<Message>,
-    pending_index: usize,
     control_tx: mpsc::Sender<ControlRequest>,
     terminal_rx: watch::Receiver<Option<TerminalCause>>,
     shared: Arc<SplitShared>,
@@ -1961,7 +2024,6 @@ where
                 protocol: reader_protocol,
                 read_buf: self.read_buf,
                 pending_messages: self.pending_messages,
-                pending_index: self.pending_index,
                 control_tx,
                 terminal_rx,
                 shared: shared.clone(),
@@ -1991,15 +2053,7 @@ where
                 return result;
             }
 
-            if self.pending_index < self.pending_messages.len() {
-                let msg = self.pending_messages[self.pending_index].clone();
-                self.pending_index += 1;
-
-                if self.pending_index >= self.pending_messages.len() {
-                    self.pending_messages.clear();
-                    self.pending_index = 0;
-                }
-
+            if let Some(msg) = self.pending_messages.pop() {
                 let request = match &msg {
                     Message::Ping(data) => {
                         ControlRequest::Ping(data.clone(), tokio::time::Instant::now())
@@ -2011,7 +2065,12 @@ where
                         self.shared.begin_closing();
                         ControlRequest::PeerClose
                     }
-                    _ => ControlRequest::Activity(tokio::time::Instant::now()),
+                    _ => {
+                        // Data frames only need to refresh the inactivity clock; a
+                        // relaxed store avoids a channel round trip per message.
+                        self.shared.note_inbound();
+                        return Some(Ok(msg));
+                    }
                 };
                 if self.control_tx.send(request).await.is_err() {
                     self.shared.terminate(TerminalCause::ConnectionClosed);
@@ -2021,7 +2080,7 @@ where
             }
 
             if self.read_buf.capacity() - self.read_buf.len() < 4096 {
-                self.read_buf.reserve(8192);
+                self.read_buf.reserve(crate::RECV_BUFFER_SIZE);
             }
 
             tokio::select! {
@@ -2037,12 +2096,11 @@ where
                             let _ = self.control_tx.send(ControlRequest::Eof).await;
                             self.shared.terminate(TerminalCause::ConnectionClosed);
                         }
-                        Ok(_) => match self.protocol.process(&mut self.read_buf) {
-                            Ok(messages) if !messages.is_empty() => {
-                                self.pending_messages = messages;
-                                self.pending_index = 0;
-                            }
-                            Ok(_) => {}
+                        Ok(_) => match self
+                            .protocol
+                            .process_into(&mut self.read_buf, &mut self.pending_messages)
+                        {
+                            Ok(()) => self.pending_messages.reverse(),
                             Err(error) => {
                                 self.shared.terminate(TerminalCause::ConnectionClosed);
                                 return Some(Err(error));

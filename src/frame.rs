@@ -9,7 +9,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::error::{CloseReason, Error, Result};
-use crate::simd::apply_mask;
+use crate::simd::{apply_mask, apply_mask_offset};
 use crate::utf8::validate_utf8;
 use crate::{MEDIUM_MESSAGE_THRESHOLD, SMALL_MESSAGE_THRESHOLD};
 
@@ -274,6 +274,29 @@ pub struct FrameParser {
     expect_masked: bool,
     /// Whether RSV1 is allowed (compression enabled)
     allow_rsv1: bool,
+    /// Number of payload bytes at the front of the caller's buffer that have
+    /// already been unmasked while waiting for the rest of the frame.
+    payload_ready: usize,
+}
+
+/// Description of a frame whose header has been parsed but whose payload has
+/// not fully arrived yet.
+///
+/// `ready` bytes at the front of the caller's buffer are already unmasked and
+/// can be inspected (for example, for incremental UTF-8 validation) before the
+/// frame completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingPayload {
+    /// Frame opcode
+    pub opcode: OpCode,
+    /// Final fragment flag
+    pub fin: bool,
+    /// RSV1 (compressed) flag
+    pub rsv1: bool,
+    /// Payload bytes already available and unmasked at the front of the buffer
+    pub ready: usize,
+    /// Total payload length of the frame
+    pub total: usize,
 }
 
 impl FrameParser {
@@ -287,6 +310,7 @@ impl FrameParser {
             max_frame_size,
             expect_masked,
             allow_rsv1: false,
+            payload_ready: 0,
         }
     }
 
@@ -300,7 +324,28 @@ impl FrameParser {
             max_frame_size,
             expect_masked,
             allow_rsv1: true,
+            payload_ready: 0,
         }
+    }
+
+    /// Describe the frame currently waiting for the rest of its payload.
+    ///
+    /// Returns `None` unless a header has been fully parsed and the payload is
+    /// still incomplete. The first `ready` bytes of the buffer passed to the
+    /// last [`FrameParser::parse`] call are the unmasked payload prefix.
+    #[inline]
+    pub fn pending_payload(&self) -> Option<PendingPayload> {
+        if self.state != ParseState::Payload {
+            return None;
+        }
+        let header = self.header.as_ref()?;
+        Some(PendingPayload {
+            opcode: header.opcode,
+            fin: header.fin,
+            rsv1: header.rsv1,
+            ready: self.payload_ready,
+            total: header.payload_len as usize,
+        })
     }
 
     /// Enable or disable RSV1 (compression) support
@@ -314,6 +359,7 @@ impl FrameParser {
         self.state = ParseState::Header;
         self.header_len = 0;
         self.header = None;
+        self.payload_ready = 0;
     }
 
     /// Parse a frame from the buffer
@@ -756,6 +802,18 @@ impl FrameParser {
                         if DEBUG {
                             eprintln!("[PARSER] Not enough payload data, waiting...");
                         }
+                        // Streaming unmask: make the bytes that already arrived
+                        // readable so callers can validate them before the frame
+                        // completes (fail-fast UTF-8) and so the final unmask only
+                        // touches the tail.
+                        let available = buf.len();
+                        let ready = self.payload_ready;
+                        if available > ready {
+                            if let Some(mask) = header.mask {
+                                apply_mask_offset(&mut buf[ready..available], mask, ready);
+                            }
+                            self.payload_ready = available;
+                        }
                         return Ok(None);
                     }
 
@@ -767,11 +825,16 @@ impl FrameParser {
                         );
                     }
 
-                    // Extract and unmask payload
+                    // Extract and unmask the part of the payload that was not
+                    // already unmasked while streaming.
+                    let mask = header.mask;
+                    let ready = self.payload_ready;
                     let mut payload = buf.split_to(payload_len);
 
-                    if let Some(mask) = header.mask {
-                        apply_mask(&mut payload, mask);
+                    if let Some(mask) = mask
+                        && ready < payload_len
+                    {
+                        apply_mask_offset(&mut payload[ready..], mask, ready);
                     }
 
                     let frame = Frame {

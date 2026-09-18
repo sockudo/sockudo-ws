@@ -11,7 +11,7 @@ use crate::error::{CloseReason, Error, Result};
 #[cfg(feature = "permessage-deflate")]
 use crate::frame::encode_frame_with_rsv;
 use crate::frame::{Frame, FrameParser, OpCode, encode_frame};
-use crate::utf8::{validate_utf8, validate_utf8_incomplete};
+use crate::utf8::{Utf8Stream, validate_utf8};
 
 #[cfg(feature = "permessage-deflate")]
 use crate::deflate::{DeflateConfig, DeflateContext};
@@ -288,6 +288,11 @@ pub struct Protocol {
     pub(crate) max_message_size: usize,
     /// Pending close reason (if we received a close frame)
     pending_close: Option<CloseReason>,
+    /// Incremental UTF-8 validator for the text message currently being received
+    pub(crate) utf8: Utf8Stream,
+    /// Payload bytes of the frame currently being received that were already
+    /// fed to `utf8` before the frame completed
+    partial_checked: usize,
 }
 
 impl Protocol {
@@ -303,7 +308,43 @@ impl Protocol {
             fragment_opcode: None,
             max_message_size,
             pending_close: None,
+            utf8: Utf8Stream::new(),
+            partial_checked: 0,
         }
+    }
+
+    /// Validate the already-received prefix of an incomplete text frame.
+    ///
+    /// Called when the parser needs more data. This makes invalid UTF-8 fail as
+    /// soon as it arrives (RFC 6455 fail-fast, Autobahn 6.4.x strict) and keeps
+    /// text validation to a single linear pass however the message is chopped.
+    #[inline]
+    fn prevalidate_partial_text(&mut self, buf: &BytesMut) -> Result<()> {
+        let Some(pending) = self.parser.pending_payload() else {
+            return Ok(());
+        };
+        if pending.rsv1 || pending.ready <= self.partial_checked {
+            return Ok(());
+        }
+
+        let is_text = match pending.opcode {
+            OpCode::Text => self.fragment_opcode.is_none(),
+            OpCode::Continuation => self.fragment_opcode == Some(OpCode::Text),
+            _ => false,
+        };
+        if !is_text {
+            return Ok(());
+        }
+
+        if self.partial_checked == 0 && pending.opcode == OpCode::Text {
+            self.utf8.reset();
+        }
+        let ready = pending.ready.min(buf.len());
+        if !self.utf8.push(&buf[self.partial_checked..ready]) {
+            return Err(Error::InvalidUtf8);
+        }
+        self.partial_checked = ready;
+        Ok(())
     }
 
     /// Check if connection is closed
@@ -339,11 +380,15 @@ impl Protocol {
         while !buf.is_empty() {
             match self.parser.parse(buf)? {
                 Some(frame) => {
-                    if let Some(msg) = self.handle_frame(frame)? {
+                    let prevalidated = std::mem::take(&mut self.partial_checked);
+                    if let Some(msg) = self.handle_frame(frame, prevalidated)? {
                         messages.push(msg);
                     }
                 }
-                None => break,
+                None => {
+                    self.prevalidate_partial_text(buf)?;
+                    break;
+                }
             }
         }
 
@@ -374,6 +419,7 @@ impl Protocol {
         while !buf.is_empty() {
             match self.parser.parse(buf)? {
                 Some(frame) => {
+                    self.partial_checked = 0;
                     if let Some(msg) = self.handle_raw_frame(frame)? {
                         messages.push(msg);
                     }
@@ -386,10 +432,13 @@ impl Protocol {
     }
 
     /// Handle a single parsed frame
-    fn handle_frame(&mut self, frame: Frame) -> Result<Option<Message>> {
+    ///
+    /// `prevalidated` is the number of leading payload bytes that were already
+    /// UTF-8 validated while the frame was still incomplete.
+    fn handle_frame(&mut self, frame: Frame, prevalidated: usize) -> Result<Option<Message>> {
         match frame.header.opcode {
-            OpCode::Continuation => self.handle_continuation(frame),
-            OpCode::Text => self.handle_text(frame),
+            OpCode::Continuation => self.handle_continuation(frame, prevalidated),
+            OpCode::Text => self.handle_text(frame, prevalidated),
             OpCode::Binary => self.handle_binary(frame),
             OpCode::Close => self.handle_close(frame),
             OpCode::Ping => self.handle_ping(frame),
@@ -413,21 +462,27 @@ impl Protocol {
     }
 
     /// Handle text frame
-    fn handle_text(&mut self, frame: Frame) -> Result<Option<Message>> {
+    fn handle_text(&mut self, frame: Frame, prevalidated: usize) -> Result<Option<Message>> {
         if self.fragment_opcode.is_some() {
             return Err(Error::Protocol("expected continuation frame"));
         }
 
         if frame.header.fin {
-            // Complete message in one frame (fast path)
-            if !validate_utf8(&frame.payload) {
+            // Complete message in one frame (fast path: one SIMD pass)
+            let valid = if prevalidated == 0 {
+                validate_utf8(&frame.payload)
+            } else {
+                let prevalidated = prevalidated.min(frame.payload.len());
+                self.utf8.push(&frame.payload[prevalidated..]) && self.utf8.finish()
+            };
+            if !valid {
                 return Err(Error::InvalidUtf8);
             }
             // Zero-copy: just return the Bytes directly (already UTF-8 validated)
             Ok(Some(Message::Text(frame.payload)))
         } else {
             // Start of fragmented message
-            self.start_fragment(OpCode::Text, frame.payload)?;
+            self.start_fragment(OpCode::Text, frame.payload, prevalidated)?;
             Ok(None)
         }
     }
@@ -443,7 +498,7 @@ impl Protocol {
             Ok(Some(Message::Binary(frame.payload)))
         } else {
             // Start of fragmented message
-            self.start_fragment(OpCode::Binary, frame.payload)?;
+            self.start_fragment(OpCode::Binary, frame.payload, 0)?;
             Ok(None)
         }
     }
@@ -477,7 +532,11 @@ impl Protocol {
     }
 
     /// Handle continuation frame
-    fn handle_continuation(&mut self, frame: Frame) -> Result<Option<Message>> {
+    fn handle_continuation(
+        &mut self,
+        frame: Frame,
+        prevalidated: usize,
+    ) -> Result<Option<Message>> {
         let opcode = self
             .fragment_opcode
             .ok_or(Error::Protocol("unexpected continuation frame"))?;
@@ -488,19 +547,22 @@ impl Protocol {
             return Err(Error::MessageTooLarge);
         }
 
+        // Text fragments are validated incrementally: only the bytes that were
+        // not already checked while the frame was incomplete are scanned, so a
+        // message costs one linear pass no matter how many fragments it has.
+        if opcode == OpCode::Text {
+            let prevalidated = prevalidated.min(frame.payload.len());
+            if !self.utf8.push(&frame.payload[prevalidated..]) {
+                return Err(Error::InvalidUtf8);
+            }
+        }
+
         self.fragment_buf.extend_from_slice(&frame.payload);
 
         if frame.header.fin {
             // Complete the fragmented message
             self.complete_fragment(opcode)
         } else {
-            // Validate partial UTF-8 for text messages
-            if opcode == OpCode::Text {
-                let (valid, _incomplete) = validate_utf8_incomplete(&self.fragment_buf);
-                if !valid {
-                    return Err(Error::InvalidUtf8);
-                }
-            }
             Ok(None)
         }
     }
@@ -526,22 +588,33 @@ impl Protocol {
     }
 
     /// Start a fragmented message
-    pub(crate) fn start_fragment(&mut self, opcode: OpCode, payload: Bytes) -> Result<()> {
+    ///
+    /// `prevalidated` leading bytes of a text payload were already fed to the
+    /// incremental validator while the frame was incomplete.
+    pub(crate) fn start_fragment(
+        &mut self,
+        opcode: OpCode,
+        payload: Bytes,
+        prevalidated: usize,
+    ) -> Result<()> {
         if payload.len() > self.max_message_size {
             return Err(Error::MessageTooLarge);
+        }
+
+        // Validate the first fragment of a text message incrementally
+        if opcode == OpCode::Text {
+            if prevalidated == 0 {
+                self.utf8.reset();
+            }
+            let prevalidated = prevalidated.min(payload.len());
+            if !self.utf8.push(&payload[prevalidated..]) {
+                return Err(Error::InvalidUtf8);
+            }
         }
 
         self.fragment_opcode = Some(opcode);
         self.fragment_buf.clear();
         self.fragment_buf.extend_from_slice(&payload);
-
-        // Validate partial UTF-8 for text messages
-        if opcode == OpCode::Text {
-            let (valid, _incomplete) = validate_utf8_incomplete(&self.fragment_buf);
-            if !valid {
-                return Err(Error::InvalidUtf8);
-            }
-        }
 
         Ok(())
     }
@@ -565,10 +638,11 @@ impl Protocol {
 
         match opcode {
             OpCode::Text => {
-                if !validate_utf8(&data) {
+                // Every fragment was validated as it arrived; only an incomplete
+                // trailing sequence can still make the message invalid.
+                if !self.utf8.finish() {
                     return Err(Error::InvalidUtf8);
                 }
-                // Zero-copy: just return the Bytes directly (already UTF-8 validated)
                 Ok(Some(Message::Text(data)))
             }
             OpCode::Binary => Ok(Some(Message::Binary(data))),
@@ -880,11 +954,12 @@ impl CompressedProtocol {
             // For compressed fragments, store as binary (don't validate UTF-8 yet)
             // We'll decompress and validate when the message is complete
             if compressed {
-                self.inner.start_fragment(OpCode::Binary, frame.payload)?;
+                self.inner
+                    .start_fragment(OpCode::Binary, frame.payload, 0)?;
                 // Override the opcode back to Text for proper handling
                 self.inner.fragment_opcode = Some(OpCode::Text);
             } else {
-                self.inner.start_fragment(OpCode::Text, frame.payload)?;
+                self.inner.start_fragment(OpCode::Text, frame.payload, 0)?;
             }
             Ok(None)
         }
@@ -908,7 +983,8 @@ impl CompressedProtocol {
         } else {
             // Start of fragmented message
             self.fragment_compressed = compressed;
-            self.inner.start_fragment(OpCode::Binary, frame.payload)?;
+            self.inner
+                .start_fragment(OpCode::Binary, frame.payload, 0)?;
             Ok(None)
         }
     }

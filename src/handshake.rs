@@ -64,24 +64,31 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>
             let mut connection_upgrade = false;
 
             for header in req.headers.iter() {
-                let name = header.name.to_ascii_lowercase();
+                let name = header.name;
                 let value = std::str::from_utf8(header.value)
                     .map_err(|_| Error::InvalidHttp("invalid header value"))?;
 
-                match name.as_str() {
-                    "sec-websocket-key" => key = Some(value),
-                    "sec-websocket-version" => version = Some(value),
-                    "sec-websocket-protocol" => protocol = Some(value),
-                    "sec-websocket-extensions" => extensions = Some(value),
-                    "host" => host = Some(value),
-                    "origin" => origin = Some(value),
-                    "upgrade" if value.to_ascii_lowercase().contains("websocket") => {
+                // Case-insensitive comparisons without allocating per header.
+                if name.eq_ignore_ascii_case("sec-websocket-key") {
+                    key = Some(value);
+                } else if name.eq_ignore_ascii_case("sec-websocket-version") {
+                    version = Some(value);
+                } else if name.eq_ignore_ascii_case("sec-websocket-protocol") {
+                    protocol = Some(value);
+                } else if name.eq_ignore_ascii_case("sec-websocket-extensions") {
+                    extensions = Some(value);
+                } else if name.eq_ignore_ascii_case("host") {
+                    host = Some(value);
+                } else if name.eq_ignore_ascii_case("origin") {
+                    origin = Some(value);
+                } else if name.eq_ignore_ascii_case("upgrade") {
+                    if has_token_ignore_case(value, "websocket") {
                         upgrade = true;
                     }
-                    "connection" if value.to_ascii_lowercase().contains("upgrade") => {
-                        connection_upgrade = true;
-                    }
-                    _ => {}
+                } else if name.eq_ignore_ascii_case("connection")
+                    && has_token_ignore_case(value, "upgrade")
+                {
+                    connection_upgrade = true;
                 }
             }
 
@@ -117,6 +124,15 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>
         Ok(httparse::Status::Partial) => Ok(None),
         Err(_) => Err(Error::InvalidHttp("failed to parse HTTP request")),
     }
+}
+
+/// Returns true if the comma-separated header `value` contains `token`
+/// (ASCII case-insensitive, surrounding whitespace ignored).
+#[inline]
+fn has_token_ignore_case(value: &str, token: &str) -> bool {
+    value
+        .split(',')
+        .any(|part| part.trim().eq_ignore_ascii_case(token))
 }
 
 /// Generate the Sec-WebSocket-Accept key
@@ -252,15 +268,16 @@ pub fn parse_response(buf: &[u8]) -> Result<Option<(HandshakeResponse<'_>, usize
             let mut extensions = None;
 
             for header in res.headers.iter() {
-                let name = header.name.to_ascii_lowercase();
+                let name = header.name;
                 let value = std::str::from_utf8(header.value)
                     .map_err(|_| Error::InvalidHttp("invalid header value"))?;
 
-                match name.as_str() {
-                    "sec-websocket-accept" => accept = Some(value),
-                    "sec-websocket-protocol" => protocol = Some(value),
-                    "sec-websocket-extensions" => extensions = Some(value),
-                    _ => {}
+                if name.eq_ignore_ascii_case("sec-websocket-accept") {
+                    accept = Some(value);
+                } else if name.eq_ignore_ascii_case("sec-websocket-protocol") {
+                    protocol = Some(value);
+                } else if name.eq_ignore_ascii_case("sec-websocket-extensions") {
+                    extensions = Some(value);
                 }
             }
 

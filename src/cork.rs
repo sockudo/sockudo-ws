@@ -134,9 +134,39 @@ impl CorkBuffer {
         self.overflow_bytes += len;
     }
 
+    /// Fill `out` with pending data as IoSlices, without allocating.
+    ///
+    /// Returns the number of slices written. At most `out.len()` slices are
+    /// produced; if more chunks are pending, they are picked up by the next
+    /// call after `consume`. Use this in hot paths instead of
+    /// [`CorkBuffer::get_write_slices`].
+    #[inline]
+    pub fn fill_write_slices<'a>(&'a self, out: &mut [IoSlice<'a>]) -> usize {
+        let mut n = 0;
+        if out.is_empty() {
+            return 0;
+        }
+
+        if !self.buffer.is_empty() {
+            out[n] = IoSlice::new(&self.buffer);
+            n += 1;
+        }
+
+        for chunk in &self.overflow {
+            if n == out.len() {
+                break;
+            }
+            out[n] = IoSlice::new(chunk);
+            n += 1;
+        }
+
+        n
+    }
+
     /// Get data for writing as IoSlices (for vectored I/O)
     ///
     /// This is optimized for `writev` syscall to minimize copies.
+    /// Allocates a `Vec`; prefer [`CorkBuffer::fill_write_slices`] in hot paths.
     pub fn get_write_slices(&self) -> Vec<IoSlice<'_>> {
         let mut slices = Vec::with_capacity(1 + self.overflow.len());
 
