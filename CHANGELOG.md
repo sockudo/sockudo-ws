@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.2] - 2026-09-19
+
+### Fixed
+
+- Fragmented text messages were re-validated as UTF-8 over the whole
+  accumulated message on every fragment (O(n·k)); a 4 MiB text message in
+  64-byte fragments (Autobahn 9.3.1) took ~30 s of server CPU. Text is now
+  validated incrementally in one linear pass (`utf8::Utf8Stream`).
+- Invalid UTF-8 is rejected as soon as it arrives, including mid-frame
+  (Autobahn 6.4.x now STRICT). The frame parser unmasks payload bytes as they
+  arrive and exposes them via `FrameParser::pending_payload`.
+- `WebSocketStream` / `CompressedWebSocketStream` re-created the heartbeat
+  timer on every inbound message (v2.0.1 regression). One timer per stream is
+  now re-armed lazily; steady-state cost per message is zero timer operations.
+- The split reader no longer sends an activity message through the writer
+  channel for every inbound data frame; it publishes the inactivity clock via
+  an atomic. `ControlRequest::Activity` was removed (internal).
+- The split writer driver re-registered its heartbeat sleep on every loop
+  iteration; it now keeps a single `Sleep`.
+- Removed per-read `Vec<Message>` allocation and per-message `Message` clone
+  in the streams and split readers; removed the `Vec<IoSlice>` allocation per
+  flush (`CorkBuffer::fill_write_slices`).
+- Read buffer regrowth now reserves `RECV_BUFFER_SIZE` instead of 8 KiB, so
+  reads are no longer capped at ~8 KiB once the buffer has been shared out.
+- Handshake header parsing no longer allocates a `String` per header, and
+  `Upgrade` / `Connection` are matched as comma-separated tokens.
+
+### Added
+
+- `utf8::Utf8Stream`, `frame::PendingPayload`, `FrameParser::pending_payload`,
+  `CorkBuffer::fill_write_slices`.
+- `docs/PERFORMANCE_AUDIT.md` with measurements against tokio-tungstenite and
+  the Autobahn suite.
+
 ## [2.0.1] - 2026-07-25
 
 ### Added
@@ -322,6 +356,7 @@ ASCII fast-path strategy: Check if all bytes in a 16/32-byte chunk have high bit
 - Passes all 517 Autobahn test cases
 - Outperforms uWebSockets in benchmarks
 
+[2.0.2]: https://github.com/sockudo/sockudo-ws/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/sockudo/sockudo-ws/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/sockudo/sockudo-ws/compare/v1.7.5...v2.0.0
 [1.5.1]: https://github.com/RustNSparks/sockudo-ws/compare/v1.5.0...v1.5.1
