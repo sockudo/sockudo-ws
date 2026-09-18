@@ -118,6 +118,12 @@ sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", default-features =
 
 # With TLS (rustls)
 sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", features = ["rustls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = [
+    "aws-lc-rs",
+    "logging",
+    "std",
+    "tls12",
+] }
 
 # With TLS (native-tls)
 sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", features = ["native-tls"] }
@@ -798,6 +804,10 @@ streams inherit the state machine from their runtime WebSocket stream.
 | `rustls-webpki-roots` | TLS via tokio-rustls with webpki-roots |
 | `rustls-native-roots` | TLS via tokio-rustls with native root certificates |
 | `rustls-platform-verifier` | TLS via tokio-rustls with platform verifier |
+
+Rustls features do not select a crypto provider. Applications must enable
+exactly one provider, such as `aws-lc-rs` or `ring`, on their direct `rustls`
+dependency.
 
 ### SHA-1 Implementations
 
