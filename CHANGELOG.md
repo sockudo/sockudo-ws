@@ -7,14 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-09-19
+
 ### Added
 
 - Added custom HTTP headers to Tokio and Compio HTTP/1.1 client handshakes, with validation that
-  prevents malformed fields and conflicts with handshake-managed headers.
+  prevents malformed fields and conflicts with handshake-managed headers
+  (`build_request_with_headers`, `client_handshake_with_headers`, `connect_with_headers`,
+  `connect_raw_with_headers`, `connect_to_url_with_headers`, `connect_async_with_headers`). (#17)
+
+### Changed
+
+- The `rustls-*` features no longer select a crypto provider. `rustls` is depended on with only
+  `std`, and `tokio-rustls` with `logging` and `tls12`. Applications must enable exactly one
+  provider (`ring` or `aws-lc-rs`) on their own direct `rustls` dependency; see the README.
+  Sockudo's tests select Ring through a dev-dependency. (#11)
 
 ### Fixed
 
-- Preserved WebSocket frame bytes read together with Tokio HTTP/1.1 upgrade requests or responses.
+- permessage-deflate with context takeover (`Compression::Dedicated` and the `WindowNKB` modes)
+  silently corrupted or killed the stream after any message that did not shrink when compressed:
+  the raw message stayed in the sender's LZ77 window but never entered the peer's. Such messages are
+  now always sent compressed under context takeover, costing ~6 bytes on incompressible frames. (#14)
+- Preserved WebSocket frame bytes read together with Tokio HTTP/1.1 upgrade requests or responses,
+  including when the stream is split immediately after connecting. (#17)
 
 ## [2.0.2] - 2026-09-19
 
@@ -365,6 +381,7 @@ ASCII fast-path strategy: Check if all bytes in a 16/32-byte chunk have high bit
 - Passes all 517 Autobahn test cases
 - Outperforms uWebSockets in benchmarks
 
+[2.1.0]: https://github.com/sockudo/sockudo-ws/compare/v2.0.2...v2.1.0
 [2.0.2]: https://github.com/sockudo/sockudo-ws/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/sockudo/sockudo-ws/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/sockudo/sockudo-ws/compare/v1.7.5...v2.0.0
