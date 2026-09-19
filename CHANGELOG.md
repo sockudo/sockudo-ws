@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** handshake request/response construction is fallible; migrate callers to handle Result. ExtendedConnectRequest exposes additional metadata and WebSocketUpgradeRejection adds rejection cases. Subprotocol matching is case-sensitive, http is a required dependency, and deprecated Compio handshake entry points have request-aware replacements.
+
 - Outbound frames are coalesced across `send()` calls while inbound messages
   that were already parsed are still queued for the application
   (`Config::write_coalescing`, default on). A read batch of N messages

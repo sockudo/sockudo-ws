@@ -688,7 +688,7 @@ impl WebSocketClient<Http3> {
 
         // Create HTTP/3 connection using h3 crate
         let mut builder = h3::client::builder();
-        builder.enable_extended_connect(true);
+        builder.enable_extended_connect(self.config.http3.enable_connect_protocol);
         let (mut driver, mut send_request) = builder
             .build(h3_quinn::Connection::new(connection))
             .await
