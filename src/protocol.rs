@@ -1092,18 +1092,18 @@ impl CompressedProtocol {
     /// Split the compressed protocol into separate reader and writer halves
     ///
     /// This allows the encoder and decoder to be used independently for
-    /// concurrent read/write operations.
+    /// concurrent read/write operations. The reader retains the parser state and
+    /// frame-size limit configured before splitting.
     pub fn split(
         self,
-        max_frame_size: usize,
         max_message_size: usize,
     ) -> (CompressedReaderProtocol, CompressedWriterProtocol) {
         let role = self.inner.role;
 
-        // Create fresh reader protocol (decoder state)
+        // Keep parser and fragment state already consumed by the unified stream.
         let reader = CompressedReaderProtocol {
             role,
-            parser: FrameParser::new(max_frame_size, role == Role::Server),
+            parser: self.inner.parser,
             fragment_buf: self.inner.fragment_buf,
             fragment_opcode: self.inner.fragment_opcode,
             max_message_size,

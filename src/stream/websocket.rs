@@ -1118,13 +1118,14 @@ where
         let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
         let shared = SplitShared::new(self.state != StreamState::Open);
         let terminal_rx = shared.terminal_tx.subscribe();
-        let reader_protocol = Protocol::new(
+        let writer_protocol = Protocol::new(
             self.protocol.role,
             self.config.max_frame_size,
             self.config.max_message_size,
         );
+        let reader_protocol = self.protocol;
         let sink: SharedSink<WriteHalf<S>, Protocol> = Arc::new(tokio::sync::Mutex::new(
-            SplitSink::new(writer, self.protocol, self.config.write_buffer_size),
+            SplitSink::new(writer, writer_protocol, self.config.write_buffer_size),
         ));
 
         tokio::spawn(split_writer_driver(
@@ -2204,9 +2205,7 @@ where
         let terminal_rx = shared.terminal_tx.subscribe();
 
         // Split the protocol into reader and writer halves
-        let (reader_protocol, writer_protocol) = self
-            .protocol
-            .split(self.config.max_frame_size, self.config.max_message_size);
+        let (reader_protocol, writer_protocol) = self.protocol.split(self.config.max_message_size);
         let sink = Arc::new(tokio::sync::Mutex::new(SplitSink::new(
             writer,
             writer_protocol,
