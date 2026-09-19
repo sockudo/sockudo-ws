@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** DEFLATE encoder windows use DeflateWindowBits (9–15). An unsupported 8-bit encoder limit is rejected instead of panicking or widening it; server negotiation can still receive an 8-bit client stream with a larger decoder window.
+
 - Outbound frames are coalesced across `send()` calls while inbound messages
   that were already parsed are still queued for the application
   (`Config::write_coalescing`, default on). A read batch of N messages
