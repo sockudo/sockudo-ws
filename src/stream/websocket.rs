@@ -1318,6 +1318,10 @@ where
     ///
     /// Cancelling after acquiring the write sink closes the connection: a
     /// partially written frame cannot safely be followed by another frame.
+    /// This also applies when the transport has not accepted any bytes yet,
+    /// or a Close was written but its driver notification is still pending.
+    /// Use a retained send future when racing it with other work; dropping it
+    /// through `timeout` or `select!` abandons the connection at this boundary.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
         self.core.send(msg).await
     }
@@ -2384,6 +2388,8 @@ where
     ///
     /// Cancelling after acquiring the write sink closes the connection, since
     /// the frame or compression state may already have advanced.
+    /// Zero transport progress does not make cancellation recoverable. Retain
+    /// the send future across `select!` if the connection must remain usable.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
         self.core.send(msg).await
     }
