@@ -91,6 +91,9 @@ pub mod deflate;
 #[cfg(feature = "permessage-deflate")]
 pub mod compression;
 
+#[cfg(all(test, any(feature = "tokio-runtime", feature = "compio-runtime")))]
+mod receive_tests;
+
 #[cfg(feature = "axum-integration")]
 pub mod axum_integration;
 

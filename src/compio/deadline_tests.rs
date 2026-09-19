@@ -57,7 +57,7 @@ fn driver(
     let (application, application_rx) = mpsc::channel(SPLIT_APPLICATION_CAPACITY);
     let (cancel, cancel_rx) = mpsc::unbounded();
     let (terminal_tx, _) = mpsc::unbounded();
-    let shared = CompioSplitShared::new(false);
+    let shared = CompioSplitShared::new(false, &config);
     let bytes = Rc::new(RefCell::new(Vec::new()));
     let flush_blocked = Rc::new(Cell::new(false));
     let task = compio_split_writer_driver(

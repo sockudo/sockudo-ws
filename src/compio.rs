@@ -115,33 +115,36 @@ impl CompioTerminalCause {
 }
 
 struct CompioSplitShared {
+    /// Clock epoch shared by the reader and the writer driver
+    clock_epoch: Instant,
+    track_activity: bool,
+    /// Milliseconds since `clock_epoch` of the last inbound data frame (reader -> driver)
+    last_data_ms: Cell<u64>,
     status: Cell<u8>,
     terminal: Cell<Option<CompioTerminalCause>>,
-    /// Clock epoch shared by the reader and the writer driver
-    epoch: Instant,
-    /// Milliseconds since `epoch` of the last inbound data frame (reader -> driver)
-    last_inbound_ms: Cell<u64>,
 }
 
 impl CompioSplitShared {
-    fn new(closed: bool) -> Rc<Self> {
+    fn new(closed: bool, config: &Config) -> Rc<Self> {
         Rc::new(Self {
+            clock_epoch: Instant::now(),
+            track_activity: (config.auto_ping && config.ping_interval != 0)
+                || config.idle_timeout != 0,
+            last_data_ms: Cell::new(0),
             status: Cell::new(if closed { SPLIT_CLOSED } else { SPLIT_OPEN }),
             terminal: Cell::new(closed.then_some(CompioTerminalCause::ConnectionClosed)),
-            epoch: Instant::now(),
-            last_inbound_ms: Cell::new(0),
         })
-    }
-
-    #[inline]
-    fn note_inbound(&self) {
-        let now_ms = self.epoch.elapsed().as_millis() as u64;
-        self.last_inbound_ms
-            .set(self.last_inbound_ms.get().max(now_ms));
     }
 
     fn is_open(&self) -> bool {
         self.status.get() == SPLIT_OPEN
+    }
+
+    fn record_data_activity(&self) {
+        if self.track_activity {
+            self.last_data_ms
+                .set(self.clock_epoch.elapsed().as_millis() as u64);
+        }
     }
 
     fn begin_closing(&self) {
@@ -155,11 +158,18 @@ impl CompioSplitShared {
             self.terminal.set(Some(cause));
         }
     }
+
+    fn error(&self) -> Error {
+        self.terminal
+            .get()
+            .unwrap_or(CompioTerminalCause::ConnectionClosed)
+            .error()
+    }
+
     fn read_terminal(&self) -> Option<Result<Message>> {
-        match self.terminal.get() {
-            Some(CompioTerminalCause::IdleTimeout) => Some(Err(Error::IdleTimeout)),
-            Some(CompioTerminalCause::HeartbeatTimeout) => Some(Err(Error::HeartbeatTimeout)),
-            _ => None,
+        match self.error() {
+            Error::ConnectionClosed => None,
+            error => Some(Err(error)),
         }
     }
 }
@@ -654,13 +664,11 @@ impl AsyncRead for CompioHttp2Stream {
             return BufResult(Ok(0), buf);
         }
 
-        let Some(result) = poll_read_until_cancelled(std::future::poll_fn(|cx| {
-            Pin::new(&mut self.recv).poll_data(cx)
-        }))
-        .await
-        else {
+        let read = std::future::poll_fn(|cx| Pin::new(&mut self.recv).poll_data(cx));
+        let Some(result) = poll_read_until_cancelled(read).await else {
             return BufResult(Err(poll_read_cancelled()), buf);
         };
+
         match result {
             Some(Ok(mut data)) => {
                 let len = data.len();
@@ -1201,6 +1209,7 @@ pub async fn connect_http3_multiplexed(
     mut tls_config: rustls::ClientConfig,
     config: Config,
 ) -> Result<CompioHttp3Connection> {
+    crate::http3::validate_config(&config.http3)?;
     if !config.http3.enable_connect_protocol {
         return Err(Error::ExtendedConnectNotSupported);
     }
@@ -1474,8 +1483,9 @@ pub struct CompioWebSocketStream<S> {
     state: CompioStreamState,
     config: Config,
     pending_messages: Vec<Message>,
+    pending_index: usize,
     // Deliver accepted messages before a later parse failure.
-    pending_parse_error: Option<Error>,
+    pending_terminal_error: Option<Error>,
     clock_epoch: Instant,
     heartbeat: Heartbeat,
     high_water_mark: usize,
@@ -1513,7 +1523,8 @@ where
             state: CompioStreamState::Open,
             config,
             pending_messages: Vec::new(),
-            pending_parse_error: None,
+            pending_index: 0,
+            pending_terminal_error: None,
             clock_epoch,
             heartbeat,
             high_water_mark: DEFAULT_HIGH_WATER_MARK,
@@ -1623,7 +1634,7 @@ where
                 return Some(self.handle_incoming_message(msg).await);
             }
 
-            if let Some(error) = self.pending_parse_error.take() {
+            if let Some(error) = self.pending_terminal_error.take() {
                 self.heartbeat.stop();
                 self.state = CompioStreamState::Closed;
                 return Some(Err(error));
@@ -1633,7 +1644,8 @@ where
                 Ok(true) => continue,
                 Ok(false) => {}
                 Err(error) => {
-                    self.pending_parse_error = Some(error);
+                    self.pending_index = 0;
+                    self.pending_terminal_error = Some(error);
                     continue;
                 }
             }
@@ -1784,24 +1796,34 @@ where
             return Ok(false);
         }
 
-        // Reuse the message Vec across reads; messages are popped from the
-        // back, so keep them in reverse order.
-        debug_assert!(self.pending_messages.is_empty());
-        let result = self
+        if self
             .protocol
-            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages);
-        if matches!(result, Ok(true)) {
+            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)?
+            && self.heartbeat.tracks_activity()
+        {
             self.heartbeat
                 .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
         }
-        // Preserve accepted messages even when a later frame fails.
-        self.pending_messages.reverse();
-        result.map(|_| !self.pending_messages.is_empty())
+        self.pending_index = 0;
+        Ok(!self.pending_messages.is_empty())
     }
 
-    #[inline]
     fn next_pending_message(&mut self) -> Option<Message> {
-        self.pending_messages.pop()
+        if self.pending_index < self.pending_messages.len() {
+            // Move the message out; the consumed slot is never returned again.
+            let msg = std::mem::replace(
+                &mut self.pending_messages[self.pending_index],
+                Message::Close(None),
+            );
+            self.pending_index += 1;
+            if self.pending_index >= self.pending_messages.len() {
+                self.pending_messages.clear();
+                self.pending_index = 0;
+            }
+            Some(msg)
+        } else {
+            None
+        }
     }
 
     async fn handle_incoming_message(&mut self, msg: Message) -> Result<Message> {
@@ -1817,7 +1839,8 @@ where
             Message::Close(reason) => {
                 self.heartbeat.stop();
                 self.pending_messages.clear();
-                self.pending_parse_error = None;
+                self.pending_index = 0;
+                self.pending_terminal_error = None;
                 self.read_buf.clear();
                 if self.state == CompioStreamState::Open {
                     self.protocol.encode_close_response(&mut self.write_buf);
@@ -1858,7 +1881,7 @@ where
         let (application_tx, application_rx) = mpsc::channel(SPLIT_APPLICATION_CAPACITY);
         let (cancel_tx, cancel_rx) = mpsc::unbounded();
         let (terminal_tx, terminal_rx) = mpsc::unbounded();
-        let shared = CompioSplitShared::new(self.state != CompioStreamState::Open);
+        let shared = CompioSplitShared::new(self.state != CompioStreamState::Open, &self.config);
 
         let writer_protocol = Protocol::new(
             self.protocol.role,
@@ -1887,7 +1910,9 @@ where
                 protocol: reader_protocol,
                 read_buf: self.read_buf,
                 pending_messages: self.pending_messages,
-                pending_parse_error: self.pending_parse_error,
+                pending_index: self.pending_index,
+                pending_terminal_error: self.pending_terminal_error,
+                read_budget: SPLIT_CONTROL_CAPACITY,
                 control_tx,
                 terminal_rx,
                 cancel_tx: cancel_tx.clone(),
@@ -1983,8 +2008,10 @@ pub struct CompioSplitReader<R> {
     protocol: Protocol,
     read_buf: BytesMut,
     pending_messages: Vec<Message>,
+    pending_index: usize,
     // Deliver accepted messages before a later parse failure.
-    pending_parse_error: Option<Error>,
+    pending_terminal_error: Option<Error>,
+    read_budget: usize,
     control_tx: mpsc::Sender<ControlRequest>,
     terminal_rx: mpsc::UnboundedReceiver<()>,
     cancel_tx: mpsc::UnboundedSender<()>,
@@ -1993,6 +2020,10 @@ pub struct CompioSplitReader<R> {
 }
 
 /// Write half of a split Compio WebSocket stream.
+///
+/// Pending sends and flushes enforce idle/Pong deadlines while the connection
+/// is open. On expiry, the driver cancels the write and releases its writer
+/// before completing pending requests.
 pub struct CompioSplitWriter<W> {
     application_tx: mpsc::Sender<ApplicationRequest>,
     cancel_tx: mpsc::UnboundedSender<()>,
@@ -2005,76 +2036,85 @@ where
     R: AsyncRead,
 {
     /// Receive the next message, including Ping and Pong control frames.
+    ///
+    /// Buffered ordinary messages bypass the writer's control queue. Cooperative
+    /// yields preserve them; waiting on the control queue is not cancellation-safe.
+    /// Fatal read/parse errors and EOF return without waiting for the driver;
+    /// they also queue cancellation of pending writes.
     pub async fn next(&mut self) -> Option<Result<Message>> {
+        compio_consume_read_budget(&mut self.read_budget).await;
         loop {
-            if self.terminal_reported {
-                return None;
-            }
-            if self.pending_parse_error.is_none() && self.shared.status.get() == SPLIT_CLOSED {
+            if self.pending_terminal_error.is_none() {
                 if self.terminal_reported {
                     return None;
                 }
-                self.terminal_reported = true;
-                return match self.shared.terminal.get() {
-                    Some(CompioTerminalCause::HeartbeatTimeout) => {
-                        Some(Err(Error::HeartbeatTimeout))
-                    }
-                    Some(CompioTerminalCause::IdleTimeout) => Some(Err(Error::IdleTimeout)),
-                    _ => None,
-                };
+                if self.shared.status.get() == SPLIT_CLOSED {
+                    self.terminal_reported = true;
+                    return self.shared.read_terminal();
+                }
             }
 
-            if let Some(msg) = self.pending_messages.pop() {
+            if self.pending_index < self.pending_messages.len() {
+                // Move the message out; the consumed slot is never returned again.
+                let msg = std::mem::replace(
+                    &mut self.pending_messages[self.pending_index],
+                    Message::Close(None),
+                );
+                self.pending_index += 1;
+
+                if self.pending_index >= self.pending_messages.len() {
+                    self.pending_messages.clear();
+                    self.pending_index = 0;
+                }
+
                 let request = match &msg {
                     Message::Ping(data) => ControlRequest::PeerPing(data.clone(), Instant::now()),
                     Message::Pong(data) => ControlRequest::Pong(data.clone(), Instant::now()),
                     Message::Close(_) => {
                         self.shared.begin_closing();
                         self.pending_messages.clear();
-                        self.pending_parse_error = None;
+                        self.pending_index = 0;
+                        self.pending_terminal_error = None;
                         self.read_buf.clear();
                         self.terminal_reported = true;
                         ControlRequest::PeerClose
                     }
                     _ => {
-                        // Data frames only refresh the inactivity clock; no
-                        // channel round trip per message.
-                        self.shared.note_inbound();
+                        // Data frames refresh activity without a channel round trip.
+                        self.shared.record_data_activity();
                         return Some(Ok(msg));
                     }
                 };
                 if self.control_tx.send(request).await.is_err() {
-                    self.shared.terminate(CompioTerminalCause::ConnectionClosed);
-                    continue;
+                    self.terminal_reported = true;
+                    return self.shared.read_terminal();
                 }
                 return Some(Ok(msg));
             }
 
-            if let Some(error) = self.pending_parse_error.take() {
-                self.shared.begin_closing();
-                let _ = self.cancel_tx.unbounded_send(());
+            if let Some(error) = self.pending_terminal_error.take() {
+                compio_cancel_read(&self.shared, &self.cancel_tx);
                 self.terminal_reported = true;
                 return Some(Err(error));
             }
 
             if !self.read_buf.is_empty() {
-                debug_assert!(self.pending_messages.is_empty());
                 match self
                     .protocol
                     .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)
                 {
                     Ok(fragment_activity) => {
                         if fragment_activity {
-                            self.shared.note_inbound();
+                            self.shared.record_data_activity();
                         }
-                        self.pending_messages.reverse();
+                        self.pending_index = 0;
                         if !self.pending_messages.is_empty() {
                             continue;
                         }
                     }
                     Err(error) => {
-                        self.pending_messages.reverse();
-                        self.pending_parse_error = Some(error);
+                        self.pending_index = 0;
+                        self.pending_terminal_error = Some(error);
                         continue;
                     }
                 }
@@ -2091,15 +2131,13 @@ where
             };
             match outcome {
                 CompioReadOutcome::Read(Ok(0)) => {
-                    self.shared.begin_closing();
-                    let _ = self.cancel_tx.unbounded_send(());
+                    compio_cancel_read(&self.shared, &self.cancel_tx);
                     self.terminal_reported = true;
                     return None;
                 }
                 CompioReadOutcome::Read(Ok(_)) => {}
                 CompioReadOutcome::Read(Err(error)) => {
-                    self.shared.begin_closing();
-                    let _ = self.cancel_tx.unbounded_send(());
+                    compio_cancel_read(&self.shared, &self.cancel_tx);
                     self.terminal_reported = true;
                     return Some(Err(error.into()));
                 }
@@ -2121,6 +2159,13 @@ impl<R> Drop for CompioSplitReader<R> {
     fn drop(&mut self) {
         let _ = self.cancel_tx.unbounded_send(());
     }
+}
+
+fn compio_cancel_read(shared: &CompioSplitShared, cancel_tx: &mpsc::UnboundedSender<()>) {
+    // Cancel independently of the control queue so a blocked write cannot hold
+    // up EOF or a fatal read error. The driver releases its writer asynchronously.
+    shared.begin_closing();
+    let _ = cancel_tx.unbounded_send(());
 }
 
 impl<W> CompioSplitWriter<W> {
@@ -2172,10 +2217,7 @@ impl<W> CompioSplitWriter<W> {
     }
 
     fn current_error(&self) -> Error {
-        self.shared
-            .terminal
-            .get()
-            .map_or(Error::ConnectionClosed, CompioTerminalCause::error)
+        self.shared.error()
     }
 }
 
@@ -2183,6 +2225,28 @@ impl<W> Drop for CompioSplitWriter<W> {
     fn drop(&mut self) {
         let _ = self.cancel_tx.unbounded_send(());
     }
+}
+
+// Keep the former control queue's bounded read burst without waiting on the
+// writer. Compio has no task-budget API, so this budget belongs to each reader.
+async fn compio_consume_read_budget(budget: &mut usize) {
+    if *budget == 0 {
+        // Reset before yielding: cancellation must not repeatedly stall the same
+        // message when the caller creates another next() future.
+        *budget = SPLIT_CONTROL_CAPACITY;
+        let mut yielded = false;
+        std::future::poll_fn(|cx| {
+            if yielded {
+                std::task::Poll::Ready(())
+            } else {
+                yielded = true;
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+    }
+    *budget -= 1;
 }
 
 enum CompioDriverWake {
@@ -2216,7 +2280,7 @@ async fn compio_split_writer_driver<W, E>(
         terminal_tx,
         shared,
     } = channels;
-    let epoch = shared.epoch;
+    let epoch = shared.clock_epoch;
     let mut heartbeat = Heartbeat::new(&config, epoch.elapsed().as_millis() as u64);
     let mut closing = CompioClosing {
         deadline: None,
@@ -2232,7 +2296,7 @@ async fn compio_split_writer_driver<W, E>(
             break CompioTerminalCause::ConnectionClosed;
         }
         // Pick up data-frame activity published by the reader without a channel.
-        heartbeat.on_inbound(shared.last_inbound_ms.get(), None);
+        heartbeat.on_inbound(shared.last_data_ms.get(), None);
         let now_ms = epoch.elapsed().as_millis() as u64;
         let heartbeat_deadline = heartbeat.next_deadline();
         let heartbeat_delay = heartbeat_deadline
@@ -2386,7 +2450,7 @@ async fn compio_split_writer_driver<W, E>(
             },
             CompioDriverWake::Timer => {
                 // Recheck activity recorded while the old timer was asleep.
-                heartbeat.on_inbound(shared.last_inbound_ms.get(), None);
+                heartbeat.on_inbound(shared.last_data_ms.get(), None);
                 if closing
                     .deadline
                     .is_some_and(|deadline| deadline <= Instant::now())
@@ -2489,7 +2553,7 @@ async fn await_compio_write(
     let write = write.fuse();
     futures_util::pin_mut!(write);
     loop {
-        heartbeat.on_inbound(shared.last_inbound_ms.get(), None);
+        heartbeat.on_inbound(shared.last_data_ms.get(), None);
         let deadline = heartbeat.next_timeout();
         let close_at = closing.deadline;
         let can_read_control = !matches!(deferred_control, Some(ControlRequest::PeerClose));
@@ -2507,7 +2571,7 @@ async fn await_compio_write(
                 Duration::from_millis(
                     deadline
                         .at()
-                        .saturating_sub(shared.epoch.elapsed().as_millis() as u64),
+                        .saturating_sub(shared.clock_epoch.elapsed().as_millis() as u64),
                 )
             });
             let close_delay = close_at.map(|at| at.saturating_duration_since(Instant::now()));
@@ -2521,7 +2585,7 @@ async fn await_compio_write(
             std::future::poll_fn(|cx| {
                 if close_at.is_some_and(|at| Instant::now() >= at)
                     || deadline.is_some_and(|deadline| {
-                        shared.epoch.elapsed().as_millis() as u64 >= deadline.at()
+                        shared.clock_epoch.elapsed().as_millis() as u64 >= deadline.at()
                     })
                 {
                     std::task::Poll::Ready(())
@@ -2537,11 +2601,11 @@ async fn await_compio_write(
             _ = cancel => return Err(Error::ConnectionClosed),
             request = control => match request {
                 Some(ControlRequest::Pong(payload, received_at)) => {
-                    let received_ms = received_at.saturating_duration_since(shared.epoch).as_millis() as u64;
+                    let received_ms = received_at.saturating_duration_since(shared.clock_epoch).as_millis() as u64;
                     heartbeat.on_inbound(received_ms, Some(&payload));
                 }
                 Some(ControlRequest::PeerPing(payload, received_at)) => {
-                    let received_ms = received_at.saturating_duration_since(shared.epoch).as_millis() as u64;
+                    let received_ms = received_at.saturating_duration_since(shared.clock_epoch).as_millis() as u64;
                     heartbeat.on_inbound(received_ms, None);
                     // RFC 6455 §5.5.3 allows replying only to the latest queued
                     // Ping. Keep this bounded while a matching Pong can pass it.
@@ -2560,8 +2624,8 @@ async fn await_compio_write(
                 if close_at.is_some_and(|at| Instant::now() >= at) {
                     return Err(Error::ConnectionClosed);
                 }
-                heartbeat.on_inbound(shared.last_inbound_ms.get(), None);
-                let now_ms = shared.epoch.elapsed().as_millis() as u64;
+                heartbeat.on_inbound(shared.last_data_ms.get(), None);
+                let now_ms = shared.clock_epoch.elapsed().as_millis() as u64;
                 match heartbeat.next_timeout() {
                     Some(Deadline::Pong(at)) if at <= now_ms => return Err(Error::HeartbeatTimeout),
                     Some(Deadline::Idle(at)) if at <= now_ms => return Err(Error::IdleTimeout),
@@ -2628,8 +2692,9 @@ pub struct CompioCompressedWebSocketStream<S> {
     state: CompioStreamState,
     config: Config,
     pending_messages: Vec<Message>,
+    pending_index: usize,
     // Deliver accepted messages before a later parse failure.
-    pending_parse_error: Option<Error>,
+    pending_terminal_error: Option<Error>,
     clock_epoch: Instant,
     heartbeat: Heartbeat,
     high_water_mark: usize,
@@ -2681,7 +2746,8 @@ where
             state: CompioStreamState::Open,
             config,
             pending_messages: Vec::new(),
-            pending_parse_error: None,
+            pending_index: 0,
+            pending_terminal_error: None,
             clock_epoch,
             heartbeat,
             high_water_mark: DEFAULT_HIGH_WATER_MARK,
@@ -2729,7 +2795,8 @@ where
             state: CompioStreamState::Open,
             config,
             pending_messages: Vec::new(),
-            pending_parse_error: None,
+            pending_index: 0,
+            pending_terminal_error: None,
             clock_epoch,
             heartbeat,
             high_water_mark: DEFAULT_HIGH_WATER_MARK,
@@ -2759,7 +2826,7 @@ where
                 return Some(self.handle_incoming_message(msg).await);
             }
 
-            if let Some(error) = self.pending_parse_error.take() {
+            if let Some(error) = self.pending_terminal_error.take() {
                 self.heartbeat.stop();
                 self.state = CompioStreamState::Closed;
                 return Some(Err(error));
@@ -2769,7 +2836,8 @@ where
                 Ok(true) => continue,
                 Ok(false) => {}
                 Err(error) => {
-                    self.pending_parse_error = Some(error);
+                    self.pending_index = 0;
+                    self.pending_terminal_error = Some(error);
                     continue;
                 }
             }
@@ -2944,24 +3012,34 @@ where
             return Ok(false);
         }
 
-        // Reuse the message Vec across reads; messages are popped from the
-        // back, so keep them in reverse order.
-        debug_assert!(self.pending_messages.is_empty());
-        let result = self
+        if self
             .protocol
-            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages);
-        if matches!(result, Ok(true)) {
+            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)?
+            && self.heartbeat.tracks_activity()
+        {
             self.heartbeat
                 .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
         }
-        // Preserve accepted messages even when a later frame fails.
-        self.pending_messages.reverse();
-        result.map(|_| !self.pending_messages.is_empty())
+        self.pending_index = 0;
+        Ok(!self.pending_messages.is_empty())
     }
 
-    #[inline]
     fn next_pending_message(&mut self) -> Option<Message> {
-        self.pending_messages.pop()
+        if self.pending_index < self.pending_messages.len() {
+            // Move the message out; the consumed slot is never returned again.
+            let msg = std::mem::replace(
+                &mut self.pending_messages[self.pending_index],
+                Message::Close(None),
+            );
+            self.pending_index += 1;
+            if self.pending_index >= self.pending_messages.len() {
+                self.pending_messages.clear();
+                self.pending_index = 0;
+            }
+            Some(msg)
+        } else {
+            None
+        }
     }
 
     async fn handle_incoming_message(&mut self, msg: Message) -> Result<Message> {
@@ -2977,7 +3055,8 @@ where
             Message::Close(reason) => {
                 self.heartbeat.stop();
                 self.pending_messages.clear();
-                self.pending_parse_error = None;
+                self.pending_index = 0;
+                self.pending_terminal_error = None;
                 self.read_buf.clear();
                 if self.state == CompioStreamState::Open {
                     self.protocol.encode_close_response(&mut self.write_buf);
@@ -3004,6 +3083,9 @@ where
     S::WriteHalf: AsyncWrite + 'static,
 {
     /// Split the compressed WebSocket stream into Compio read and write halves.
+    ///
+    /// Blocked writes enforce idle/Pong deadlines with the same cancellation
+    /// and transport lifetime semantics as [`CompioWebSocketStream::split`].
     pub fn split(
         self,
     ) -> (
@@ -3015,7 +3097,7 @@ where
         let (application_tx, application_rx) = mpsc::channel(SPLIT_APPLICATION_CAPACITY);
         let (cancel_tx, cancel_rx) = mpsc::unbounded();
         let (terminal_tx, terminal_rx) = mpsc::unbounded();
-        let shared = CompioSplitShared::new(self.state != CompioStreamState::Open);
+        let shared = CompioSplitShared::new(self.state != CompioStreamState::Open, &self.config);
         let (reader_protocol, writer_protocol) = self
             .protocol
             .split(self.config.max_frame_size, self.config.max_message_size);
@@ -3040,7 +3122,9 @@ where
                 protocol: reader_protocol,
                 read_buf: self.read_buf,
                 pending_messages: self.pending_messages,
-                pending_parse_error: self.pending_parse_error,
+                pending_index: self.pending_index,
+                pending_terminal_error: self.pending_terminal_error,
+                read_budget: SPLIT_CONTROL_CAPACITY,
                 control_tx,
                 terminal_rx,
                 cancel_tx: cancel_tx.clone(),
@@ -3064,8 +3148,10 @@ pub struct CompioCompressedSplitReader<R> {
     protocol: CompressedReaderProtocol,
     read_buf: BytesMut,
     pending_messages: Vec<Message>,
+    pending_index: usize,
     // Deliver accepted messages before a later parse failure.
-    pending_parse_error: Option<Error>,
+    pending_terminal_error: Option<Error>,
+    read_budget: usize,
     control_tx: mpsc::Sender<ControlRequest>,
     terminal_rx: mpsc::UnboundedReceiver<()>,
     cancel_tx: mpsc::UnboundedSender<()>,
@@ -3087,77 +3173,86 @@ impl<R> CompioCompressedSplitReader<R>
 where
     R: AsyncRead,
 {
-    /// Receive the next non-control message.
+    /// Receive the next message, including Ping and Pong control frames.
+    ///
+    /// Buffered ordinary messages bypass the writer's control queue. Cooperative
+    /// yields preserve them; waiting on the control queue is not cancellation-safe.
+    /// Fatal read/parse errors and EOF return without waiting for the driver;
+    /// they also queue cancellation of pending writes.
     pub async fn next(&mut self) -> Option<Result<Message>> {
+        compio_consume_read_budget(&mut self.read_budget).await;
         loop {
-            if self.terminal_reported {
-                return None;
-            }
-            if self.pending_parse_error.is_none() && self.shared.status.get() == SPLIT_CLOSED {
+            if self.pending_terminal_error.is_none() {
                 if self.terminal_reported {
                     return None;
                 }
-                self.terminal_reported = true;
-                return match self.shared.terminal.get() {
-                    Some(CompioTerminalCause::HeartbeatTimeout) => {
-                        Some(Err(Error::HeartbeatTimeout))
-                    }
-                    Some(CompioTerminalCause::IdleTimeout) => Some(Err(Error::IdleTimeout)),
-                    _ => None,
-                };
+                if self.shared.status.get() == SPLIT_CLOSED {
+                    self.terminal_reported = true;
+                    return self.shared.read_terminal();
+                }
             }
 
-            if let Some(msg) = self.pending_messages.pop() {
+            if self.pending_index < self.pending_messages.len() {
+                // Move the message out; the consumed slot is never returned again.
+                let msg = std::mem::replace(
+                    &mut self.pending_messages[self.pending_index],
+                    Message::Close(None),
+                );
+                self.pending_index += 1;
+
+                if self.pending_index >= self.pending_messages.len() {
+                    self.pending_messages.clear();
+                    self.pending_index = 0;
+                }
+
                 let request = match &msg {
                     Message::Ping(data) => ControlRequest::PeerPing(data.clone(), Instant::now()),
                     Message::Pong(data) => ControlRequest::Pong(data.clone(), Instant::now()),
                     Message::Close(_) => {
                         self.shared.begin_closing();
                         self.pending_messages.clear();
-                        self.pending_parse_error = None;
+                        self.pending_index = 0;
+                        self.pending_terminal_error = None;
                         self.read_buf.clear();
                         self.terminal_reported = true;
                         ControlRequest::PeerClose
                     }
                     _ => {
-                        // Data frames only refresh the inactivity clock; no
-                        // channel round trip per message.
-                        self.shared.note_inbound();
+                        // Data frames refresh activity without a channel round trip.
+                        self.shared.record_data_activity();
                         return Some(Ok(msg));
                     }
                 };
                 if self.control_tx.send(request).await.is_err() {
-                    self.shared.terminate(CompioTerminalCause::ConnectionClosed);
-                    continue;
+                    self.terminal_reported = true;
+                    return self.shared.read_terminal();
                 }
                 return Some(Ok(msg));
             }
 
-            if let Some(error) = self.pending_parse_error.take() {
-                self.shared.begin_closing();
-                let _ = self.cancel_tx.unbounded_send(());
+            if let Some(error) = self.pending_terminal_error.take() {
+                compio_cancel_read(&self.shared, &self.cancel_tx);
                 self.terminal_reported = true;
                 return Some(Err(error));
             }
 
             if !self.read_buf.is_empty() {
-                debug_assert!(self.pending_messages.is_empty());
                 match self
                     .protocol
                     .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)
                 {
                     Ok(fragment_activity) => {
                         if fragment_activity {
-                            self.shared.note_inbound();
+                            self.shared.record_data_activity();
                         }
-                        self.pending_messages.reverse();
+                        self.pending_index = 0;
                         if !self.pending_messages.is_empty() {
                             continue;
                         }
                     }
                     Err(error) => {
-                        self.pending_messages.reverse();
-                        self.pending_parse_error = Some(error);
+                        self.pending_index = 0;
+                        self.pending_terminal_error = Some(error);
                         continue;
                     }
                 }
@@ -3174,15 +3269,13 @@ where
             };
             match outcome {
                 CompioReadOutcome::Read(Ok(0)) => {
-                    self.shared.begin_closing();
-                    let _ = self.cancel_tx.unbounded_send(());
+                    compio_cancel_read(&self.shared, &self.cancel_tx);
                     self.terminal_reported = true;
                     return None;
                 }
                 CompioReadOutcome::Read(Ok(_)) => {}
                 CompioReadOutcome::Read(Err(error)) => {
-                    self.shared.begin_closing();
-                    let _ = self.cancel_tx.unbounded_send(());
+                    compio_cancel_read(&self.shared, &self.cancel_tx);
                     self.terminal_reported = true;
                     return Some(Err(error.into()));
                 }
@@ -3257,10 +3350,7 @@ impl<W> CompioCompressedSplitWriter<W> {
     }
 
     fn current_error(&self) -> Error {
-        self.shared
-            .terminal
-            .get()
-            .map_or(Error::ConnectionClosed, CompioTerminalCause::error)
+        self.shared.error()
     }
 }
 
@@ -3270,6 +3360,9 @@ impl<W> Drop for CompioCompressedSplitWriter<W> {
         let _ = self.cancel_tx.unbounded_send(());
     }
 }
+
+#[cfg(test)]
+mod receive_tests;
 
 #[cfg(test)]
 mod tests {
