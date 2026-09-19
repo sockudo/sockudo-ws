@@ -230,6 +230,7 @@ impl DeflateEncoder {
             // We get the spare capacity, compress into it, then only set_len for bytes actually written.
             let out_start = output.len();
             let spare = output.spare_capacity_mut();
+            let spare_len = spare.len();
 
             let status = self
                 .compress
@@ -249,7 +250,9 @@ impl DeflateEncoder {
 
             match status {
                 Status::Ok | Status::BufError => {
-                    if total_in >= data.len() {
+                    // Consuming the input does not finish a flush when output is full.
+                    // Continue with the same flush mode until pending output is drained.
+                    if total_in == data.len() && produced < spare_len {
                         break;
                     }
                 }
