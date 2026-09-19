@@ -403,6 +403,8 @@ impl AsyncWrite for UpgradedStream {
 
 /// Inner stream type that can be either compressed or uncompressed
 #[cfg(feature = "permessage-deflate")]
+// Boxing the compressed stream would add an allocation and indirection to each connection.
+#[allow(clippy::large_enum_variant)]
 enum WebSocketInner {
     Plain(WebSocketStream<UpgradedStream>),
     Compressed(CompressedWebSocketStream<UpgradedStream>),
@@ -843,48 +845,57 @@ mod tests {
         state: &HeartbeatTestState,
     ) {
         let mut stream = connect_raw_websocket(address, path, deflate).await;
-        tokio::time::pause();
-        tokio::task::yield_now().await;
 
-        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        // Keep real time while waiting for TCP: a paused clock can auto-advance
+        // to the Pong deadline before the client even receives the Ping.
         let first_ping = read_server_control_frame(&mut stream, 0x09).await;
         assert_eq!(first_ping.len(), 8);
         send_masked_pong(&mut stream, &first_ping).await;
-        tokio::time::resume();
         state.pong_seen.notified().await;
-        tokio::time::pause();
 
-        tokio::time::advance(std::time::Duration::from_secs(1)).await;
         let second_ping = read_server_control_frame(&mut stream, 0x09).await;
         assert_eq!(second_ping.len(), 8);
         assert_ne!(first_ping, second_ping);
 
-        tokio::time::advance(std::time::Duration::from_secs(1)).await;
         let close = read_server_control_frame(&mut stream, 0x08).await;
         assert_eq!(u16::from_be_bytes([close[0], close[1]]), 4201);
         assert_eq!(&close[2..], b"Pong reply not received in time");
-        tokio::time::resume();
+    }
+
+    #[tokio::test]
+    async fn axum_split_native_heartbeat_plain() {
+        run_axum_split_heartbeat("/plain", false).await;
     }
 
     #[cfg(feature = "permessage-deflate")]
     #[tokio::test]
-    async fn axum_split_native_heartbeat_plain_and_deflate() {
+    async fn axum_split_native_heartbeat_deflate() {
+        run_axum_split_heartbeat("/deflate", true).await;
+    }
+
+    async fn run_axum_split_heartbeat(path: &str, deflate: bool) {
         use axum::{Router, routing::get};
 
         let state = std::sync::Arc::new(HeartbeatTestState::default());
-        let app = Router::new()
-            .route("/plain", get(plain_heartbeat_handler))
-            .route("/deflate", get(compressed_heartbeat_handler))
-            .with_state(state.clone());
+        let app = Router::new().route("/plain", get(plain_heartbeat_handler));
+        #[cfg(feature = "permessage-deflate")]
+        let app = app.route("/deflate", get(compressed_heartbeat_handler));
+        let app = app.with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
 
-        assert_axum_split_heartbeat(address, "/plain", false, &state).await;
-        assert_axum_split_heartbeat(address, "/deflate", true, &state).await;
+        // The exchange takes three one-second heartbeat intervals. Bound failures
+        // so a missing frame or Pong notification cannot hang the test suite.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            assert_axum_split_heartbeat(address, path, deflate, &state),
+        )
+        .await;
         server.abort();
+        result.expect("Axum split heartbeat exchange timed out");
     }
 
     #[cfg(feature = "permessage-deflate")]

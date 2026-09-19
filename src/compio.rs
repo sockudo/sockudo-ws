@@ -609,7 +609,9 @@ pub async fn connect_http2<S>(
     config: Config,
 ) -> Result<CompioWebSocketStream<CompioHttp2Stream>>
 where
-    S: AsyncRead + AsyncWrite + 'static,
+    S: ::compio::io::util::Splittable + 'static,
+    S::ReadHalf: AsyncRead + Unpin,
+    S::WriteHalf: AsyncWrite + Unpin,
 {
     let mut conn = connect_http2_multiplexed(stream, config).await?;
     conn.open_websocket(uri, protocol).await
@@ -622,11 +624,13 @@ pub async fn connect_http2_multiplexed<S>(
     config: Config,
 ) -> Result<CompioHttp2Connection>
 where
-    S: AsyncRead + AsyncWrite + 'static,
+    S: ::compio::io::util::Splittable + 'static,
+    S::ReadHalf: AsyncRead + Unpin,
+    S::WriteHalf: AsyncWrite + Unpin,
 {
     use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-    let stream = ::compio::io::compat::AsyncStream::new(stream).compat();
+    let stream = Box::pin(::compio::io::compat::AsyncStream::new(stream)).compat();
     let mut builder = h2::client::Builder::new();
     builder
         .initial_window_size(config.http2.initial_stream_window_size)
@@ -651,7 +655,9 @@ where
 #[cfg(feature = "http2")]
 pub async fn serve_http2<S, F, Fut>(stream: S, config: Config, handler: F) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + 'static,
+    S: ::compio::io::util::Splittable + 'static,
+    S::ReadHalf: AsyncRead + Unpin,
+    S::WriteHalf: AsyncWrite + Unpin,
     F: Fn(CompioWebSocketStream<CompioHttp2Stream>, ExtendedConnectRequest) -> Fut
         + Clone
         + 'static,
@@ -659,7 +665,7 @@ where
 {
     use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-    let stream = ::compio::io::compat::AsyncStream::new(stream).compat();
+    let stream = Box::pin(::compio::io::compat::AsyncStream::new(stream)).compat();
     let mut builder = h2::server::Builder::new();
     builder
         .initial_window_size(config.http2.initial_stream_window_size)
@@ -2872,6 +2878,8 @@ mod tests {
                 let msg = ws.next().await.unwrap().unwrap();
                 assert!(matches!(&msg, Message::Text(text) if text == "h2"));
                 ws.send(msg).await.unwrap();
+                ws.close(1000, "").await.unwrap();
+                ws.get_mut().shutdown().await.unwrap();
             })
             .await
             .unwrap();
@@ -2907,6 +2915,8 @@ mod tests {
                 assert!(matches!(req.path.as_str(), "/one" | "/two"));
                 let msg = ws.next().await.unwrap().unwrap();
                 ws.send(msg).await.unwrap();
+                ws.close(1000, "").await.unwrap();
+                ws.get_mut().shutdown().await.unwrap();
             })
             .await
             .unwrap();
@@ -2945,11 +2955,12 @@ mod tests {
     async fn compio_http3_echo_round_trip() {
         install_test_crypto_provider();
 
-        let rcgen::CertifiedKey { cert, key_pair } =
+        let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
 
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
-        let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
 
         let server_tls = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -3006,11 +3017,12 @@ mod tests {
     async fn compio_http3_multiplexed_round_trip() {
         install_test_crypto_provider();
 
-        let rcgen::CertifiedKey { cert, key_pair } =
+        let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
 
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
-        let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
 
         let server_tls = rustls::ServerConfig::builder()
             .with_no_client_auth()

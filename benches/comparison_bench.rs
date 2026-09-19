@@ -3,7 +3,8 @@
 //! Run with: cargo bench --bench comparison_bench
 
 use bytes::{Bytes, BytesMut};
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use std::hint::black_box;
 
 // sockudo-ws imports
 use sockudo_ws::frame::{FrameParser as SockudoParser, OpCode, encode_frame};
