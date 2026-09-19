@@ -284,14 +284,15 @@ pub struct Protocol {
     pub(crate) fragment_buf: BytesMut,
     /// Opcode of current fragmented message
     pub(crate) fragment_opcode: Option<OpCode>,
+    // Bytes before this offset form complete, validated UTF-8 code points.
+    fragment_validated_len: usize,
     /// Maximum message size
     pub(crate) max_message_size: usize,
     /// Pending close reason (if we received a close frame)
     pending_close: Option<CloseReason>,
-    /// Incremental UTF-8 validator for the text message currently being received
-    pub(crate) utf8: Utf8Stream,
-    /// Payload bytes of the frame currently being received that were already
-    /// fed to `utf8` before the frame completed
+    /// Validator for the current text frame, including any preceding incomplete code point.
+    utf8: Utf8Stream,
+    /// Payload bytes already validated before the current frame completes.
     partial_checked: usize,
 }
 
@@ -306,6 +307,7 @@ impl Protocol {
             parser: FrameParser::new(max_frame_size, expect_masked),
             fragment_buf: BytesMut::new(),
             fragment_opcode: None,
+            fragment_validated_len: 0,
             max_message_size,
             pending_close: None,
             utf8: Utf8Stream::new(),
@@ -336,8 +338,16 @@ impl Protocol {
             return Ok(());
         }
 
-        if self.partial_checked == 0 && pending.opcode == OpCode::Text {
+        if self.partial_checked == 0 {
             self.utf8.reset();
+            // Raw calls can leave an unvalidated suffix, not just a split code point.
+            if pending.opcode == OpCode::Continuation
+                && !self
+                    .utf8
+                    .push(&self.fragment_buf[self.fragment_validated_len..])
+            {
+                return Err(Error::InvalidUtf8);
+            }
         }
         let ready = pending.ready.min(buf.len());
         if !self.utf8.push(&buf[self.partial_checked..ready]) {
@@ -468,11 +478,10 @@ impl Protocol {
         }
 
         if frame.header.fin {
-            // Complete message in one frame (fast path: one SIMD pass)
+            // Complete message in one frame (fast path)
             let valid = if prevalidated == 0 {
                 validate_utf8(&frame.payload)
             } else {
-                let prevalidated = prevalidated.min(frame.payload.len());
                 self.utf8.push(&frame.payload[prevalidated..]) && self.utf8.finish()
             };
             if !valid {
@@ -547,22 +556,32 @@ impl Protocol {
             return Err(Error::MessageTooLarge);
         }
 
-        // Text fragments are validated incrementally: only the bytes that were
-        // not already checked while the frame was incomplete are scanned, so a
-        // message costs one linear pass no matter how many fragments it has.
+        // Validate only new bytes; re-seed from the complete validated prefix
+        // when raw processing or a split code point preceded this frame.
         if opcode == OpCode::Text {
-            let prevalidated = prevalidated.min(frame.payload.len());
+            if prevalidated == 0 {
+                self.utf8.reset();
+                if !self
+                    .utf8
+                    .push(&self.fragment_buf[self.fragment_validated_len..])
+                {
+                    return Err(Error::InvalidUtf8);
+                }
+            }
             if !self.utf8.push(&frame.payload[prevalidated..]) {
                 return Err(Error::InvalidUtf8);
             }
         }
-
         self.fragment_buf.extend_from_slice(&frame.payload);
 
         if frame.header.fin {
             // Complete the fragmented message
             self.complete_fragment(opcode)
         } else {
+            // Validate partial UTF-8 for text messages, retaining only a code-point tail.
+            if opcode == OpCode::Text {
+                self.fragment_validated_len = self.fragment_buf.len() - self.utf8.pending();
+            }
             Ok(None)
         }
     }
@@ -578,6 +597,7 @@ impl Protocol {
             return Err(Error::MessageTooLarge);
         }
 
+        // Keep the validated prefix unchanged so a later typed call checks these bytes.
         self.fragment_buf.extend_from_slice(&frame.payload);
 
         if frame.header.fin {
@@ -601,20 +621,21 @@ impl Protocol {
             return Err(Error::MessageTooLarge);
         }
 
-        // Validate the first fragment of a text message incrementally
+        self.fragment_opcode = Some(opcode);
+        self.fragment_validated_len = 0;
+        self.fragment_buf.clear();
+        self.fragment_buf.extend_from_slice(&payload);
+
+        // Validate partial UTF-8 for text messages
         if opcode == OpCode::Text {
             if prevalidated == 0 {
                 self.utf8.reset();
             }
-            let prevalidated = prevalidated.min(payload.len());
-            if !self.utf8.push(&payload[prevalidated..]) {
+            if !self.utf8.push(&self.fragment_buf[prevalidated..]) {
                 return Err(Error::InvalidUtf8);
             }
+            self.fragment_validated_len = self.fragment_buf.len() - self.utf8.pending();
         }
-
-        self.fragment_opcode = Some(opcode);
-        self.fragment_buf.clear();
-        self.fragment_buf.extend_from_slice(&payload);
 
         Ok(())
     }
@@ -626,6 +647,7 @@ impl Protocol {
         }
 
         self.fragment_opcode = Some(opcode);
+        self.fragment_validated_len = 0;
         self.fragment_buf.clear();
         self.fragment_buf.extend_from_slice(&payload);
         Ok(())
@@ -638,11 +660,10 @@ impl Protocol {
 
         match opcode {
             OpCode::Text => {
-                // Every fragment was validated as it arrived; only an incomplete
-                // trailing sequence can still make the message invalid.
                 if !self.utf8.finish() {
                     return Err(Error::InvalidUtf8);
                 }
+                // Zero-copy: just return the Bytes directly (already UTF-8 validated)
                 Ok(Some(Message::Text(data)))
             }
             OpCode::Binary => Ok(Some(Message::Binary(data))),
