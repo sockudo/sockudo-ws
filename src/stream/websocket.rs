@@ -1134,6 +1134,15 @@ where
         let (reader, writer) = tokio::io::split(self.inner);
         let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
         let shared = SplitShared::new(self.state != StreamState::Open);
+        // Splitting must not reopen application writes after a known parse error.
+        // A preceding accepted Close still needs its automatic response.
+        if self.pending_parse_error.is_some() {
+            shared.begin_closing();
+            if !self.pending_messages.iter().any(Message::is_close) {
+                shared.terminate(TerminalCause::ConnectionClosed);
+                shared.cancel.cancel();
+            }
+        }
         let terminal_rx = shared.terminal_tx.subscribe();
         let reader_protocol = Protocol::new(
             self.protocol.role,
@@ -1204,7 +1213,9 @@ where
             }
 
             if let Some(msg) = self.pending_messages.pop() {
-                if self.pending_parse_error.is_some() && !self.shared.is_open() {
+                if self.pending_parse_error.is_some()
+                    && self.shared.status.load(Ordering::Acquire) == SPLIT_CLOSED
+                {
                     if msg.is_close() {
                         self.pending_messages.clear();
                         self.pending_parse_error = None;
@@ -2273,6 +2284,15 @@ where
 
         let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
         let shared = SplitShared::new(self.state != StreamState::Open);
+        // Splitting must not reopen application writes after a known parse error.
+        // A preceding accepted Close still needs its automatic response.
+        if self.pending_parse_error.is_some() {
+            shared.begin_closing();
+            if !self.pending_messages.iter().any(Message::is_close) {
+                shared.terminate(TerminalCause::ConnectionClosed);
+                shared.cancel.cancel();
+            }
+        }
         let terminal_rx = shared.terminal_tx.subscribe();
 
         // Split the protocol into reader and writer halves
@@ -2345,7 +2365,9 @@ where
             }
 
             if let Some(msg) = self.pending_messages.pop() {
-                if self.pending_parse_error.is_some() && !self.shared.is_open() {
+                if self.pending_parse_error.is_some()
+                    && self.shared.status.load(Ordering::Acquire) == SPLIT_CLOSED
+                {
                     if msg.is_close() {
                         self.pending_messages.clear();
                         self.pending_parse_error = None;

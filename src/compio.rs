@@ -1407,7 +1407,7 @@ where
 
     /// Send a WebSocket message.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
-        if self.state == CompioStreamState::Closed {
+        if self.state == CompioStreamState::Closed || self.pending_parse_error.is_some() {
             return Err(Error::ConnectionClosed);
         }
 
@@ -1521,6 +1521,15 @@ where
         let (cancel_tx, cancel_rx) = mpsc::unbounded();
         let (terminal_tx, terminal_rx) = mpsc::unbounded();
         let shared = CompioSplitShared::new(self.state != CompioStreamState::Open);
+        // Splitting must not reopen application writes after a known parse error.
+        // A preceding accepted Close still needs its automatic response.
+        if self.pending_parse_error.is_some() {
+            shared.begin_closing();
+            if !self.pending_messages.iter().any(Message::is_close) {
+                shared.terminate(CompioTerminalCause::ConnectionClosed);
+                let _ = cancel_tx.unbounded_send(());
+            }
+        }
 
         let reader_protocol = Protocol::new(
             self.protocol.role,
@@ -1695,7 +1704,7 @@ where
             }
 
             if let Some(msg) = self.pending_messages.pop() {
-                if self.pending_parse_error.is_some() && !self.shared.is_open() {
+                if self.pending_parse_error.is_some() && self.shared.status.get() == SPLIT_CLOSED {
                     if msg.is_close() {
                         self.pending_messages.clear();
                         self.pending_parse_error = None;
@@ -2394,7 +2403,7 @@ where
 
     /// Send a WebSocket message.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
-        if self.state == CompioStreamState::Closed {
+        if self.state == CompioStreamState::Closed || self.pending_parse_error.is_some() {
             return Err(Error::ConnectionClosed);
         }
 
@@ -2534,6 +2543,15 @@ where
         let (cancel_tx, cancel_rx) = mpsc::unbounded();
         let (terminal_tx, terminal_rx) = mpsc::unbounded();
         let shared = CompioSplitShared::new(self.state != CompioStreamState::Open);
+        // Splitting must not reopen application writes after a known parse error.
+        // A preceding accepted Close still needs its automatic response.
+        if self.pending_parse_error.is_some() {
+            shared.begin_closing();
+            if !self.pending_messages.iter().any(Message::is_close) {
+                shared.terminate(CompioTerminalCause::ConnectionClosed);
+                let _ = cancel_tx.unbounded_send(());
+            }
+        }
         let (reader_protocol, writer_protocol) = self
             .protocol
             .split(self.config.max_frame_size, self.config.max_message_size);
@@ -2635,7 +2653,7 @@ where
             }
 
             if let Some(msg) = self.pending_messages.pop() {
-                if self.pending_parse_error.is_some() && !self.shared.is_open() {
+                if self.pending_parse_error.is_some() && self.shared.status.get() == SPLIT_CLOSED {
                     if msg.is_close() {
                         self.pending_messages.clear();
                         self.pending_parse_error = None;
