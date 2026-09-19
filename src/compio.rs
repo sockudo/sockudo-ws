@@ -2476,7 +2476,9 @@ where
         let (cancel_tx, cancel_rx) = mpsc::unbounded();
         let (terminal_tx, terminal_rx) = mpsc::unbounded();
         let shared = CompioSplitShared::new(self.state != CompioStreamState::Open);
-        let (reader_protocol, writer_protocol) = self.protocol.split(self.config.max_message_size);
+        let (reader_protocol, writer_protocol) = self
+            .protocol
+            .split(self.config.max_frame_size, self.config.max_message_size);
 
         ::compio::runtime::spawn(compio_split_writer_driver(
             writer,

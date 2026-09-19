@@ -279,8 +279,24 @@ fn compressed_protocol_split_preserves_partially_unmasked_payload() {
     let mut receiver = CompressedProtocol::server(8192, 8192, config);
     let mut buf = wire.split_to(wire.len() - 3);
     assert!(receiver.process(&mut buf).unwrap().is_empty());
-    let (mut reader, _writer) = receiver.split(8192);
+    let (mut reader, _writer) = receiver.split(8192, 8192);
     buf.extend_from_slice(&wire);
     let messages = reader.process(&mut buf).unwrap();
     assert!(matches!(&messages[..], [Message::Text(t)] if t.as_ref() == payload.as_bytes()));
+}
+
+#[cfg(feature = "permessage-deflate")]
+#[test]
+fn compressed_protocol_split_can_lower_a_pending_frame_limit() {
+    use bytes::BytesMut;
+    use sockudo_ws::{CompressedProtocol, DeflateConfig, Error};
+    let mut receiver = CompressedProtocol::client(8192, 8192, DeflateConfig::default());
+    let mut buf = BytesMut::from(&b"\x82\x05a"[..]);
+    assert!(receiver.process(&mut buf).unwrap().is_empty());
+    let (mut reader, _) = receiver.split(4, 8192);
+    buf.extend_from_slice(b"bcde");
+    assert!(matches!(
+        reader.process(&mut buf),
+        Err(Error::FrameTooLarge)
+    ));
 }
