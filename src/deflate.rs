@@ -4,7 +4,12 @@
 //! which compresses message payloads using the DEFLATE algorithm.
 
 use bytes::{Bytes, BytesMut};
-use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
+use flate2::{Compress, Compression, FlushCompress, Status};
+use libz_rs_sys::{
+    Z_BUF_ERROR, Z_OK, Z_STREAM_END, Z_SYNC_FLUSH, inflate, inflateEnd, inflateInit2_, inflateMark,
+    inflateReset, inflateResetKeep, z_stream, zlibVersion,
+};
+use std::mem::MaybeUninit;
 
 use crate::error::{Error, Result};
 
@@ -293,24 +298,128 @@ impl DeflateEncoder {
     }
 }
 
+struct RawInflateDecoder {
+    // zlib may retain the address passed to inflateInit2_. Keep the stream at
+    // a stable address until inflateEnd(), even though zlib-rs currently does
+    // not use the back-pointer present in the reference zlib implementation.
+    stream: Box<z_stream>,
+}
+
+// SAFETY: RawInflateDecoder is exclusively mutable while inflating, clears its
+// borrowed input/output pointers after every call, and owns the remaining
+// zlib-rs state allocation.
+unsafe impl Send for RawInflateDecoder {}
+// SAFETY: all operations that access the stream require &mut self, and neither
+// the stream nor its internal pointers are exposed through shared references.
+unsafe impl Sync for RawInflateDecoder {}
+
+impl RawInflateDecoder {
+    fn new(window_bits: u8) -> Self {
+        let mut stream = Box::new(z_stream::default());
+        // A negative window size selects raw DEFLATE, as required by RFC 7692.
+        // SAFETY: z_stream::default supplies the allocator callbacks required by
+        // libz-rs-sys, the stream has a stable address, and the remaining
+        // arguments match the initialized stream.
+        let status = unsafe {
+            inflateInit2_(
+                &mut *stream,
+                -i32::from(window_bits),
+                zlibVersion(),
+                std::mem::size_of::<z_stream>() as i32,
+            )
+        };
+        assert_eq!(status, Z_OK, "failed to initialize DEFLATE decoder");
+        Self { stream }
+    }
+
+    fn inflate(
+        &mut self,
+        input: &[u8],
+        output: &mut [MaybeUninit<u8>],
+    ) -> Result<(Status, usize, usize, bool)> {
+        debug_assert!(input.len() <= u32::MAX as usize);
+        debug_assert!(output.len() <= u32::MAX as usize);
+        let input_len = input.len();
+        let output_len = output.len();
+        self.stream.next_in = input.as_ptr();
+        self.stream.avail_in = input_len as u32;
+        self.stream.next_out = output.as_mut_ptr().cast();
+        self.stream.avail_out = output_len as u32;
+
+        // SAFETY: next_in and next_out reference the slices above for their
+        // advertised lengths, and the stream remains initialized until Drop.
+        let status = unsafe { inflate(&mut *self.stream, Z_SYNC_FLUSH) };
+        let consumed = input_len - self.stream.avail_in as usize;
+        let produced = output_len - self.stream.avail_out as usize;
+        let has_pending_output = if self.stream.avail_in == 0 && self.stream.avail_out == 0 {
+            // inflateMark reports -1 in the high half and zero in the low half
+            // only when no literal, match, or stored-block copy is in progress.
+            // SAFETY: the stream remains initialized and its call buffers are
+            // still valid until the pointers are cleared below.
+            let mark = unsafe { inflateMark(&*self.stream) };
+            mark >> 16 != -1 || mark & 0xffff != 0
+        } else {
+            false
+        };
+        self.stream.next_in = std::ptr::null_mut();
+        self.stream.avail_in = 0;
+        self.stream.next_out = std::ptr::null_mut();
+        self.stream.avail_out = 0;
+        let status = match status {
+            Z_OK => Status::Ok,
+            Z_BUF_ERROR => Status::BufError,
+            Z_STREAM_END => Status::StreamEnd,
+            code => {
+                return Err(Error::Compression(format!(
+                    "inflate error: status code {code}"
+                )));
+            }
+        };
+        Ok((status, consumed, produced, has_pending_output))
+    }
+
+    fn reset(&mut self, keep_window: bool) -> Result<()> {
+        // SAFETY: the stream was initialized in new and is exclusively borrowed.
+        let status = unsafe {
+            if keep_window {
+                inflateResetKeep(&mut *self.stream)
+            } else {
+                inflateReset(&mut *self.stream)
+            }
+        };
+        if status == Z_OK {
+            Ok(())
+        } else {
+            Err(Error::Compression(format!(
+                "inflate reset error: status code {status}"
+            )))
+        }
+    }
+}
+
+impl Drop for RawInflateDecoder {
+    fn drop(&mut self) {
+        // SAFETY: the stream was initialized in new and is ended exactly once.
+        let status = unsafe { inflateEnd(&mut *self.stream) };
+        debug_assert_eq!(status, Z_OK);
+    }
+}
+
 /// Deflate decompressor for incoming messages
 pub struct DeflateDecoder {
-    decompress: Decompress,
+    decompress: RawInflateDecoder,
     no_context_takeover: bool,
-    #[allow(dead_code)]
-    window_bits: u8,
 }
 
 impl DeflateDecoder {
     /// Create a new decoder
     pub fn new(window_bits: u8, no_context_takeover: bool) -> Self {
         // Use raw deflate (no zlib header) with the negotiated window_bits
-        let decompress = Decompress::new_with_window_bits(false, window_bits);
+        let decompress = RawInflateDecoder::new(window_bits);
 
         Self {
             decompress,
             no_context_takeover,
-            window_bits,
         }
     }
 
@@ -318,94 +427,133 @@ impl DeflateDecoder {
     pub fn decompress(&mut self, data: &[u8], max_size: usize) -> Result<Bytes> {
         // Reset context if required
         if self.no_context_takeover {
-            self.decompress.reset(false);
+            self.decompress.reset(false)?;
         }
 
-        // Per RFC 7692: Append 0x00 0x00 0xff 0xff before decompressing
-        let mut input = BytesMut::with_capacity(data.len() + 4);
+        let initial_cap = data.len().saturating_mul(4).max(1024).min(max_size);
+        let mut output = Vec::with_capacity(initial_cap);
+
+        // Per RFC 7692: append the sync-flush trailer before decoding.
+        let mut input = BytesMut::with_capacity(data.len().saturating_add(4));
         input.extend_from_slice(data);
         input.extend_from_slice(&DEFLATE_TRAILER);
+        self.inflate_input(&input, data.len(), &mut output, max_size)?;
 
-        // Start with reasonable output buffer (at least 1KB or 4x input)
-        let initial_cap = std::cmp::max(1024, data.len() * 4);
-        let mut output = BytesMut::with_capacity(initial_cap);
-        let mut total_in: usize = 0;
-        let mut iterations = 0u32;
+        Ok(Bytes::from(output))
+    }
+
+    /// Inflate `input`, whose first `payload_len` bytes are message payload.
+    ///
+    /// Returns whether a final DEFLATE block ended exactly at the payload end;
+    /// the synthetic trailer must then not be fed to the fresh stream.
+    fn inflate_input(
+        &mut self,
+        mut input: &[u8],
+        payload_len: usize,
+        output: &mut Vec<u8>,
+        max_size: usize,
+    ) -> Result<bool> {
+        let input_len = input.len();
+        while !input.is_empty() {
+            let (status, consumed) = self.inflate_chunk(input, output, max_size)?;
+            input = &input[consumed..];
+            if status != Status::StreamEnd {
+                if input.is_empty() {
+                    return Ok(false);
+                }
+                return Err(Error::Compression("incomplete deflate payload".into()));
+            }
+            // RFC 7692 permits a final block; with context takeover the next
+            // stream still references the window decoded so far.
+            self.decompress.reset(!self.no_context_takeover)?;
+            if input_len - input.len() == payload_len {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Inflate one input chunk, growing `output` while the decoder fills it.
+    ///
+    /// Returns the last status and the number of input bytes consumed.
+    fn inflate_chunk(
+        &mut self,
+        input: &[u8],
+        output: &mut Vec<u8>,
+        max_size: usize,
+    ) -> Result<(Status, usize)> {
+        let mut total_in = 0usize;
 
         loop {
-            iterations += 1;
-            // Safety check to prevent infinite loops
-            if iterations > 100_000 {
-                return Err(Error::Compression(
-                    "decompression took too many iterations".into(),
-                ));
-            }
+            let input_end = input.len().min(total_in.saturating_add(u32::MAX as usize));
+            let input_chunk = &input[total_in..input_end];
 
-            // Check size limit
-            if output.len() > max_size {
-                return Err(Error::MessageTooLarge);
-            }
-
-            // Ensure we have space in output buffer
-            let available = output.capacity() - output.len();
-            if available == 0 {
-                if output.capacity() >= max_size {
+            if output.len() == max_size {
+                // Input may still contain only the synthetic trailer. Give
+                // inflate one byte of scratch output so it can consume input;
+                // any byte actually produced exceeds the logical limit.
+                let mut probe = [MaybeUninit::uninit()];
+                let (status, consumed, produced, has_pending_output) =
+                    self.decompress.inflate(input_chunk, &mut probe)?;
+                total_in += consumed;
+                if produced != 0 {
                     return Err(Error::MessageTooLarge);
                 }
-                // At least double or add 4KB, whichever is larger
-                let additional = std::cmp::max(output.capacity(), 4096);
-                output.reserve(additional);
+                if status == Status::StreamEnd || consumed == 0 {
+                    return Ok((status, total_in));
+                }
+                if total_in == input.len() && !has_pending_output {
+                    return Ok((status, total_in));
+                }
+                continue;
             }
 
-            let before_out = self.decompress.total_out();
-            let before_in = self.decompress.total_in();
+            if output.len() == output.capacity() {
+                // At least double or add 4KB, whichever is larger, but never
+                // reserve writable output beyond the logical message limit.
+                let additional = output.len().max(4096).min(max_size - output.len());
+                output.reserve_exact(additional);
+            }
 
-            // Get writable slice using spare_capacity_mut to avoid UB with uninitialized memory.
             let out_start = output.len();
+            // Write directly into spare capacity to avoid initializing bytes
+            // that the decompressor will overwrite.
+            let remaining_output = max_size - output.len();
             let spare = output.spare_capacity_mut();
-
-            // SAFETY: We're creating a &mut [u8] from MaybeUninit<u8> slice.
-            // flate2's decompress() will write to this buffer and tell us how many bytes were written.
-            // We only call set_len() for the bytes that were actually initialized by decompress().
-            let spare_slice = unsafe {
-                std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len())
-            };
-
-            let status = self
-                .decompress
-                .decompress(&input[total_in..], spare_slice, FlushDecompress::Sync)
-                .map_err(|e| Error::Compression(format!("inflate error: {}", e)))?;
-
-            let consumed = (self.decompress.total_in() - before_in) as usize;
-            let produced = (self.decompress.total_out() - before_out) as usize;
-
+            let allowed = spare.len().min(remaining_output).min(u32::MAX as usize);
+            let spare = &mut spare[..allowed];
+            let spare_len = spare.len();
+            let (status, consumed, produced, has_pending_output) =
+                self.decompress.inflate(input_chunk, spare)?;
             total_in += consumed;
 
-            // SAFETY: decompress() wrote exactly `produced` bytes to spare_slice.
-            // We're only extending the length by the number of bytes that were initialized.
+            // SAFETY: inflate initialized exactly `produced` bytes.
             unsafe {
                 output.set_len(out_start + produced);
             }
-
-            match status {
-                Status::Ok => {
-                    if total_in >= input.len() {
-                        break;
-                    }
-                }
-                Status::StreamEnd => break,
-                Status::BufError => {
-                    // Need more output space - will be handled at top of loop
-                }
+            if status == Status::StreamEnd || (consumed == 0 && produced == 0) {
+                return Ok((status, total_in));
             }
+            if produced < spare_len {
+                if total_in < input.len() && consumed == input_chunk.len() {
+                    continue;
+                }
+                return Ok((status, total_in));
+            }
+            if total_in == input.len() && !has_pending_output {
+                return Ok((status, total_in));
+            }
+            // A full output buffer can hide pending output even when this input
+            // chunk was consumed completely. Continue with more space, passing
+            // empty input when necessary, until inflate reports no more output.
         }
-
-        Ok(output.freeze())
     }
 
     /// Reset the decompression context (for no_context_takeover)
     pub fn reset(&mut self) {
-        self.decompress.reset(false);
+        self.decompress
+            .reset(false)
+            .expect("failed to reset DEFLATE decoder");
     }
 }
 
