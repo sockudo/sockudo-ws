@@ -270,10 +270,23 @@ where
         let close = Message::Close(Some(CloseReason::new(code, reason)));
         self.protocol
             .encode_message(&close, self.write_buf.buffer_mut())?;
+        self.check_write_limit()?;
         self.state = StreamState::CloseSent;
 
         // Flush the close frame
         self.flush_write_buf().await?;
+        Ok(())
+    }
+
+    fn check_write_limit(&mut self) -> Result<()> {
+        if self.write_buf.pending_bytes() > self.config.max_backpressure {
+            // Rejected frames must not be sent by a later flush or close.
+            self.write_buf.clear();
+            self.state = StreamState::Closed;
+            self.heartbeat.stop();
+            self.heartbeat_sleep = None;
+            return Err(Error::BufferFull);
+        }
         Ok(())
     }
 
@@ -406,6 +419,9 @@ where
 
     /// Write every pending frame to the transport and flush it.
     fn poll_write_out(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if self.state == StreamState::Closed {
+            return Poll::Ready(Err(Error::ConnectionClosed));
+        }
         let this = self.as_mut().get_mut();
 
         // Write all pending data
@@ -727,7 +743,7 @@ where
                         None,
                     );
                     this.write_buf.push_segment(payload.clone());
-                    return Ok(());
+                    return this.check_write_limit();
                 }
                 _ => {}
             }
@@ -736,7 +752,7 @@ where
         // Encode message into write buffer
         this.protocol
             .encode_message(&item, this.write_buf.buffer_mut())?;
-        Ok(())
+        this.check_write_limit()
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
@@ -965,6 +981,7 @@ struct SplitSink<W, E> {
     writer: W,
     encoder: E,
     buf: BytesMut,
+    max_backpressure: usize,
 }
 
 type SharedSink<W, E> = Arc<tokio::sync::Mutex<SplitSink<W, E>>>;
@@ -974,11 +991,12 @@ where
     W: AsyncWrite + Unpin,
     E: SplitEncoder,
 {
-    fn new(writer: W, encoder: E, capacity: usize) -> Self {
+    fn new(writer: W, encoder: E, capacity: usize, max_backpressure: usize) -> Self {
         Self {
             writer,
             encoder,
             buf: BytesMut::with_capacity(capacity),
+            max_backpressure,
         }
     }
 
@@ -1045,9 +1063,14 @@ where
         if is_close {
             self.shared.begin_closing();
         }
+        let limit = sink.max_backpressure;
         let result = sink
             .write_frame(&self.shared.cancel, |encoder, buf| {
-                encoder.encode_message(&msg, buf)
+                encoder.encode_message(&msg, buf)?;
+                if buf.len() > limit {
+                    return Err(Error::BufferFull);
+                }
+                Ok(())
             })
             .await;
         drop(sink);
@@ -1056,6 +1079,7 @@ where
                 return Err(self.current_error());
             }
             self.shared.terminate(TerminalCause::ConnectionClosed);
+            self.shared.cancel.cancel();
             return result;
         }
         if is_close {
@@ -1151,7 +1175,7 @@ where
         );
         let reader_protocol = self.protocol;
         let sink: SharedSink<SplitTransport<S>, Protocol> = Arc::new(tokio::sync::Mutex::new(
-            SplitSink::new(writer, writer_protocol, self.config.write_buffer_size),
+            SplitSink::new(writer, writer_protocol, self.config.write_buffer_size, self.config.max_backpressure),
         ));
 
         tokio::spawn(split_writer_driver(
@@ -1754,9 +1778,22 @@ where
         let close = Message::Close(Some(CloseReason::new(code, reason)));
         self.protocol
             .encode_message(&close, self.write_buf.buffer_mut())?;
+        self.check_write_limit()?;
         self.state = StreamState::CloseSent;
 
         self.flush_write_buf().await?;
+        Ok(())
+    }
+
+    fn check_write_limit(&mut self) -> Result<()> {
+        if self.write_buf.pending_bytes() > self.config.max_backpressure {
+            // Rejected frames must not be sent by a later flush or close.
+            self.write_buf.clear();
+            self.state = StreamState::Closed;
+            self.heartbeat.stop();
+            self.heartbeat_sleep = None;
+            return Err(Error::BufferFull);
+        }
         Ok(())
     }
 
@@ -1883,6 +1920,9 @@ where
 
     /// Write every pending frame to the transport and flush it.
     fn poll_write_out(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if self.state == StreamState::Closed {
+            return Poll::Ready(Err(Error::ConnectionClosed));
+        }
         let this = self.as_mut().get_mut();
 
         while this.write_buf.has_data() {
@@ -2157,7 +2197,7 @@ where
 
         this.protocol
             .encode_message(&item, this.write_buf.buffer_mut())?;
-        Ok(())
+        this.check_write_limit()
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
@@ -2286,6 +2326,7 @@ where
             writer,
             writer_protocol,
             self.config.write_buffer_size,
+            self.config.max_backpressure,
         )));
 
         tokio::spawn(split_writer_driver(
@@ -2710,7 +2751,11 @@ mod tests {
     #[tokio::test]
     async fn blocked_split_writer_is_cancelled_when_reader_drops() {
         let (client_io, _peer_io) = tokio::io::duplex(64);
-        let config = Config::builder().auto_ping(false).idle_timeout(0).build();
+        let config = Config::builder()
+            .auto_ping(false)
+            .idle_timeout(0)
+            .max_backpressure(2 * 1024 * 1024)
+            .build();
         let (reader, mut writer) = WebSocketStream::client(client_io, config).split();
         let send = tokio::spawn(async move {
             writer
