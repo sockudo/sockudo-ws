@@ -609,7 +609,9 @@ pub async fn connect_http2<S>(
     config: Config,
 ) -> Result<CompioWebSocketStream<CompioHttp2Stream>>
 where
-    S: AsyncRead + AsyncWrite + 'static,
+    S: ::compio::io::util::Splittable + 'static,
+    S::ReadHalf: AsyncRead + Unpin,
+    S::WriteHalf: AsyncWrite + Unpin,
 {
     let mut conn = connect_http2_multiplexed(stream, config).await?;
     conn.open_websocket(uri, protocol).await
@@ -622,11 +624,13 @@ pub async fn connect_http2_multiplexed<S>(
     config: Config,
 ) -> Result<CompioHttp2Connection>
 where
-    S: AsyncRead + AsyncWrite + 'static,
+    S: ::compio::io::util::Splittable + 'static,
+    S::ReadHalf: AsyncRead + Unpin,
+    S::WriteHalf: AsyncWrite + Unpin,
 {
     use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-    let stream = ::compio::io::compat::AsyncStream::new(stream).compat();
+    let stream = Box::pin(::compio::io::compat::AsyncStream::new(stream)).compat();
     let mut builder = h2::client::Builder::new();
     builder
         .initial_window_size(config.http2.initial_stream_window_size)
@@ -651,7 +655,9 @@ where
 #[cfg(feature = "http2")]
 pub async fn serve_http2<S, F, Fut>(stream: S, config: Config, handler: F) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + 'static,
+    S: ::compio::io::util::Splittable + 'static,
+    S::ReadHalf: AsyncRead + Unpin,
+    S::WriteHalf: AsyncWrite + Unpin,
     F: Fn(CompioWebSocketStream<CompioHttp2Stream>, ExtendedConnectRequest) -> Fut
         + Clone
         + 'static,
@@ -659,7 +665,7 @@ where
 {
     use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-    let stream = ::compio::io::compat::AsyncStream::new(stream).compat();
+    let stream = Box::pin(::compio::io::compat::AsyncStream::new(stream)).compat();
     let mut builder = h2::server::Builder::new();
     builder
         .initial_window_size(config.http2.initial_stream_window_size)
