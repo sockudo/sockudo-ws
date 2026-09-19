@@ -173,7 +173,7 @@ impl Message {
         match self {
             Message::Text(b) => {
                 // Public Text variants can bypass the parser's UTF-8 validation.
-                std::str::from_utf8(b).ok()
+                simdutf8::basic::from_utf8(b).ok()
             }
             _ => None,
         }
@@ -198,7 +198,7 @@ impl Message {
         match self {
             Message::Text(b) => {
                 // Public Text variants can bypass the parser's UTF-8 validation.
-                String::from_utf8(b.to_vec()).ok()
+                simdutf8::basic::from_utf8(&b).ok().map(str::to_owned)
             }
             _ => None,
         }
