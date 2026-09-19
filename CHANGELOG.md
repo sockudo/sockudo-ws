@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** native io_uring read/write methods now require mutable access to preserve ordering with poll I/O. Direct I/O through get_ref bypasses the bridge and is outside this ordering contract.
+
 - Outbound frames are coalesced across `send()` calls while inbound messages
   that were already parsed are still queued for the application
   (`Config::write_coalescing`, default on). A read batch of N messages
