@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** Compio 0.19 HTTP/2 entry points require Splittable; wrap other transports with compio::io::util::Split::new. Automatic Ping requires pending custom reads to cooperate with cancellation; an existing idle/Pong deadline remains terminal.
+
 - Outbound frames are coalesced across `send()` calls while inbound messages
   that were already parsed are still queued for the application
   (`Config::write_coalescing`, default on). A read batch of N messages

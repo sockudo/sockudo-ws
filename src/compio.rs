@@ -3,6 +3,16 @@
 //! Compio uses completion-based I/O traits, which are intentionally different
 //! from Tokio's poll-based `AsyncRead` and `AsyncWrite`. This module exposes a
 //! native async-method API for Compio streams instead of adapting through Tokio.
+//!
+//! Custom readers used with automatic heartbeats must cooperate with Compio's
+//! cancellation token so a pending read returns its owned buffer before Ping
+//! work resumes. An existing idle or Pong deadline still terminates the
+//! connection; without one, a reader that ignores cancellation can delay Ping
+//! indefinitely. No Pong timeout starts before the Ping is actually sent.
+//!
+//! HTTP/2 entry points require `compio::io::util::Splittable`. Wrap transports
+//! without that implementation (including TLS wrappers) in
+//! `compio::io::util::Split::new(transport)` before passing them to these APIs.
 
 use std::cell::Cell;
 #[cfg(any(feature = "http2", feature = "http3"))]
@@ -240,7 +250,8 @@ where
             }
             // Continuing after Ping requires the owned buffer back. Native Compio
             // reads and our poll-based adapters cooperate with the cancellation.
-            // A hard idle/Pong deadline still bounds a non-cooperative reader.
+            // An existing hard idle/Pong deadline bounds recovery. Without
+            // one, prompt recovery requires the reader to honor cancellation.
             let hard_timer = async {
                 let Some(at) = hard_timeout else {
                     return std::future::pending::<Deadline>().await;
