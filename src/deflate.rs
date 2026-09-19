@@ -119,13 +119,10 @@ impl DeflateConfig {
                 .map_err(|_| Error::HandshakeFailed("unsupported server_max_window_bits value"))?;
         }
         if let Some(Some(bits)) = parsed.client_max_window_bits {
-            config.client_max_window_bits = if bits == MIN_RFC_WINDOW_BITS {
-                DeflateWindowBits::Bits9
-            } else {
-                DeflateWindowBits::try_from(bits).map_err(|_| {
-                    Error::HandshakeFailed("unsupported client_max_window_bits value")
-                })?
-            };
+            // This config can construct a client encoder or a response header;
+            // unlike server negotiation, it cannot silently widen a wire limit.
+            config.client_max_window_bits = DeflateWindowBits::try_from(bits)
+                .map_err(|_| Error::HandshakeFailed("unsupported client_max_window_bits value"))?;
         }
 
         Ok(config)
@@ -852,10 +849,8 @@ mod tests {
     }
 
     #[test]
-    fn config_from_params_uses_a_supported_decoder_for_client_window_eight() {
-        let config = DeflateConfig::from_params(&[("client_max_window_bits", Some("8"))]).unwrap();
-
-        assert_eq!(config.client_max_window_bits, DeflateWindowBits::Bits9);
+    fn config_from_params_rejects_an_unsupported_client_encoder_window() {
+        assert!(DeflateConfig::from_params(&[("client_max_window_bits", Some("8"))]).is_err());
     }
 
     #[test]
