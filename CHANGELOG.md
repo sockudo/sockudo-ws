@@ -23,7 +23,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The default outbound backpressure limit is 1 MiB, independent of inbound message limits. Encoded buffer overflow is terminal; `WouldBlock` remains retryable.
+- Encoded buffer overflow is terminal; `WouldBlock` remains retryable. The default
+  outbound limit is 1 MiB, independently of inbound message limits.
+- Generic deflate configs reject unsupported 8-bit encoder windows; role-aware
+  server negotiation can use a supported decoder for an 8-bit client window.
+- Received HTTP lists ignore empty elements, while outbound metadata remains validated.
+- HTTP/3 applies its configured defaults, including a 1 MiB send window and
+  1350-byte maximum UDP payload.
+- Native io_uring read/write methods require mutable access. Direct I/O through
+  shared transport handles bypasses bridge ordering.
+- Compio HTTP/2 entry points require `Splittable`; other transports can use
+  `compio::io::util::Split::new`. Custom reads must cooperate with cancellation
+  for prompt automatic Ping; only an existing idle/Pong deadline bounds recovery.
 
 - Explicit `send_coalesced()` calls can coalesce outbound frames while parsed
   inbound messages remain queued (`Config::write_coalescing`, default on).
