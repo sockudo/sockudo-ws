@@ -102,3 +102,9 @@ async fn explicit_close_counts_toward_pending_byte_limit() {
     ));
     assert!(ws.is_closed());
 }
+
+#[test]
+fn encoded_buffer_limit_is_a_terminal_error() {
+    assert!(Error::BufferFull.is_fatal());
+    assert!(!Error::BufferFull.is_recoverable());
+}
