@@ -655,3 +655,23 @@ async fn tcp_backpressure_reports_timeout_with_both_handles_retained() {
     assert!(matches!(result, Err(Error::IdleTimeout)));
     assert!(matches!(reader.next().await, Some(Err(Error::IdleTimeout))));
 }
+#[compio::test]
+async fn oversized_unified_frame_fails_before_writing() {
+    let (io, state, _entered) = connection();
+    let mut ws = CompioWebSocketStream::client(io, Config::builder().max_backpressure(16).build());
+    let result = ws.send_binary(Bytes::from_static(&[1; 32])).await;
+    assert!(matches!(result, Err(Error::BufferFull)));
+    assert!(state.bytes.borrow().is_empty());
+    assert!(ws.is_closed());
+}
+
+#[compio::test]
+async fn oversized_split_frame_releases_writer_before_notifying_sender() {
+    let (io, state, _entered) = connection();
+    let (_reader, mut writer) =
+        CompioWebSocketStream::client(io, Config::builder().max_backpressure(16).build()).split();
+    let result = writer.send_binary(Bytes::from_static(&[1; 32])).await;
+    assert!(matches!(result, Err(Error::BufferFull)));
+    assert!(state.bytes.borrow().is_empty());
+    assert!(state.writer_dropped.get());
+}
