@@ -1,9 +1,11 @@
-//! Comparative benchmarks: sockudo-ws vs tokio-websockets
+//! sockudo-ws benchmarks with scalar masking and standard-library UTF-8 references
 //!
 //! Run with: cargo bench --bench comparison_bench
 
+use std::hint::black_box;
+
 use bytes::{Bytes, BytesMut};
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 // sockudo-ws imports
 use sockudo_ws::frame::{FrameParser as SockudoParser, OpCode, encode_frame};
@@ -201,19 +203,28 @@ fn bench_message_protocol(c: &mut Criterion) {
                     protocol::{Message, Protocol, Role},
                 };
 
-                b.iter(|| {
-                    let config = Config::default();
-                    let mut protocol =
-                        Protocol::new(Role::Server, config.max_frame_size, config.max_message_size);
+                let config = Config::default();
+                let mut sender =
+                    Protocol::new(Role::Server, config.max_frame_size, config.max_message_size);
+                // The server's unmasked frame must be received in the client role.
+                let mut receiver =
+                    Protocol::new(Role::Client, config.max_frame_size, config.max_message_size);
+                let mut buf = BytesMut::with_capacity(data.len() + 14);
+                let msg = Message::Binary(Bytes::copy_from_slice(data));
 
-                    let mut buf = BytesMut::new();
-                    let msg = Message::Binary(Bytes::from(data.clone()));
-                    protocol
+                sender.encode_message(&msg, &mut buf).unwrap();
+                let decoded = receiver.process(&mut buf).unwrap();
+                assert_eq!(decoded.len(), 1);
+                assert_eq!(decoded[0].as_bytes(), data);
+                drop(decoded);
+
+                b.iter(|| {
+                    sender
                         .encode_message(black_box(&msg), black_box(&mut buf))
                         .unwrap();
 
                     // Parse it back
-                    let messages = protocol.process(black_box(&mut buf)).unwrap();
+                    let messages = receiver.process(black_box(&mut buf)).unwrap();
                     black_box(messages);
                 });
             },

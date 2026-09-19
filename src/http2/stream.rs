@@ -84,7 +84,8 @@ impl AsyncRead for Http2Stream {
         // First, try to satisfy from the internal buffer
         if !self.recv_buf.is_empty() {
             let to_copy = std::cmp::min(buf.remaining(), self.recv_buf.len());
-            buf.put_slice(&self.recv_buf.split_to(to_copy));
+            buf.put_slice(&self.recv_buf[..to_copy]);
+            self.recv_buf.advance(to_copy);
             return Poll::Ready(Ok(()));
         }
 
@@ -102,7 +103,8 @@ impl AsyncRead for Http2Stream {
 
                 // Copy what we can to the output buffer
                 let to_copy = std::cmp::min(buf.remaining(), data.len());
-                buf.put_slice(&data.split_to(to_copy));
+                buf.put_slice(&data[..to_copy]);
+                data.advance(to_copy);
 
                 // Buffer any remainder
                 if data.has_remaining() {

@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures_core::Stream;
 use futures_sink::Sink;
 use pin_project_lite::pin_project;
@@ -45,7 +45,7 @@ pin_project! {
     /// # Example
     ///
     /// ```ignore
-    /// use futures_util::{SinkExt, StreamExt};
+    /// use futures_util::StreamExt;
     /// use sockudo_ws::WebSocketStream;
     ///
     /// async fn handle(mut ws: WebSocketStream<TcpStream>) {
@@ -76,17 +76,17 @@ pin_project! {
         config: Config,
         // Pending messages from last process() call
         pending_messages: Vec<Message>,
-        // Deadline (ms since clock_epoch) the heartbeat timer is currently armed for
-        heartbeat_armed_ms: u64,
+        // Deliver successfully parsed messages before a later parse failure.
+        pending_parse_error: Option<Error>,
         // A control message is only returned after its automatic response is flushed.
         pending_control_message: Option<Message>,
         pending_terminal_error: Option<Error>,
         flush_on_read: bool,
         close_after_flush: bool,
         ping_flush_pending: bool,
-        clock_epoch: tokio::time::Instant,
+        clock_epoch: super::clock::Instant,
         heartbeat: Heartbeat,
-        heartbeat_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+        heartbeat_sleep: Option<super::clock::HeartbeatTimer>,
         // Backpressure thresholds
         high_water_mark: usize,
         low_water_mark: usize,
@@ -127,7 +127,7 @@ where
             read_buf.extend_from_slice(&leftover);
         }
         let has_unprocessed_read_data = !read_buf.is_empty();
-        let clock_epoch = tokio::time::Instant::now();
+        let clock_epoch = super::clock::Instant::now();
         let heartbeat = Heartbeat::new(&config, 0);
 
         Self {
@@ -139,7 +139,7 @@ where
             state: StreamState::Open,
             config,
             pending_messages: Vec::new(),
-            heartbeat_armed_ms: 0,
+            pending_parse_error: None,
             pending_control_message: None,
             pending_terminal_error: None,
             flush_on_read: false,
@@ -263,17 +263,30 @@ where
 
     /// Send a close frame
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
-        if self.state != StreamState::Open {
+        if self.state != StreamState::Open || self.pending_parse_error.is_some() {
             return Ok(());
         }
 
         let close = Message::Close(Some(CloseReason::new(code, reason)));
         self.protocol
             .encode_message(&close, self.write_buf.buffer_mut())?;
+        self.check_write_limit()?;
         self.state = StreamState::CloseSent;
 
         // Flush the close frame
         self.flush_write_buf().await?;
+        Ok(())
+    }
+
+    fn check_write_limit(&mut self) -> Result<()> {
+        if self.write_buf.pending_bytes() > self.config.max_backpressure {
+            // Rejected frames must not be sent by a later flush or close.
+            self.write_buf.clear();
+            self.state = StreamState::Closed;
+            self.heartbeat.stop();
+            self.heartbeat_sleep = None;
+            return Err(Error::BufferFull);
+        }
         Ok(())
     }
 
@@ -282,13 +295,13 @@ where
         use tokio::io::AsyncWriteExt;
 
         while self.write_buf.has_data() {
-            let mut slices = [IoSlice::new(&[]); MAX_WRITE_SLICES];
-            let count = self.write_buf.fill_write_slices(&mut slices);
-            if count == 0 {
-                break;
-            }
-
-            let n = self.inner.write_vectored(&slices[..count]).await?;
+            let n = if self.write_buf.has_segments() && self.inner.is_write_vectored() {
+                let mut slices = [IoSlice::new(&[]); MAX_WRITE_SLICES];
+                let count = self.write_buf.fill_write_slices(&mut slices);
+                self.inner.write_vectored(&slices[..count]).await?
+            } else {
+                self.inner.write(self.write_buf.chunk()).await?
+            };
             if n == 0 {
                 return Err(Error::ConnectionClosed);
             }
@@ -304,24 +317,23 @@ where
         let this = self.project();
 
         // Ensure we have space in the buffer
+        // Reuse an empty receive window when no delivered payload still owns it.
+        if this.read_buf.is_empty() {
+            let _ = this.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE);
+        }
+
         if this.read_buf.capacity() - this.read_buf.len() < 4096 {
             this.read_buf.reserve(crate::RECV_BUFFER_SIZE);
         }
 
         // Get a slice of uninitialized memory
         let buf_len = this.read_buf.len();
-        let buf_cap = this.read_buf.capacity();
-
-        // SAFETY: We're extending into the spare capacity
-        unsafe {
-            this.read_buf.set_len(buf_cap);
-        }
-
-        let mut read_buf = ReadBuf::new(&mut this.read_buf[buf_len..]);
+        let mut read_buf = ReadBuf::uninit(this.read_buf.spare_capacity_mut());
 
         match this.inner.poll_read(cx, &mut read_buf) {
             Poll::Ready(Ok(())) => {
                 let n = read_buf.filled().len();
+                // SAFETY: ReadBuf guarantees that its filled bytes are initialized.
                 unsafe {
                     this.read_buf.set_len(buf_len + n);
                 }
@@ -331,18 +343,8 @@ where
                     Poll::Ready(Ok(n))
                 }
             }
-            Poll::Ready(Err(e)) => {
-                unsafe {
-                    this.read_buf.set_len(buf_len);
-                }
-                Poll::Ready(Err(e))
-            }
-            Poll::Pending => {
-                unsafe {
-                    this.read_buf.set_len(buf_len);
-                }
-                Poll::Pending
-            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -355,11 +357,16 @@ where
         // Reuse the message Vec across reads (no allocation per read). Messages
         // are popped from the back, so store them in reverse order.
         debug_assert!(self.pending_messages.is_empty());
-        self.protocol
-            .process_into(&mut self.read_buf, &mut self.pending_messages)?;
+        let result = self
+            .protocol
+            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages);
+        if matches!(result, Ok(true)) {
+            self.heartbeat
+                .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
+        }
+        // Preserve accepted messages even when a later frame fails.
         self.pending_messages.reverse();
-
-        Ok(())
+        result.map(|_| ())
     }
 
     /// Get the next pending message (moved out, no clone)
@@ -374,41 +381,53 @@ where
     /// untouched on every message and re-armed lazily when it fires. It is reset
     /// eagerly only when the deadline moves earlier (e.g. a Pong deadline starts).
     fn poll_heartbeat_timer(&mut self, cx: &mut Context<'_>, deadline_ms: u64) -> Poll<()> {
-        let target = self.clock_epoch + Duration::from_millis(deadline_ms);
-        match self.heartbeat_sleep.as_mut() {
-            Some(sleep) => {
-                if deadline_ms < self.heartbeat_armed_ms
-                    || (deadline_ms != self.heartbeat_armed_ms && sleep.is_elapsed())
-                {
-                    sleep.as_mut().reset(target);
-                    self.heartbeat_armed_ms = deadline_ms;
-                }
-            }
-            None => {
-                self.heartbeat_sleep = Some(Box::pin(tokio::time::sleep_until(target)));
-                self.heartbeat_armed_ms = deadline_ms;
-            }
-        }
+        let deadline = self.clock_epoch + Duration::from_millis(deadline_ms);
         self.heartbeat_sleep
-            .as_mut()
-            .expect("heartbeat timer armed above")
-            .as_mut()
-            .poll(cx)
+            .get_or_insert_with(|| super::clock::HeartbeatTimer::new(deadline))
+            .poll(deadline, cx)
+    }
+
+    /// Send a frame, allowing read-batch coalescing when configured.
+    ///
+    /// Unlike `SinkExt::send`, this may return with bytes buffered while inbound
+    /// messages remain queued. Call `SinkExt::flush` before pausing reads or
+    /// waiting for a reply that depends on this frame. Polling for more input
+    /// after the batch, or reaching the high water mark, also flushes the buffer.
+    pub async fn send_coalesced(&mut self, item: Message) -> Result<()> {
+        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_ready(cx)).await?;
+        Pin::new(&mut *self).start_send(item)?;
+        // Batch-scoped corking: while inbound messages that were already
+        // parsed are still queued for the application, keep the encoded
+        // frames buffered. poll_next writes them all in one vectored write
+        // before it next waits on the transport, so a read batch answered
+        // with N coalesced sends costs one syscall instead of N.
+        if self.config.write_coalescing
+            && self.state == StreamState::Open
+            && !self.pending_messages.is_empty()
+            && self.write_buf.pending_bytes() < self.high_water_mark
+        {
+            return Ok(());
+        }
+        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_write_out(cx)).await
     }
 
     /// Write every pending frame to the transport and flush it.
     fn poll_write_out(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if self.state == StreamState::Closed {
+            return Poll::Ready(Err(Error::ConnectionClosed));
+        }
         let this = self.as_mut().get_mut();
 
         // Write all pending data
         while this.write_buf.has_data() {
-            let mut slices = [IoSlice::new(&[]); MAX_WRITE_SLICES];
-            let count = this.write_buf.fill_write_slices(&mut slices);
-            if count == 0 {
-                break;
-            }
-
-            match Pin::new(&mut this.inner).poll_write_vectored(cx, &slices[..count]) {
+            let result = if this.write_buf.has_segments() && this.inner.is_write_vectored() {
+                let mut slices = [IoSlice::new(&[]); MAX_WRITE_SLICES];
+                let count = this.write_buf.fill_write_slices(&mut slices);
+                Pin::new(&mut this.inner).poll_write_vectored(cx, &slices[..count])
+            } else {
+                Pin::new(&mut this.inner).poll_write(cx, this.write_buf.chunk())
+            };
+            match result {
                 Poll::Ready(Ok(0)) => {
                     this.state = StreamState::Closed;
                     this.heartbeat.stop();
@@ -495,9 +514,23 @@ where
                 return Poll::Ready(None);
             }
 
+            if self.pending_messages.is_empty()
+                && let Some(error) = self.as_mut().get_mut().pending_parse_error.take()
+            {
+                let this = self.as_mut().get_mut();
+                this.state = StreamState::Closed;
+                this.heartbeat.stop();
+                this.heartbeat_sleep = None;
+                return Poll::Ready(Some(Err(error)));
+            }
+
             // Heartbeat deadlines are based on inbound inactivity. A Pong
             // deadline starts only after the corresponding Ping is flushed.
-            let deadline = self.heartbeat.next_deadline();
+            let deadline = self
+                .pending_parse_error
+                .is_none()
+                .then(|| self.heartbeat.next_deadline())
+                .flatten();
             if let Some(deadline) = deadline {
                 let now = self.clock_epoch.elapsed().as_millis() as u64;
                 if deadline.at() <= now {
@@ -588,6 +621,9 @@ where
                         let this = self.as_mut().get_mut();
                         this.heartbeat.stop();
                         this.heartbeat_sleep = None;
+                        this.pending_messages.clear();
+                        this.pending_parse_error = None;
+                        this.read_buf.clear();
                         if this.state == StreamState::Open {
                             // Send close response
                             this.protocol
@@ -611,11 +647,8 @@ where
                     Ok(()) if !self.pending_messages.is_empty() => continue,
                     Ok(()) => {}
                     Err(e) => {
-                        let this = self.as_mut().get_mut();
-                        this.state = StreamState::Closed;
-                        this.heartbeat.stop();
-                        this.heartbeat_sleep = None;
-                        return Poll::Ready(Some(Err(e)));
+                        self.as_mut().get_mut().pending_parse_error = Some(e);
+                        continue;
                     }
                 }
             }
@@ -648,11 +681,8 @@ where
                 Poll::Ready(Ok(_n)) => match self.as_mut().get_mut().process_read_buf() {
                     Ok(()) => continue,
                     Err(e) => {
-                        let this = self.as_mut().get_mut();
-                        this.state = StreamState::Closed;
-                        this.heartbeat.stop();
-                        this.heartbeat_sleep = None;
-                        return Poll::Ready(Some(Err(e)));
+                        self.as_mut().get_mut().pending_parse_error = Some(e);
+                        continue;
                     }
                 },
                 Poll::Ready(Err(e)) => {
@@ -678,7 +708,7 @@ where
     type Error = Error;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if self.state != StreamState::Open {
+        if self.state != StreamState::Open || self.pending_parse_error.is_some() {
             return Poll::Ready(Err(Error::ConnectionClosed));
         }
         Poll::Ready(Ok(()))
@@ -687,7 +717,7 @@ where
     fn start_send(self: Pin<&mut Self>, item: Message) -> Result<()> {
         let this = self.get_mut();
 
-        if this.state != StreamState::Open {
+        if this.state != StreamState::Open || this.pending_parse_error.is_some() {
             return Err(Error::ConnectionClosed);
         }
 
@@ -719,7 +749,7 @@ where
                         None,
                     );
                     this.write_buf.push_segment(payload.clone());
-                    return Ok(());
+                    return this.check_write_limit();
                 }
                 _ => {}
             }
@@ -728,25 +758,10 @@ where
         // Encode message into write buffer
         this.protocol
             .encode_message(&item, this.write_buf.buffer_mut())?;
-        Ok(())
+        this.check_write_limit()
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        {
-            let this = self.as_mut().get_mut();
-            // Batch-scoped corking: while inbound messages that were already
-            // parsed are still queued for the application, keep the encoded
-            // frames buffered. poll_next writes them all in one vectored write
-            // before it next waits on the transport, so a read batch answered
-            // with N sends costs one syscall instead of N.
-            if this.config.write_coalescing
-                && this.state == StreamState::Open
-                && !this.pending_messages.is_empty()
-                && this.write_buf.pending_bytes() < this.high_water_mark
-            {
-                return Poll::Ready(Ok(()));
-            }
-        }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.poll_write_out(cx)
     }
 
@@ -868,7 +883,8 @@ impl Default for WebSocketStreamBuilder {
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use super::split_transport::SplitTransport;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -896,9 +912,11 @@ impl TerminalCause {
 
 #[derive(Debug)]
 enum ControlRequest {
-    Ping(Bytes, tokio::time::Instant),
-    Pong(Bytes, tokio::time::Instant),
+    Ping(Bytes, super::clock::Instant),
+    Pong(Bytes, super::clock::Instant),
     PeerClose,
+    /// Start one closing budget before the application writes its Close frame.
+    LocalCloseStarted(tokio::time::Instant),
     /// The application wrote a Close frame through the shared sink.
     LocalCloseSent,
     Eof,
@@ -909,7 +927,7 @@ struct SplitShared {
     terminal_tx: watch::Sender<Option<TerminalCause>>,
     cancel: CancellationToken,
     /// Clock epoch shared by the reader and the writer driver
-    epoch: tokio::time::Instant,
+    epoch: super::clock::Instant,
     /// Milliseconds since `epoch` of the last inbound data frame (reader -> driver)
     last_inbound_ms: AtomicU64,
 }
@@ -921,7 +939,7 @@ impl SplitShared {
             status: AtomicU8::new(if closed { SPLIT_CLOSED } else { SPLIT_OPEN }),
             terminal_tx,
             cancel: CancellationToken::new(),
-            epoch: tokio::time::Instant::now(),
+            epoch: super::clock::Instant::now(),
             last_inbound_ms: AtomicU64::new(0),
         })
     }
@@ -971,6 +989,7 @@ struct SplitSink<W, E> {
     writer: W,
     encoder: E,
     buf: BytesMut,
+    max_backpressure: usize,
 }
 
 type SharedSink<W, E> = Arc<tokio::sync::Mutex<SplitSink<W, E>>>;
@@ -980,11 +999,12 @@ where
     W: AsyncWrite + Unpin,
     E: SplitEncoder,
 {
-    fn new(writer: W, encoder: E, capacity: usize) -> Self {
+    fn new(writer: W, encoder: E, capacity: usize, max_backpressure: usize) -> Self {
         Self {
             writer,
             encoder,
             buf: BytesMut::with_capacity(capacity),
+            max_backpressure,
         }
     }
 
@@ -994,11 +1014,31 @@ where
         cancel: &CancellationToken,
         encode: impl FnOnce(&mut E, &mut BytesMut) -> Result<()>,
     ) -> Result<()> {
+        // A control writer may have waited for a cancelled application send.
+        if cancel.is_cancelled() {
+            return Err(Error::ConnectionClosed);
+        }
         self.buf.clear();
         encode(&mut self.encoder, &mut self.buf)?;
         let result = write_split_bytes(&mut self.writer, &self.buf, cancel).await;
         self.buf.clear();
         result
+    }
+}
+
+/// A cancelled send may have written a frame prefix or advanced compression
+/// state. Close before releasing the sink so no subsequent frame can follow it.
+struct SplitSendGuard<'a> {
+    shared: &'a SplitShared,
+    completed: bool,
+}
+
+impl Drop for SplitSendGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.shared.terminate(TerminalCause::ConnectionClosed);
+            self.shared.cancel.cancel();
+        }
     }
 }
 
@@ -1018,28 +1058,55 @@ where
         if !self.shared.is_open() {
             return Err(self.current_error());
         }
-        let mut sink = self.sink.lock().await;
-        // Re-check under the lock: the control driver may have closed meanwhile.
-        if !self.shared.is_open() {
-            return Err(self.current_error());
-        }
         let is_close = msg.is_close();
         if is_close {
-            self.shared.begin_closing();
+            let permit = self
+                .control_tx
+                .reserve()
+                .await
+                .map_err(|_| self.current_error())?;
+            if !self.shared.begin_closing() {
+                return Err(self.current_error());
+            }
+            // Publish before waiting for the sink: a blocked control write must
+            // use the same closing budget as the application Close behind it.
+            permit.send(ControlRequest::LocalCloseStarted(
+                tokio::time::Instant::now(),
+            ));
         }
+        let mut sink = self.sink.lock().await;
+        // Re-check under the lock: the control driver may have closed meanwhile.
+        let status = self.shared.status.load(Ordering::Acquire);
+        if status != SPLIT_OPEN && !(is_close && status == SPLIT_CLOSING) {
+            return Err(self.current_error());
+        }
+        let mut cancellation = SplitSendGuard {
+            shared: &self.shared,
+            completed: false,
+        };
+        let limit = sink.max_backpressure;
         let result = sink
             .write_frame(&self.shared.cancel, |encoder, buf| {
-                encoder.encode_message(&msg, buf)
+                encoder.encode_message(&msg, buf)?;
+                if buf.len() > limit {
+                    return Err(Error::BufferFull);
+                }
+                Ok(())
             })
             .await;
         drop(sink);
         if result.is_err() {
+            if self.shared.status.load(Ordering::Acquire) == SPLIT_CLOSED {
+                return Err(self.current_error());
+            }
             self.shared.terminate(TerminalCause::ConnectionClosed);
+            self.shared.cancel.cancel();
             return result;
         }
         if is_close {
             let _ = self.control_tx.send(ControlRequest::LocalCloseSent).await;
         }
+        cancellation.completed = true;
         Ok(())
     }
 
@@ -1054,6 +1121,9 @@ where
         };
         drop(sink);
         if result.is_err() {
+            if self.shared.status.load(Ordering::Acquire) == SPLIT_CLOSED {
+                return Err(self.current_error());
+            }
             self.shared.terminate(TerminalCause::ConnectionClosed);
         }
         result
@@ -1087,11 +1157,13 @@ impl SplitEncoder for Protocol {
 
 /// The read half of a split WebSocket stream.
 pub struct SplitReader<S> {
-    reader: ReadHalf<S>,
+    reader: SplitTransport<S>,
     protocol: Protocol,
     read_buf: BytesMut,
     has_unprocessed_read_data: bool,
     pending_messages: Vec<Message>,
+    // Deliver successfully parsed messages before a later parse failure.
+    pending_parse_error: Option<Error>,
     control_tx: mpsc::Sender<ControlRequest>,
     terminal_rx: watch::Receiver<Option<TerminalCause>>,
     shared: Arc<SplitShared>,
@@ -1102,7 +1174,7 @@ pub struct SplitReader<S> {
 ///
 /// The transport writer itself is owned by the per-connection control driver.
 pub struct SplitWriter<S> {
-    core: SplitWriterCore<WriteHalf<S>, Protocol>,
+    core: SplitWriterCore<SplitTransport<S>, Protocol>,
 }
 
 impl<S> WebSocketStream<S>
@@ -1114,20 +1186,36 @@ where
     /// This starts one connection-scoped Tokio task that exclusively owns the
     /// transport writer. Dropping either returned half cancels that task.
     pub fn split(self) -> (SplitReader<S>, SplitWriter<S>) {
-        let (reader, writer) = tokio::io::split(self.inner);
+        let (reader, writer) = SplitTransport::pair(self.inner);
+        let transport = reader.clone();
         let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
         let shared = SplitShared::new(self.state != StreamState::Open);
+        // Splitting must not reopen application writes after a known parse error.
+        // A preceding accepted Close still needs its automatic response.
+        if self.pending_parse_error.is_some() {
+            shared.begin_closing();
+            if !self.pending_messages.iter().any(Message::is_close) {
+                shared.terminate(TerminalCause::ConnectionClosed);
+                shared.cancel.cancel();
+            }
+        }
         let terminal_rx = shared.terminal_tx.subscribe();
-        let reader_protocol = Protocol::new(
+        let writer_protocol = Protocol::new(
             self.protocol.role,
             self.config.max_frame_size,
             self.config.max_message_size,
         );
-        let sink: SharedSink<WriteHalf<S>, Protocol> = Arc::new(tokio::sync::Mutex::new(
-            SplitSink::new(writer, self.protocol, self.config.write_buffer_size),
-        ));
+        let reader_protocol = self.protocol;
+        let sink: SharedSink<SplitTransport<S>, Protocol> =
+            Arc::new(tokio::sync::Mutex::new(SplitSink::new(
+                writer,
+                writer_protocol,
+                self.config.write_buffer_size,
+                self.config.max_backpressure,
+            )));
 
         tokio::spawn(split_writer_driver(
+            transport,
             sink.clone(),
             self.config,
             control_rx,
@@ -1141,6 +1229,7 @@ where
                 read_buf: self.read_buf,
                 has_unprocessed_read_data: self.has_unprocessed_read_data,
                 pending_messages: self.pending_messages,
+                pending_parse_error: self.pending_parse_error,
                 control_tx: control_tx.clone(),
                 terminal_rx,
                 shared: shared.clone(),
@@ -1166,21 +1255,50 @@ where
     /// Ping and Pong frames remain visible after their automatic state-machine
     /// processing. A terminal heartbeat/idle cause is yielded once as an error.
     pub async fn next(&mut self) -> Option<Result<Message>> {
+        tokio::task::consume_budget().await;
         loop {
-            if let Some(result) = self.take_terminal() {
+            if self.terminal_reported {
+                return None;
+            }
+            // Stop the connection without discarding its accepted message prefix.
+            // An accepted Close takes precedence over invalid bytes after it.
+            if self.pending_parse_error.is_some()
+                && self.shared.is_open()
+                && !self.pending_messages.iter().any(Message::is_close)
+            {
+                self.shared.terminate(TerminalCause::ConnectionClosed);
+                self.shared.cancel.cancel();
+            }
+            if self.pending_parse_error.is_none()
+                && let Some(result) = self.take_terminal()
+            {
                 return result;
             }
 
             if let Some(msg) = self.pending_messages.pop() {
+                if self.pending_parse_error.is_some()
+                    && self.shared.status.load(Ordering::Acquire) == SPLIT_CLOSED
+                {
+                    if msg.is_close() {
+                        self.pending_messages.clear();
+                        self.pending_parse_error = None;
+                        self.terminal_reported = true;
+                    }
+                    return Some(Ok(msg));
+                }
                 let request = match &msg {
                     Message::Ping(data) => {
-                        ControlRequest::Ping(data.clone(), tokio::time::Instant::now())
+                        ControlRequest::Ping(data.clone(), super::clock::Instant::now())
                     }
                     Message::Pong(data) => {
-                        ControlRequest::Pong(data.clone(), tokio::time::Instant::now())
+                        ControlRequest::Pong(data.clone(), super::clock::Instant::now())
                     }
                     Message::Close(_) => {
                         self.shared.begin_closing();
+                        self.pending_messages.clear();
+                        self.pending_parse_error = None;
+                        self.read_buf.clear();
+                        self.terminal_reported = true;
                         ControlRequest::PeerClose
                     }
                     _ => {
@@ -1197,24 +1315,39 @@ where
                 return Some(Ok(msg));
             }
 
+            if let Some(error) = self.pending_parse_error.take() {
+                self.shared.terminate(TerminalCause::ConnectionClosed);
+                self.terminal_reported = true;
+                return Some(Err(error));
+            }
+
             if self.has_unprocessed_read_data {
                 self.has_unprocessed_read_data = false;
                 debug_assert!(self.pending_messages.is_empty());
                 match self
                     .protocol
-                    .process_into(&mut self.read_buf, &mut self.pending_messages)
+                    .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)
                 {
-                    Ok(()) => {
+                    Ok(fragment_activity) => {
+                        if fragment_activity {
+                            self.shared.note_inbound();
+                        }
                         self.pending_messages.reverse();
                         if !self.pending_messages.is_empty() {
                             continue;
                         }
                     }
                     Err(error) => {
-                        self.shared.terminate(TerminalCause::ConnectionClosed);
-                        return Some(Err(error));
+                        self.pending_messages.reverse();
+                        self.pending_parse_error = Some(error);
+                        continue;
                     }
                 }
+            }
+
+            // Reuse an empty receive window when no delivered payload still owns it.
+            if self.read_buf.is_empty() {
+                let _ = self.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE);
             }
 
             if self.read_buf.capacity() - self.read_buf.len() < 4096 {
@@ -1236,12 +1369,17 @@ where
                         }
                         Ok(_) => match self
                             .protocol
-                            .process_into(&mut self.read_buf, &mut self.pending_messages)
+                            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)
                         {
-                            Ok(()) => self.pending_messages.reverse(),
+                            Ok(fragment_activity) => {
+                                if fragment_activity {
+                                    self.shared.note_inbound();
+                                }
+                                self.pending_messages.reverse();
+                            },
                             Err(error) => {
-                                self.shared.terminate(TerminalCause::ConnectionClosed);
-                                return Some(Err(error));
+                                self.pending_messages.reverse();
+                                self.pending_parse_error = Some(error);
                             }
                         },
                         Err(error) => {
@@ -1290,6 +1428,13 @@ where
     /// The frame is written directly to the transport; automatic Pong, Ping
     /// and Close frames from the connection driver interleave at frame
     /// boundaries.
+    ///
+    /// Cancelling after acquiring the write sink closes the connection: a
+    /// partially written frame cannot safely be followed by another frame.
+    /// This also applies when the transport has not accepted any bytes yet,
+    /// or a Close was written but its driver notification is still pending.
+    /// Use a retained send future when racing it with other work; dropping it
+    /// through `timeout` or `select!` abandons the connection at this boundary.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
         self.core.send(msg).await
     }
@@ -1327,24 +1472,62 @@ impl<S> Drop for SplitWriter<S> {
     }
 }
 
-async fn split_writer_driver<W, E>(
+/// Control writes stay in the driver's select loop while waiting for the sink
+/// or transport, so neither phase suppresses heartbeats or peer control work.
+enum SplitControlFrame {
+    Ping(Bytes),
+    Pong(Bytes),
+    Close,
+}
+
+async fn write_split_control<W, E>(
     sink: SharedSink<W, E>,
+    frame: SplitControlFrame,
+    cancel: CancellationToken,
+) -> (SplitControlFrame, Result<()>)
+where
+    W: AsyncWrite + Unpin,
+    E: SplitEncoder,
+{
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(Error::ConnectionClosed),
+        result = async {
+            let mut guard = sink.lock().await;
+            guard.write_frame(&cancel, |encoder, buf| {
+                match &frame {
+                    SplitControlFrame::Ping(payload) => encoder.encode_message(&Message::Ping(payload.clone()), buf),
+                    SplitControlFrame::Pong(payload) => { encoder.encode_pong(payload, buf); Ok(()) }
+                    SplitControlFrame::Close => { encoder.encode_close_response(buf); Ok(()) }
+                }
+            }).await
+        } => result,
+    };
+    (frame, result)
+}
+
+async fn split_writer_driver<S, E>(
+    transport: SplitTransport<S>,
+    sink: SharedSink<SplitTransport<S>, E>,
     config: Config,
     mut control_rx: mpsc::Receiver<ControlRequest>,
     shared: Arc<SplitShared>,
 ) where
-    W: AsyncWrite + Unpin,
+    S: AsyncWrite + Unpin,
     E: SplitEncoder,
 {
     let epoch = shared.epoch;
     let mut heartbeat = Heartbeat::new(&config, 0);
     let mut closing_deadline = None;
     let mut local_close_sent = false;
+    let mut peer_close = false;
+    let mut pending_pong = None;
+    let pending_write = None;
+    tokio::pin!(pending_write);
 
     // One timer for the whole connection: re-armed lazily when it fires or when
     // the deadline moves earlier, never per message.
-    let mut heartbeat_sleep = Box::pin(tokio::time::sleep_until(epoch + Duration::from_secs(3600)));
-    let mut heartbeat_armed_ms: Option<u64> = None;
+    let mut heartbeat_sleep = super::clock::HeartbeatTimer::new(epoch + Duration::from_secs(3600));
     let mut last_synced_inbound_ms = 0u64;
 
     loop {
@@ -1355,20 +1538,44 @@ async fn split_writer_driver<W, E>(
             heartbeat.on_inbound(observed_inbound, None);
         }
 
-        let heartbeat_deadline = heartbeat.next_deadline();
-        if let Some(deadline) = heartbeat_deadline {
-            let at = deadline.at();
-            let rearm = match heartbeat_armed_ms {
-                None => true,
-                Some(armed) => at < armed || (at != armed && heartbeat_sleep.is_elapsed()),
-            };
-            if rearm {
-                heartbeat_sleep
-                    .as_mut()
-                    .reset(epoch + Duration::from_millis(at));
-                heartbeat_armed_ms = Some(at);
+        if pending_write.is_none() {
+            if peer_close {
+                if local_close_sent {
+                    // Include acquiring the sink in the shutdown bound, too.
+                    let _ = tokio::time::timeout(
+                        closing_deadline
+                            .unwrap_or_else(tokio::time::Instant::now)
+                            .saturating_duration_since(tokio::time::Instant::now()),
+                        async {
+                            let mut guard = sink.lock().await;
+                            guard.writer.flush().await?;
+                            guard.writer.shutdown().await
+                        },
+                    )
+                    .await;
+                    transport.close_with(|| shared.terminate(TerminalCause::ConnectionClosed));
+                    shared.cancel.cancel();
+                    break;
+                }
+                pending_write.set(Some(write_split_control(
+                    sink.clone(),
+                    SplitControlFrame::Close,
+                    shared.cancel.clone(),
+                )));
+            } else if let Some(payload) = pending_pong.take() {
+                pending_write.set(Some(write_split_control(
+                    sink.clone(),
+                    SplitControlFrame::Pong(payload),
+                    shared.cancel.clone(),
+                )));
             }
         }
+
+        let heartbeat_deadline = if pending_write.is_some() {
+            heartbeat.next_timeout()
+        } else {
+            heartbeat.next_deadline()
+        };
         let close_delay = closing_deadline
             .map(|deadline: tokio::time::Instant| {
                 deadline.saturating_duration_since(tokio::time::Instant::now())
@@ -1378,115 +1585,96 @@ async fn split_writer_driver<W, E>(
         tokio::select! {
             biased;
             _ = shared.cancel.cancelled() => {
-                shared.terminate(TerminalCause::ConnectionClosed);
+                transport.close_with(|| shared.terminate(TerminalCause::ConnectionClosed));
                 break;
             }
             request = control_rx.recv() => {
                 let Some(request) = request else {
-                    shared.terminate(TerminalCause::ConnectionClosed);
+                    transport.close_with(|| shared.terminate(TerminalCause::ConnectionClosed));
+                    shared.cancel.cancel();
                     break;
                 };
                 match request {
                     ControlRequest::Ping(payload, received_at) => {
-                        let received_ms =
-                            received_at.saturating_duration_since(epoch).as_millis() as u64;
-                        heartbeat.on_inbound(received_ms, None);
-                        let written = sink
-                            .lock()
-                            .await
-                            .write_frame(&shared.cancel, |encoder, buf| {
-                                encoder.encode_pong(&payload, buf);
-                                Ok(())
-                            })
-                            .await;
-                        if written.is_err() {
-                            shared.terminate(TerminalCause::ConnectionClosed);
-                            break;
-                        }
+                        heartbeat.on_inbound(received_at.saturating_duration_since(epoch).as_millis() as u64, None);
+                        // RFC 6455 allows replying only to the latest Ping when
+                        // earlier replies are still pending. Keep this bounded.
+                        pending_pong = Some(payload);
                     }
                     ControlRequest::Pong(payload, received_at) => {
-                        let received_ms =
-                            received_at.saturating_duration_since(epoch).as_millis() as u64;
+                        let received_ms = received_at.saturating_duration_since(epoch).as_millis() as u64;
                         heartbeat.on_inbound(received_ms, Some(&payload));
                     }
                     ControlRequest::PeerClose => {
                         heartbeat.stop();
-                        let mut guard = sink.lock().await;
-                        if !local_close_sent {
-                            let _ = guard
-                                .write_frame(&shared.cancel, |encoder, buf| {
-                                    encoder.encode_close_response(buf);
-                                    Ok(())
-                                })
-                                .await;
-                        }
-                        let _ = bounded_shutdown(&mut guard.writer, config.close_timeout).await;
-                        drop(guard);
-                        shared.terminate(TerminalCause::ConnectionClosed);
-                        break;
+                        peer_close = true;
+                        closing_deadline.get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(config.close_timeout.into()));
+                    }
+                    ControlRequest::LocalCloseStarted(started) => {
+                        heartbeat.stop();
+                        closing_deadline.get_or_insert(started + Duration::from_secs(config.close_timeout.into()));
                     }
                     ControlRequest::LocalCloseSent => {
                         heartbeat.stop();
                         local_close_sent = true;
-                        closing_deadline = Some(
-                            tokio::time::Instant::now()
-                                + Duration::from_secs(config.close_timeout.into()),
-                        );
+                        closing_deadline.get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(config.close_timeout.into()));
                     }
                     ControlRequest::Eof => {
                         heartbeat.stop();
-                        shared.terminate(TerminalCause::ConnectionClosed);
+                        transport.close_with(|| shared.terminate(TerminalCause::ConnectionClosed));
+                        shared.cancel.cancel();
                         break;
                     }
                 }
             }
             _ = tokio::time::sleep(close_delay), if closing_deadline.is_some() => {
-                let _ = bounded_shutdown(&mut sink.lock().await.writer, config.close_timeout).await;
-                shared.terminate(TerminalCause::ConnectionClosed);
+                // A writer may own a partial frame. Do not wait for its lock or
+                // append a Close frame to that unfinished payload.
+                transport.close_with(|| shared.terminate(TerminalCause::ConnectionClosed));
+                shared.cancel.cancel();
                 break;
             }
-            _ = &mut heartbeat_sleep, if heartbeat_deadline.is_some() && shared.is_open() => {
+            _ = std::future::poll_fn(|cx| match heartbeat_deadline {
+                Some(deadline) => heartbeat_sleep.poll(epoch + Duration::from_millis(deadline.at()), cx),
+                None => Poll::Pending,
+            }), if heartbeat_deadline.is_some() && shared.is_open() => {
+                // Activity can arrive while this select is parked on the timer.
+                let observed_inbound = shared.last_inbound_ms.load(Ordering::Relaxed);
+                if observed_inbound > last_synced_inbound_ms {
+                    last_synced_inbound_ms = observed_inbound;
+                    heartbeat.on_inbound(observed_inbound, None);
+                }
                 let now_ms = epoch.elapsed().as_millis() as u64;
-                match heartbeat.next_deadline() {
-                    Some(Deadline::Ping(at)) if at <= now_ms => {
+                match if pending_write.is_some() { heartbeat.next_timeout() } else { heartbeat.next_deadline() } {
+                    Some(Deadline::Ping(at)) if at <= now_ms && pending_write.is_none() => {
                         if let Some(payload) = heartbeat.ping_due(now_ms) {
-                            let written = sink
-                                .lock()
-                                .await
-                                .write_frame(&shared.cancel, |encoder, buf| {
-                                    encoder.encode_message(&Message::Ping(payload), buf)
-                                })
-                                .await;
-                            if written.is_err() {
-                                shared.terminate(TerminalCause::ConnectionClosed);
-                                break;
-                            }
-                            heartbeat.ping_flushed(epoch.elapsed().as_millis() as u64);
+                            pending_write.set(Some(write_split_control(sink.clone(), SplitControlFrame::Ping(payload), shared.cancel.clone())));
                         }
                     }
                     Some(Deadline::Pong(at)) if at <= now_ms => {
-                        timeout_close(
-                            &sink,
-                            &config,
-                            config.pong_timeout_close_code,
-                            &config.pong_timeout_close_reason,
-                            &shared.cancel,
-                        ).await;
-                        shared.terminate(TerminalCause::HeartbeatTimeout);
+                        timeout_close(&transport, &sink, &config, config.pong_timeout_close_code, &config.pong_timeout_close_reason, &shared, TerminalCause::HeartbeatTimeout).await;
                         break;
                     }
                     Some(Deadline::Idle(at)) if at <= now_ms => {
-                        timeout_close(
-                            &sink,
-                            &config,
-                            CloseReason::GOING_AWAY,
-                            "Connection idle timeout",
-                            &shared.cancel,
-                        ).await;
-                        shared.terminate(TerminalCause::IdleTimeout);
+                        timeout_close(&transport, &sink, &config, CloseReason::GOING_AWAY, "Connection idle timeout", &shared, TerminalCause::IdleTimeout).await;
                         break;
                     }
                     _ => {}
+                }
+            }
+            (frame, result) = async { pending_write.as_mut().as_pin_mut().unwrap().await }, if pending_write.is_some() => {
+                pending_write.set(None);
+                if result.is_err() {
+                    transport.close_with(|| shared.terminate(TerminalCause::ConnectionClosed));
+                    shared.cancel.cancel();
+                    break;
+                }
+                match frame {
+                    SplitControlFrame::Ping(_) => {
+                        heartbeat.ping_flushed(epoch.elapsed().as_millis() as u64);
+                    },
+                    SplitControlFrame::Close => local_close_sent = true,
+                    SplitControlFrame::Pong(_) => {}
                 }
             }
         }
@@ -1511,37 +1699,36 @@ where
     }
 }
 
-async fn bounded_shutdown<W>(writer: &mut W, seconds: u32) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    tokio::time::timeout(Duration::from_secs(seconds.into()), async {
-        writer.flush().await?;
-        writer.shutdown().await
-    })
-    .await
-    .map_err(|_| Error::ConnectionClosed)?
-    .map_err(Into::into)
-}
-
-async fn timeout_close<W, E>(
-    sink: &SharedSink<W, E>,
+async fn timeout_close<S, E>(
+    transport: &SplitTransport<S>,
+    sink: &SharedSink<SplitTransport<S>, E>,
     config: &Config,
     code: u16,
     reason: &str,
-    cancel: &CancellationToken,
+    shared: &SplitShared,
+    cause: TerminalCause,
 ) where
-    W: AsyncWrite + Unpin,
+    S: AsyncWrite + Unpin,
     E: SplitEncoder,
 {
-    let mut guard = sink.lock().await;
-    let close = Message::Close(Some(CloseReason::new(code, bounded_close_reason(reason))));
-    let _ = tokio::time::timeout(
-        Duration::from_secs(config.close_timeout.into()),
-        guard.write_frame(cancel, |encoder, buf| encoder.encode_message(&close, buf)),
-    )
-    .await;
-    let _ = bounded_shutdown(&mut guard.writer, config.close_timeout).await;
+    if let Ok(mut guard) = sink.try_lock() {
+        let close = Message::Close(Some(CloseReason::new(code, bounded_close_reason(reason))));
+        let _ = tokio::time::timeout(Duration::from_secs(config.close_timeout.into()), async {
+            guard
+                .write_frame(&shared.cancel, |encoder, buf| {
+                    encoder.encode_message(&close, buf)
+                })
+                .await?;
+            guard.writer.flush().await?;
+            guard.writer.shutdown().await?;
+            Ok::<(), Error>(())
+        })
+        .await;
+    }
+    // Release the transport and publish its typed cause before waking either handle.
+    transport.close_with(|| shared.terminate(cause));
+    // A held sink may contain a partial frame. Cancel it without appending Close.
+    shared.cancel.cancel();
 }
 
 // ============================================================================
@@ -1559,20 +1746,21 @@ pin_project! {
         inner: S,
         protocol: crate::protocol::CompressedProtocol,
         read_buf: BytesMut,
+        has_unprocessed_read_data: bool,
         write_buf: CorkBuffer,
         state: StreamState,
         config: Config,
         pending_messages: Vec<Message>,
-        // Deadline (ms since clock_epoch) the heartbeat timer is currently armed for
-        heartbeat_armed_ms: u64,
+        // Deliver successfully parsed messages before a later parse failure.
+        pending_parse_error: Option<Error>,
         pending_control_message: Option<Message>,
         pending_terminal_error: Option<Error>,
         flush_on_read: bool,
         close_after_flush: bool,
         ping_flush_pending: bool,
-        clock_epoch: tokio::time::Instant,
+        clock_epoch: super::clock::Instant,
         heartbeat: Heartbeat,
-        heartbeat_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+        heartbeat_sleep: Option<super::clock::HeartbeatTimer>,
         high_water_mark: usize,
         low_water_mark: usize,
     }
@@ -1585,23 +1773,47 @@ where
 {
     /// Create a new compressed WebSocket stream for server role
     pub fn server(inner: S, config: Config, deflate_config: crate::deflate::DeflateConfig) -> Self {
-        let protocol = crate::protocol::CompressedProtocol::server(
-            config.max_frame_size,
-            config.max_message_size,
-            deflate_config,
-        );
+        Self::server_with_leftover(inner, config, deflate_config, None)
+    }
 
-        let clock_epoch = tokio::time::Instant::now();
+    /// Create a server-side compressed stream with post-handshake leftover bytes.
+    pub fn server_with_leftover(
+        inner: S,
+        config: Config,
+        deflate_config: crate::deflate::DeflateConfig,
+        leftover: Option<Bytes>,
+    ) -> Self {
+        let protocol = if config.compression.is_shared() {
+            crate::protocol::CompressedProtocol::server_with_shared_compression(
+                config.max_frame_size,
+                config.max_message_size,
+                deflate_config,
+            )
+        } else {
+            crate::protocol::CompressedProtocol::server(
+                config.max_frame_size,
+                config.max_message_size,
+                deflate_config,
+            )
+        };
+
+        let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);
+        if let Some(leftover) = leftover {
+            read_buf.extend_from_slice(&leftover);
+        }
+        let has_unprocessed_read_data = !read_buf.is_empty();
+        let clock_epoch = super::clock::Instant::now();
         let heartbeat = Heartbeat::new(&config, 0);
         Self {
             inner,
             protocol,
-            read_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
+            read_buf,
+            has_unprocessed_read_data,
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
             state: StreamState::Open,
             config,
             pending_messages: Vec::new(),
-            heartbeat_armed_ms: 0,
+            pending_parse_error: None,
             pending_control_message: None,
             pending_terminal_error: None,
             flush_on_read: false,
@@ -1617,23 +1829,47 @@ where
 
     /// Create a new compressed WebSocket stream for client role
     pub fn client(inner: S, config: Config, deflate_config: crate::deflate::DeflateConfig) -> Self {
-        let protocol = crate::protocol::CompressedProtocol::client(
-            config.max_frame_size,
-            config.max_message_size,
-            deflate_config,
-        );
+        Self::client_with_leftover(inner, config, deflate_config, None)
+    }
 
-        let clock_epoch = tokio::time::Instant::now();
+    /// Create a client-side compressed stream with post-handshake leftover bytes.
+    pub fn client_with_leftover(
+        inner: S,
+        config: Config,
+        deflate_config: crate::deflate::DeflateConfig,
+        leftover: Option<Bytes>,
+    ) -> Self {
+        let protocol = if config.compression.is_shared() {
+            crate::protocol::CompressedProtocol::client_with_shared_compression(
+                config.max_frame_size,
+                config.max_message_size,
+                deflate_config,
+            )
+        } else {
+            crate::protocol::CompressedProtocol::client(
+                config.max_frame_size,
+                config.max_message_size,
+                deflate_config,
+            )
+        };
+
+        let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);
+        if let Some(leftover) = leftover {
+            read_buf.extend_from_slice(&leftover);
+        }
+        let has_unprocessed_read_data = !read_buf.is_empty();
+        let clock_epoch = super::clock::Instant::now();
         let heartbeat = Heartbeat::new(&config, 0);
         Self {
             inner,
             protocol,
-            read_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
+            read_buf,
+            has_unprocessed_read_data,
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
             state: StreamState::Open,
             config,
             pending_messages: Vec::new(),
-            heartbeat_armed_ms: 0,
+            pending_parse_error: None,
             pending_control_message: None,
             pending_terminal_error: None,
             flush_on_read: false,
@@ -1667,16 +1903,29 @@ where
 
     /// Send a close frame
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
-        if self.state != StreamState::Open {
+        if self.state != StreamState::Open || self.pending_parse_error.is_some() {
             return Ok(());
         }
 
         let close = Message::Close(Some(CloseReason::new(code, reason)));
         self.protocol
             .encode_message(&close, self.write_buf.buffer_mut())?;
+        self.check_write_limit()?;
         self.state = StreamState::CloseSent;
 
         self.flush_write_buf().await?;
+        Ok(())
+    }
+
+    fn check_write_limit(&mut self) -> Result<()> {
+        if self.write_buf.pending_bytes() > self.config.max_backpressure {
+            // Rejected frames must not be sent by a later flush or close.
+            self.write_buf.clear();
+            self.state = StreamState::Closed;
+            self.heartbeat.stop();
+            self.heartbeat_sleep = None;
+            return Err(Error::BufferFull);
+        }
         Ok(())
     }
 
@@ -1685,13 +1934,13 @@ where
         use tokio::io::AsyncWriteExt;
 
         while self.write_buf.has_data() {
-            let mut slices = [IoSlice::new(&[]); MAX_WRITE_SLICES];
-            let count = self.write_buf.fill_write_slices(&mut slices);
-            if count == 0 {
-                break;
-            }
-
-            let n = self.inner.write_vectored(&slices[..count]).await?;
+            let n = if self.write_buf.has_segments() && self.inner.is_write_vectored() {
+                let mut slices = [IoSlice::new(&[]); MAX_WRITE_SLICES];
+                let count = self.write_buf.fill_write_slices(&mut slices);
+                self.inner.write_vectored(&slices[..count]).await?
+            } else {
+                self.inner.write(self.write_buf.chunk()).await?
+            };
             if n == 0 {
                 return Err(Error::ConnectionClosed);
             }
@@ -1706,22 +1955,22 @@ where
     fn poll_read_more(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         let this = self.project();
 
+        // Reuse an empty receive window when no delivered payload still owns it.
+        if this.read_buf.is_empty() {
+            let _ = this.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE);
+        }
+
         if this.read_buf.capacity() - this.read_buf.len() < 4096 {
             this.read_buf.reserve(crate::RECV_BUFFER_SIZE);
         }
 
         let buf_len = this.read_buf.len();
-        let buf_cap = this.read_buf.capacity();
-
-        unsafe {
-            this.read_buf.set_len(buf_cap);
-        }
-
-        let mut read_buf = ReadBuf::new(&mut this.read_buf[buf_len..]);
+        let mut read_buf = ReadBuf::uninit(this.read_buf.spare_capacity_mut());
 
         match this.inner.poll_read(cx, &mut read_buf) {
             Poll::Ready(Ok(())) => {
                 let n = read_buf.filled().len();
+                // SAFETY: ReadBuf guarantees that its filled bytes are initialized.
                 unsafe {
                     this.read_buf.set_len(buf_len + n);
                 }
@@ -1731,18 +1980,8 @@ where
                     Poll::Ready(Ok(n))
                 }
             }
-            Poll::Ready(Err(e)) => {
-                unsafe {
-                    this.read_buf.set_len(buf_len);
-                }
-                Poll::Ready(Err(e))
-            }
-            Poll::Pending => {
-                unsafe {
-                    this.read_buf.set_len(buf_len);
-                }
-                Poll::Pending
-            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -1755,11 +1994,16 @@ where
         // Reuse the message Vec across reads (no allocation per read). Messages
         // are popped from the back, so store them in reverse order.
         debug_assert!(self.pending_messages.is_empty());
-        self.protocol
-            .process_into(&mut self.read_buf, &mut self.pending_messages)?;
+        let result = self
+            .protocol
+            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages);
+        if matches!(result, Ok(true)) {
+            self.heartbeat
+                .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
+        }
+        // Preserve accepted messages even when a later frame fails.
         self.pending_messages.reverse();
-
-        Ok(())
+        result.map(|_| ())
     }
 
     /// Get the next pending message (moved out, no clone)
@@ -1770,40 +2014,52 @@ where
 
     /// See [`WebSocketStream::poll_heartbeat_timer`].
     fn poll_heartbeat_timer(&mut self, cx: &mut Context<'_>, deadline_ms: u64) -> Poll<()> {
-        let target = self.clock_epoch + Duration::from_millis(deadline_ms);
-        match self.heartbeat_sleep.as_mut() {
-            Some(sleep) => {
-                if deadline_ms < self.heartbeat_armed_ms
-                    || (deadline_ms != self.heartbeat_armed_ms && sleep.is_elapsed())
-                {
-                    sleep.as_mut().reset(target);
-                    self.heartbeat_armed_ms = deadline_ms;
-                }
-            }
-            None => {
-                self.heartbeat_sleep = Some(Box::pin(tokio::time::sleep_until(target)));
-                self.heartbeat_armed_ms = deadline_ms;
-            }
-        }
+        let deadline = self.clock_epoch + Duration::from_millis(deadline_ms);
         self.heartbeat_sleep
-            .as_mut()
-            .expect("heartbeat timer armed above")
-            .as_mut()
-            .poll(cx)
+            .get_or_insert_with(|| super::clock::HeartbeatTimer::new(deadline))
+            .poll(deadline, cx)
+    }
+
+    /// Send a frame, allowing read-batch coalescing when configured.
+    ///
+    /// Unlike `SinkExt::send`, this may return with bytes buffered while inbound
+    /// messages remain queued. Call `SinkExt::flush` before pausing reads or
+    /// waiting for a reply that depends on this frame. Polling for more input
+    /// after the batch, or reaching the high water mark, also flushes the buffer.
+    pub async fn send_coalesced(&mut self, item: Message) -> Result<()> {
+        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_ready(cx)).await?;
+        Pin::new(&mut *self).start_send(item)?;
+        // Batch-scoped corking: while inbound messages that were already
+        // parsed are still queued for the application, keep the encoded
+        // frames buffered. poll_next writes them all in one vectored write
+        // before it next waits on the transport, so a read batch answered
+        // with N coalesced sends costs one syscall instead of N.
+        if self.config.write_coalescing
+            && self.state == StreamState::Open
+            && !self.pending_messages.is_empty()
+            && self.write_buf.pending_bytes() < self.high_water_mark
+        {
+            return Ok(());
+        }
+        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_write_out(cx)).await
     }
 
     /// Write every pending frame to the transport and flush it.
     fn poll_write_out(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if self.state == StreamState::Closed {
+            return Poll::Ready(Err(Error::ConnectionClosed));
+        }
         let this = self.as_mut().get_mut();
 
         while this.write_buf.has_data() {
-            let mut slices = [IoSlice::new(&[]); MAX_WRITE_SLICES];
-            let count = this.write_buf.fill_write_slices(&mut slices);
-            if count == 0 {
-                break;
-            }
-
-            match Pin::new(&mut this.inner).poll_write_vectored(cx, &slices[..count]) {
+            let result = if this.write_buf.has_segments() && this.inner.is_write_vectored() {
+                let mut slices = [IoSlice::new(&[]); MAX_WRITE_SLICES];
+                let count = this.write_buf.fill_write_slices(&mut slices);
+                Pin::new(&mut this.inner).poll_write_vectored(cx, &slices[..count])
+            } else {
+                Pin::new(&mut this.inner).poll_write(cx, this.write_buf.chunk())
+            };
+            match result {
                 Poll::Ready(Ok(0)) => {
                     this.state = StreamState::Closed;
                     this.heartbeat.stop();
@@ -1888,7 +2144,21 @@ where
                 return Poll::Ready(None);
             }
 
-            let deadline = self.heartbeat.next_deadline();
+            if self.pending_messages.is_empty()
+                && let Some(error) = self.as_mut().get_mut().pending_parse_error.take()
+            {
+                let this = self.as_mut().get_mut();
+                this.state = StreamState::Closed;
+                this.heartbeat.stop();
+                this.heartbeat_sleep = None;
+                return Poll::Ready(Some(Err(error)));
+            }
+
+            let deadline = self
+                .pending_parse_error
+                .is_none()
+                .then(|| self.heartbeat.next_deadline())
+                .flatten();
             if let Some(deadline) = deadline {
                 let now = self.clock_epoch.elapsed().as_millis() as u64;
                 if deadline.at() <= now {
@@ -1976,6 +2246,9 @@ where
                         let this = self.as_mut().get_mut();
                         this.heartbeat.stop();
                         this.heartbeat_sleep = None;
+                        this.pending_messages.clear();
+                        this.pending_parse_error = None;
+                        this.read_buf.clear();
                         if this.state == StreamState::Open {
                             this.protocol
                                 .encode_close_response(this.write_buf.buffer_mut());
@@ -2008,6 +2281,22 @@ where
                 }
             }
 
+            // Process handshake leftover once before waiting for transport data.
+            if self.has_unprocessed_read_data {
+                self.as_mut().get_mut().has_unprocessed_read_data = false;
+                match self.as_mut().get_mut().process_read_buf() {
+                    Ok(()) if !self.pending_messages.is_empty() => continue,
+                    Ok(()) => {}
+                    Err(e) => {
+                        let this = self.as_mut().get_mut();
+                        this.state = StreamState::Closed;
+                        this.heartbeat.stop();
+                        this.heartbeat_sleep = None;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                }
+            }
+
             match self.as_mut().poll_read_more(cx) {
                 Poll::Ready(Ok(0)) => {
                     self.as_mut().get_mut().state = StreamState::Closed;
@@ -2017,11 +2306,8 @@ where
                 Poll::Ready(Ok(_n)) => match self.as_mut().get_mut().process_read_buf() {
                     Ok(()) => continue,
                     Err(e) => {
-                        let this = self.as_mut().get_mut();
-                        this.state = StreamState::Closed;
-                        this.heartbeat.stop();
-                        this.heartbeat_sleep = None;
-                        return Poll::Ready(Some(Err(e)));
+                        self.as_mut().get_mut().pending_parse_error = Some(e);
+                        continue;
                     }
                 },
                 Poll::Ready(Err(e)) => {
@@ -2047,7 +2333,7 @@ where
     type Error = Error;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if self.state != StreamState::Open {
+        if self.state != StreamState::Open || self.pending_parse_error.is_some() {
             return Poll::Ready(Err(Error::ConnectionClosed));
         }
         Poll::Ready(Ok(()))
@@ -2056,7 +2342,7 @@ where
     fn start_send(self: Pin<&mut Self>, item: Message) -> Result<()> {
         let this = self.get_mut();
 
-        if this.state != StreamState::Open {
+        if this.state != StreamState::Open || this.pending_parse_error.is_some() {
             return Err(Error::ConnectionClosed);
         }
 
@@ -2068,25 +2354,10 @@ where
 
         this.protocol
             .encode_message(&item, this.write_buf.buffer_mut())?;
-        Ok(())
+        this.check_write_limit()
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        {
-            let this = self.as_mut().get_mut();
-            // Batch-scoped corking: while inbound messages that were already
-            // parsed are still queued for the application, keep the encoded
-            // frames buffered. poll_next writes them all in one vectored write
-            // before it next waits on the transport, so a read batch answered
-            // with N sends costs one syscall instead of N.
-            if this.config.write_coalescing
-                && this.state == StreamState::Open
-                && !this.pending_messages.is_empty()
-                && this.write_buf.pending_bytes() < this.high_water_mark
-            {
-                return Poll::Ready(Ok(()));
-            }
-        }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.poll_write_out(cx)
     }
 
@@ -2127,13 +2398,16 @@ where
 #[cfg(feature = "permessage-deflate")]
 pub struct CompressedSplitReader<S> {
     /// Read half of the underlying stream
-    reader: ReadHalf<S>,
+    reader: SplitTransport<S>,
     /// Protocol for decoding with decompression
     protocol: crate::protocol::CompressedReaderProtocol,
     /// Read buffer
     read_buf: BytesMut,
+    has_unprocessed_read_data: bool,
     /// Pending messages from last decode
     pending_messages: Vec<Message>,
+    // Deliver successfully parsed messages before a later parse failure.
+    pending_parse_error: Option<Error>,
     control_tx: mpsc::Sender<ControlRequest>,
     terminal_rx: watch::Receiver<Option<TerminalCause>>,
     shared: Arc<SplitShared>,
@@ -2147,7 +2421,7 @@ pub struct CompressedSplitReader<S> {
 /// completely independently from the read half.
 #[cfg(feature = "permessage-deflate")]
 pub struct CompressedSplitWriter<S> {
-    core: SplitWriterCore<WriteHalf<S>, crate::protocol::CompressedWriterProtocol>,
+    core: SplitWriterCore<SplitTransport<S>, crate::protocol::CompressedWriterProtocol>,
 }
 
 #[cfg(feature = "permessage-deflate")]
@@ -2196,11 +2470,21 @@ where
     /// writer.send(Message::Text("Hello".into())).await?;
     /// ```
     pub fn split(self) -> (CompressedSplitReader<S>, CompressedSplitWriter<S>) {
-        // Split the underlying transport at the OS level
-        let (reader, writer) = tokio::io::split(self.inner);
+        // Share the transport so the driver can release it while handles live
+        let (reader, writer) = SplitTransport::pair(self.inner);
+        let transport = reader.clone();
 
         let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
         let shared = SplitShared::new(self.state != StreamState::Open);
+        // Splitting must not reopen application writes after a known parse error.
+        // A preceding accepted Close still needs its automatic response.
+        if self.pending_parse_error.is_some() {
+            shared.begin_closing();
+            if !self.pending_messages.iter().any(Message::is_close) {
+                shared.terminate(TerminalCause::ConnectionClosed);
+                shared.cancel.cancel();
+            }
+        }
         let terminal_rx = shared.terminal_tx.subscribe();
 
         // Split the protocol into reader and writer halves
@@ -2211,9 +2495,11 @@ where
             writer,
             writer_protocol,
             self.config.write_buffer_size,
+            self.config.max_backpressure,
         )));
 
         tokio::spawn(split_writer_driver(
+            transport,
             sink.clone(),
             self.config,
             control_rx,
@@ -2225,7 +2511,9 @@ where
                 reader,
                 protocol: reader_protocol,
                 read_buf: self.read_buf,
+                has_unprocessed_read_data: self.has_unprocessed_read_data,
                 pending_messages: self.pending_messages,
+                pending_parse_error: self.pending_parse_error,
                 control_tx: control_tx.clone(),
                 terminal_rx,
                 shared: shared.clone(),
@@ -2252,21 +2540,50 @@ where
     /// Returns `None` when the connection is closed.
     /// This method NEVER blocks the writer - true concurrent I/O!
     pub async fn next(&mut self) -> Option<Result<Message>> {
+        tokio::task::consume_budget().await;
         loop {
-            if let Some(result) = self.take_terminal() {
+            if self.terminal_reported {
+                return None;
+            }
+            // Stop the connection without discarding its accepted message prefix.
+            // An accepted Close takes precedence over invalid bytes after it.
+            if self.pending_parse_error.is_some()
+                && self.shared.is_open()
+                && !self.pending_messages.iter().any(Message::is_close)
+            {
+                self.shared.terminate(TerminalCause::ConnectionClosed);
+                self.shared.cancel.cancel();
+            }
+            if self.pending_parse_error.is_none()
+                && let Some(result) = self.take_terminal()
+            {
                 return result;
             }
 
             if let Some(msg) = self.pending_messages.pop() {
+                if self.pending_parse_error.is_some()
+                    && self.shared.status.load(Ordering::Acquire) == SPLIT_CLOSED
+                {
+                    if msg.is_close() {
+                        self.pending_messages.clear();
+                        self.pending_parse_error = None;
+                        self.terminal_reported = true;
+                    }
+                    return Some(Ok(msg));
+                }
                 let request = match &msg {
                     Message::Ping(data) => {
-                        ControlRequest::Ping(data.clone(), tokio::time::Instant::now())
+                        ControlRequest::Ping(data.clone(), super::clock::Instant::now())
                     }
                     Message::Pong(data) => {
-                        ControlRequest::Pong(data.clone(), tokio::time::Instant::now())
+                        ControlRequest::Pong(data.clone(), super::clock::Instant::now())
                     }
                     Message::Close(_) => {
                         self.shared.begin_closing();
+                        self.pending_messages.clear();
+                        self.pending_parse_error = None;
+                        self.read_buf.clear();
+                        self.terminal_reported = true;
                         ControlRequest::PeerClose
                     }
                     _ => {
@@ -2281,6 +2598,41 @@ where
                     continue;
                 }
                 return Some(Ok(msg));
+            }
+
+            if let Some(error) = self.pending_parse_error.take() {
+                self.shared.terminate(TerminalCause::ConnectionClosed);
+                self.terminal_reported = true;
+                return Some(Err(error));
+            }
+
+            if self.has_unprocessed_read_data {
+                self.has_unprocessed_read_data = false;
+                debug_assert!(self.pending_messages.is_empty());
+                match self
+                    .protocol
+                    .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)
+                {
+                    Ok(fragment_activity) => {
+                        if fragment_activity {
+                            self.shared.note_inbound();
+                        }
+                        self.pending_messages.reverse();
+                        if !self.pending_messages.is_empty() {
+                            continue;
+                        }
+                    }
+                    Err(error) => {
+                        self.pending_messages.reverse();
+                        self.pending_parse_error = Some(error);
+                        continue;
+                    }
+                }
+            }
+
+            // Reuse an empty receive window when no delivered payload still owns it.
+            if self.read_buf.is_empty() {
+                let _ = self.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE);
             }
 
             if self.read_buf.capacity() - self.read_buf.len() < 4096 {
@@ -2302,12 +2654,17 @@ where
                         }
                         Ok(_) => match self
                             .protocol
-                            .process_into(&mut self.read_buf, &mut self.pending_messages)
+                            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)
                         {
-                            Ok(()) => self.pending_messages.reverse(),
+                            Ok(fragment_activity) => {
+                                if fragment_activity {
+                                    self.shared.note_inbound();
+                                }
+                                self.pending_messages.reverse();
+                            },
                             Err(error) => {
-                                self.shared.terminate(TerminalCause::ConnectionClosed);
-                                return Some(Err(error));
+                                self.pending_messages.reverse();
+                                self.pending_parse_error = Some(error);
                             }
                         },
                         Err(error) => {
@@ -2353,6 +2710,11 @@ where
     S: AsyncWrite + Unpin,
 {
     /// Send a message (compressed when the negotiated parameters say so).
+    ///
+    /// Cancelling after acquiring the write sink closes the connection, since
+    /// the frame or compression state may already have advanced.
+    /// Zero transport progress does not make cancellation recoverable. Retain
+    /// the send future across `select!` if the connection must remain usable.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
         self.core.send(msg).await
     }
@@ -2394,7 +2756,7 @@ impl<S> Drop for CompressedSplitWriter<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn read_masked_control_payload(
@@ -2468,6 +2830,7 @@ mod tests {
         assert!(ws.is_closed());
     }
 
+    #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
     #[tokio::test(start_paused = true)]
     async fn auto_ping_uses_configured_interval_on_read_path() {
         let (client_io, mut server_io) = tokio::io::duplex(1024);
@@ -2485,6 +2848,7 @@ mod tests {
         read_task.abort();
     }
 
+    #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
     #[tokio::test(start_paused = true)]
     async fn split_driver_pings_without_application_writes_and_correlates_pong() {
         let (client_io, mut server_io) = tokio::io::duplex(1024);
@@ -2514,6 +2878,7 @@ mod tests {
         assert_ne!(first_ping, second_ping);
     }
 
+    #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
     #[tokio::test(start_paused = true)]
     async fn split_driver_times_out_with_configured_close_and_typed_cause() {
         let (client_io, mut server_io) = tokio::io::duplex(1024);
@@ -2584,6 +2949,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
     #[tokio::test(start_paused = true)]
     async fn split_hard_idle_timeout_is_typed_and_closes_once() {
         let (client_io, mut server_io) = tokio::io::duplex(1024);
@@ -2631,7 +2997,11 @@ mod tests {
     #[tokio::test]
     async fn blocked_split_writer_is_cancelled_when_reader_drops() {
         let (client_io, _peer_io) = tokio::io::duplex(64);
-        let config = Config::builder().auto_ping(false).idle_timeout(0).build();
+        let config = Config::builder()
+            .auto_ping(false)
+            .idle_timeout(0)
+            .max_backpressure(2 * 1024 * 1024)
+            .build();
         let (reader, mut writer) = WebSocketStream::client(client_io, config).split();
         let send = tokio::spawn(async move {
             writer
@@ -2645,6 +3015,7 @@ mod tests {
     }
 
     #[cfg(feature = "permessage-deflate")]
+    #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
     #[tokio::test(start_paused = true)]
     async fn compressed_split_driver_sends_uncompressed_native_ping() {
         let (client_io, mut server_io) = tokio::io::duplex(1024);
@@ -2762,7 +3133,7 @@ mod tests {
             let task = tokio::spawn(async move {
                 for _ in 0..3 {
                     let msg = server.next().await.unwrap().unwrap();
-                    server.send(msg).await.unwrap();
+                    server.send_coalesced(msg).await.unwrap();
                 }
                 server
             });
@@ -2779,7 +3150,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_batch_answered_with_sends_is_one_write_when_coalescing() {
-        // Three frames arrive in one read; three send() calls answer them.
+        // Three frames arrive in one read; three send_coalesced() calls answer them.
         assert_eq!(echo_batch_write_count(true).await, 1);
         assert_eq!(echo_batch_write_count(false).await, 3);
     }
@@ -2799,12 +3170,12 @@ mod tests {
         let task = tokio::spawn(async move {
             for _ in 0..2 {
                 let msg = server.next().await.unwrap().unwrap();
-                server.send(msg).await.unwrap();
+                server.send_coalesced(msg).await.unwrap();
             }
             // Wait for a third message that only arrives after the client saw
             // both echoes.
             let msg = server.next().await.unwrap().unwrap();
-            server.send(msg).await.unwrap();
+            server.send_coalesced(msg).await.unwrap();
         });
         let echoed = tokio::time::timeout(
             Duration::from_secs(2),
@@ -2844,11 +3215,14 @@ mod tests {
         let big_for_task = big.clone();
         let task = tokio::spawn(async move {
             let _ = server.next().await.unwrap().unwrap();
-            server.send(Message::Binary(big_for_task)).await.unwrap();
-            let _ = server.next().await.unwrap().unwrap();
-            server.send(Message::text("small")).await.unwrap();
             server
-                .send(Message::Binary(Bytes::from_static(b"tail")))
+                .send_coalesced(Message::Binary(big_for_task))
+                .await
+                .unwrap();
+            let _ = server.next().await.unwrap().unwrap();
+            server.send_coalesced(Message::text("small")).await.unwrap();
+            server
+                .send_coalesced(Message::Binary(Bytes::from_static(b"tail")))
                 .await
                 .unwrap();
         });

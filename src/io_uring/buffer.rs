@@ -1,15 +1,14 @@
-//! Registered buffer pool for io_uring zero-copy I/O
+//! Reusable owned buffer pool for io_uring I/O
 //!
-//! This module provides a buffer pool for io_uring operations that can be
-//! registered with the kernel for zero-copy I/O.
+//! This pool does not register buffers with an io_uring runtime. Callers that
+//! need fixed-buffer operations must perform that registration separately.
 
 use std::collections::VecDeque;
 
-/// A pool of registered buffers for io_uring operations
+/// A pool of reusable owned buffers for io_uring operations
 ///
-/// Registered buffers allow the kernel to avoid copying data between
-/// user and kernel space, improving performance for high-throughput
-/// applications.
+/// The pool only manages allocation and reuse. Its buffers are not registered
+/// with the kernel by this type.
 ///
 /// # Example
 ///

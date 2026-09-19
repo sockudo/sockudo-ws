@@ -106,12 +106,12 @@ pub mod io_uring;
 // Core re-exports
 pub use error::{Error, Result};
 pub use frame::{Frame, OpCode};
-pub use handshake::HandshakeResult;
+pub use handshake::{HandshakeResult, HandshakeSelection};
 pub use protocol::{Message, RawMessage, Role};
 #[cfg(feature = "tokio-runtime")]
 pub use pubsub::{PubSub, PubSubState, PublishResult, SubscriberId};
 #[cfg(feature = "tokio-runtime")]
-pub use stream::{SplitReader, SplitWriter, Stream, WebSocketStream};
+pub use stream::{SplitReader, SplitWriter, Stream, WebSocketStream, init_clock};
 
 #[cfg(all(feature = "permessage-deflate", feature = "tokio-runtime"))]
 pub use stream::CompressedWebSocketStream;
@@ -206,18 +206,24 @@ impl Default for Http2Config {
 }
 
 /// HTTP/3 configuration (RFC 9220)
+///
+/// The built-in endpoints do not currently apply these fields. Configure an
+/// external QUIC endpoint directly when transport settings are required.
 #[cfg(feature = "http3")]
 #[derive(Debug, Clone)]
 pub struct Http3Config {
     /// Maximum idle timeout for QUIC connection in milliseconds (default: 30000)
     pub max_idle_timeout_ms: u64,
-    /// Initial stream-level flow control window size (default: 1MB)
+    /// Initial per-stream receive window size (default: 1MB)
     pub initial_stream_window_size: u64,
-    /// Enable 0-RTT for faster reconnection (default: false)
+    /// Request 0-RTT support (default: false)
+    ///
+    /// The built-in HTTP/3 client and server reject `true` because their H3 layer
+    /// cannot safely restore peer settings after resumption.
     pub enable_0rtt: bool,
     /// Enable Extended CONNECT protocol for WebSocket (default: true)
     pub enable_connect_protocol: bool,
-    /// Maximum UDP payload size (default: 1350)
+    /// Maximum accepted UDP payload size (default: 1350)
     pub max_udp_payload_size: u16,
 }
 
@@ -264,13 +270,59 @@ impl Default for IoUringConfig {
 // Compression
 // ============================================================================
 
+/// LZ77 window sizes supported by the configured compression backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum DeflateWindowBits {
+    /// 512-byte window.
+    Bits9 = 9,
+    /// 1KB window.
+    Bits10 = 10,
+    /// 2KB window.
+    Bits11 = 11,
+    /// 4KB window.
+    Bits12 = 12,
+    /// 8KB window.
+    Bits13 = 13,
+    /// 16KB window.
+    Bits14 = 14,
+    /// 32KB window.
+    Bits15 = 15,
+}
+
+impl TryFrom<u8> for DeflateWindowBits {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            9 => Ok(Self::Bits9),
+            10 => Ok(Self::Bits10),
+            11 => Ok(Self::Bits11),
+            12 => Ok(Self::Bits12),
+            13 => Ok(Self::Bits13),
+            14 => Ok(Self::Bits14),
+            15 => Ok(Self::Bits15),
+            _ => Err(Error::Compression(format!(
+                "unsupported deflate window bits {value}; backend supports 9-15"
+            ))),
+        }
+    }
+}
+
+impl From<DeflateWindowBits> for u8 {
+    fn from(value: DeflateWindowBits) -> Self {
+        value as Self
+    }
+}
+
 /// Compression mode for WebSocket connections (RFC 7692 permessage-deflate)
 ///
 /// This enum controls how compression is handled for WebSocket connections.
 ///
-/// Per RFC 7692, the LZ77 sliding window size is limited to 8-15 bits
-/// (256 bytes to 32KB). Larger windows provide better compression but
-/// use more memory per connection.
+/// Per RFC 7692, the LZ77 sliding window size is limited to 8-15 bits. The
+/// configured compression backend supports 9-15, so valid configurations start
+/// at a 512-byte window. Larger windows provide better compression but use more
+/// memory per connection.
 ///
 /// # Memory Usage per Connection
 ///
@@ -279,7 +331,6 @@ impl Default for IoUringConfig {
 /// | `Disabled` | No compression | - | - |
 /// | `Dedicated` | Per-connection compressor | 15 | 32KB |
 /// | `Shared` | Shared compressor pool | 15 | 32KB |
-/// | `Window256B` | Minimal memory | 8 | 256B |
 /// | `Window1KB` | 1KB sliding window | 10 | 1KB |
 /// | `Window2KB` | 2KB sliding window | 11 | 2KB |
 /// | `Window4KB` | 4KB sliding window | 12 | 4KB |
@@ -295,8 +346,6 @@ pub enum Compression {
     Dedicated,
     /// Shared compressor pool (32KB window, good for many connections)
     Shared,
-    /// 256 byte sliding window (window_bits=8, minimal memory)
-    Window256B,
     /// 1KB sliding window (window_bits=10)
     Window1KB,
     /// 2KB sliding window (window_bits=11)
@@ -332,18 +381,19 @@ impl Compression {
 
     /// Get the window bits for this compression mode
     ///
-    /// Returns the LZ77 window bits (8-15) for RFC 7692 compliance.
+    /// Returns the configured LZ77 window size, or `None` when disabled.
     #[inline]
-    pub fn window_bits(&self) -> u8 {
+    pub fn window_bits(&self) -> Option<DeflateWindowBits> {
         match self {
-            Compression::Disabled => 0,
-            Compression::Window256B => 8,
-            Compression::Window1KB => 10,
-            Compression::Window2KB => 11,
-            Compression::Window4KB => 12,
-            Compression::Window8KB => 13,
-            Compression::Window16KB => 14,
-            Compression::Dedicated | Compression::Shared | Compression::Window32KB => 15,
+            Compression::Disabled => None,
+            Compression::Window1KB => Some(DeflateWindowBits::Bits10),
+            Compression::Window2KB => Some(DeflateWindowBits::Bits11),
+            Compression::Window4KB => Some(DeflateWindowBits::Bits12),
+            Compression::Window8KB => Some(DeflateWindowBits::Bits13),
+            Compression::Window16KB => Some(DeflateWindowBits::Bits14),
+            Compression::Dedicated | Compression::Shared | Compression::Window32KB => {
+                Some(DeflateWindowBits::Bits15)
+            }
         }
     }
 
@@ -355,7 +405,6 @@ impl Compression {
     pub fn compression_threshold(&self) -> usize {
         match self {
             Compression::Disabled => usize::MAX,
-            Compression::Window256B => 128,
             Compression::Window1KB => 64,
             Compression::Window2KB => 48,
             Compression::Window4KB => 40,
@@ -377,7 +426,6 @@ impl Compression {
             self,
             Compression::Disabled
                 | Compression::Shared
-                | Compression::Window256B
                 | Compression::Window1KB
                 | Compression::Window2KB
         )
@@ -386,11 +434,7 @@ impl Compression {
     /// Convert to DeflateConfig
     #[cfg(feature = "permessage-deflate")]
     pub fn to_deflate_config(&self) -> Option<crate::deflate::DeflateConfig> {
-        if !self.is_enabled() {
-            return None;
-        }
-
-        let window_bits = self.window_bits();
+        let window_bits = self.window_bits()?;
         let no_context_takeover = !self.context_takeover();
 
         Some(crate::deflate::DeflateConfig {
@@ -399,10 +443,10 @@ impl Compression {
             server_no_context_takeover: no_context_takeover,
             client_no_context_takeover: no_context_takeover,
             compression_level: match self {
-                Compression::Window256B | Compression::Window1KB => 1, // Fast for small windows
-                Compression::Window2KB | Compression::Window4KB => 3,  // Balanced
+                Compression::Window1KB => 1, // Fast for small windows
+                Compression::Window2KB | Compression::Window4KB => 3, // Balanced
                 Compression::Window8KB | Compression::Window16KB => 5, // Good compression
-                _ => 6,                                                // Best for 32KB
+                _ => 6,                      // Best for 32KB
             },
             compression_threshold: self.compression_threshold(),
         })
@@ -434,6 +478,12 @@ pub struct Config {
     pub max_frame_size: usize,
     /// Write buffer size for corking (default: 16KB)
     pub write_buffer_size: usize,
+    /// Disable Nagle on TCP sockets created by the built-in HTTP/1 URL client
+    /// and listener server (default: true).
+    ///
+    /// This does not change caller-supplied streams or other transport backends.
+    /// Configure the underlying socket directly when providing a TCP/TLS stream.
+    pub tcp_nodelay: bool,
     /// Compression mode (default: Disabled)
     pub compression: Compression,
     /// Hard inbound-idle timeout in seconds (default: 120, 0 = disabled).
@@ -442,7 +492,9 @@ pub struct Config {
     /// ties a Pong deadline, the more specific Pong timeout wins.
     pub idle_timeout: u32,
     /// Maximum backpressure in bytes before dropping connection (default: 1MB)
-    /// If write buffer exceeds this, connection is closed
+    /// If an application frame makes the encoded write buffer exceed this limit,
+    /// the connection becomes terminal and the write returns `Error::BufferFull`.
+    /// This bounds queued encoded bytes, not peak encoding memory.
     pub max_backpressure: usize,
     /// Send native Pings after inbound inactivity (default: true).
     ///
@@ -461,17 +513,14 @@ pub struct Config {
     /// Maximum time spent flushing a timeout/handshake Close and shutting down
     /// the transport (default: 5 seconds, 0 = immediate best effort).
     pub close_timeout: u32,
-    /// Coalesce outbound frames while inbound messages are still queued
-    /// (default: true).
+    /// Enable read-batch coalescing for `send_coalesced` (default: true).
     ///
-    /// When the stream has already parsed more inbound messages than the
-    /// application has consumed, `poll_flush` keeps the encoded frames in the
-    /// write buffer instead of issuing a write per `send()`. Everything is
-    /// written in one vectored write before the stream next waits for the
-    /// transport, or as soon as the buffer reaches the high water mark. This
-    /// turns a read batch of N messages answered with N `send()` calls into
-    /// one syscall instead of N. Disable for strict "returned means written"
-    /// semantics on every `send()`.
+    /// The explicit coalesced-send methods may buffer frames while parsed
+    /// inbound messages remain queued. They flush at the high water mark, and
+    /// the read path flushes before waiting for more input. Call `SinkExt::flush`
+    /// before pausing reads or waiting for a reply that depends on those frames.
+    /// Standard `SinkExt::send` and `SinkExt::flush` always flush, regardless of
+    /// this setting. Disable to make `send_coalesced` flush every frame as well.
     pub write_coalescing: bool,
     /// Per-message deflate configuration (requires `permessage-deflate` feature)
     #[cfg(feature = "permessage-deflate")]
@@ -495,6 +544,7 @@ impl Default for Config {
             max_message_size: 64 * 1024 * 1024,
             max_frame_size: 16 * 1024 * 1024,
             write_buffer_size: CORK_BUFFER_SIZE,
+            tcp_nodelay: true,
             compression: Compression::Disabled,
             idle_timeout: 120,
             max_backpressure: 1024 * 1024,
@@ -529,6 +579,7 @@ impl Config {
             max_message_size: 16 * 1024,
             max_frame_size: 16 * 1024,
             write_buffer_size: CORK_BUFFER_SIZE,
+            tcp_nodelay: true,
             compression: Compression::Shared,
             // A hard inbound-idle deadline shorter than the first Ping is
             // surprising. uWS-style defaults therefore leave hard idle
@@ -566,6 +617,14 @@ impl ConfigBuilder {
         Self {
             config: Config::default(),
         }
+    }
+
+    /// Set TCP_NODELAY for the built-in HTTP/1 TCP entry points.
+    ///
+    /// Caller-supplied streams and other transport backends are unaffected.
+    pub fn tcp_nodelay(mut self, enabled: bool) -> Self {
+        self.config.tcp_nodelay = enabled;
+        self
     }
 
     /// Set compression mode
@@ -648,7 +707,7 @@ impl ConfigBuilder {
         self
     }
 
-    /// Enable or disable coalescing of outbound frames across `send()` calls
+    /// Enable or disable coalescing across explicit `send_coalesced()` calls
     /// while inbound messages are still queued (see
     /// [`Config::write_coalescing`]).
     pub fn write_coalescing(mut self, enabled: bool) -> Self {
@@ -829,6 +888,7 @@ mod tokio_http2_tests {
                     let msg = ws.next().await.unwrap().unwrap();
                     assert!(matches!(&msg, Message::Text(text) if text == "h2"));
                     ws.send(msg).await.unwrap();
+                    SinkExt::close(&mut ws).await.unwrap();
                 })
                 .await
                 .unwrap();
@@ -859,6 +919,7 @@ mod tokio_http2_tests {
                     assert!(matches!(req.path.as_str(), "/one" | "/two"));
                     let msg = ws.next().await.unwrap().unwrap();
                     ws.send(msg).await.unwrap();
+                    SinkExt::close(&mut ws).await.unwrap();
                 })
                 .await
                 .unwrap();
@@ -906,11 +967,12 @@ mod tokio_http3_tests {
     async fn tokio_http3_echo_round_trip() {
         install_test_crypto_provider();
 
-        let rcgen::CertifiedKey { cert, key_pair } =
+        let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
 
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
-        let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
 
         let server_tls = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -960,11 +1022,12 @@ mod tokio_http3_tests {
     async fn tokio_http3_multiplexed_round_trip() {
         install_test_crypto_provider();
 
-        let rcgen::CertifiedKey { cert, key_pair } =
+        let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
 
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
-        let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
 
         let server_tls = rustls::ServerConfig::builder()
             .with_no_client_auth()
