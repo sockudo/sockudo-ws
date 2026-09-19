@@ -29,9 +29,11 @@
 //! writer.send(Message::Text("Hello".into())).await?;
 //! ```
 
+mod clock;
 mod transport_stream;
 mod websocket;
 
+pub use clock::init_clock;
 pub use transport_stream::Stream;
 pub use websocket::*;
 
