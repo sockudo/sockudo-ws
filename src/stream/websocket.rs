@@ -268,7 +268,7 @@ where
 
     /// Send a close frame
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
-        if self.state != StreamState::Open {
+        if self.state != StreamState::Open || self.pending_terminal_error.is_some() {
             return Ok(());
         }
 
@@ -688,7 +688,7 @@ where
     type Error = Error;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if self.state != StreamState::Open {
+        if self.state != StreamState::Open || self.pending_terminal_error.is_some() {
             return Poll::Ready(Err(Error::ConnectionClosed));
         }
         Poll::Ready(Ok(()))
@@ -697,7 +697,7 @@ where
     fn start_send(self: Pin<&mut Self>, item: Message) -> Result<()> {
         let this = self.get_mut();
 
-        if this.state != StreamState::Open {
+        if this.state != StreamState::Open || this.pending_terminal_error.is_some() {
             return Err(Error::ConnectionClosed);
         }
 
@@ -1135,6 +1135,18 @@ where
         let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
         let (application_tx, application_rx) = mpsc::channel(SPLIT_APPLICATION_CAPACITY);
         let shared = SplitShared::new(self.state != StreamState::Open, &self.config);
+        // Splitting must not reopen application writes after a known parse error.
+        // A preceding accepted Close still needs its automatic response.
+        if self.pending_terminal_error.is_some() {
+            shared.begin_closing();
+            if !self.pending_messages[self.pending_index..]
+                .iter()
+                .any(Message::is_close)
+            {
+                shared.terminate(TerminalCause::ConnectionClosed);
+                shared.cancel.cancel();
+            }
+        }
         let terminal_rx = shared.terminal_tx.subscribe();
         let writer_protocol = Protocol::new(
             self.protocol.role,
@@ -1193,6 +1205,17 @@ where
             if self.terminal_reported {
                 return None;
             }
+            // Stop the connection without discarding its accepted message prefix.
+            // An accepted Close takes precedence over invalid bytes after it.
+            if self.pending_terminal_error.is_some()
+                && self.shared.is_open()
+                && !self.pending_messages[self.pending_index..]
+                    .iter()
+                    .any(Message::is_close)
+            {
+                self.shared.terminate(TerminalCause::ConnectionClosed);
+                self.shared.cancel.cancel();
+            }
             if self.pending_terminal_error.is_none()
                 && let Some(result) = self.take_terminal()
             {
@@ -1211,6 +1234,17 @@ where
                     self.pending_index = 0;
                 }
 
+                if self.pending_terminal_error.is_some()
+                    && self.shared.status.load(Ordering::Acquire) == SPLIT_CLOSED
+                {
+                    if msg.is_close() {
+                        self.pending_messages.clear();
+                        self.pending_index = 0;
+                        self.pending_terminal_error = None;
+                        self.terminal_reported = true;
+                    }
+                    return Some(Ok(msg));
+                }
                 let request = match &msg {
                     Message::Ping(data) => ControlRequest::Ping(data.clone(), Instant::now()),
                     Message::Pong(data) => ControlRequest::Pong(data.clone(), Instant::now()),
@@ -1359,6 +1393,8 @@ impl<S> SplitWriter<S> {
     ///
     /// Cancelling after queue acceptance closes the connection; the driver may
     /// already have advanced compression state or written a frame prefix.
+    /// Zero transport progress does not make cancellation recoverable. Retain
+    /// the send future across `select!` if the connection must remain usable.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
         let is_close = msg.is_close();
         let close_timeout = self.shared.close_timeout;
@@ -2087,7 +2123,7 @@ where
 
     /// Send a close frame
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
-        if self.state != StreamState::Open {
+        if self.state != StreamState::Open || self.pending_terminal_error.is_some() {
             return Ok(());
         }
 
@@ -2491,7 +2527,7 @@ where
     type Error = Error;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if self.state != StreamState::Open {
+        if self.state != StreamState::Open || self.pending_terminal_error.is_some() {
             return Poll::Ready(Err(Error::ConnectionClosed));
         }
         Poll::Ready(Ok(()))
@@ -2500,7 +2536,7 @@ where
     fn start_send(self: Pin<&mut Self>, item: Message) -> Result<()> {
         let this = self.get_mut();
 
-        if this.state != StreamState::Open {
+        if this.state != StreamState::Open || this.pending_terminal_error.is_some() {
             return Err(Error::ConnectionClosed);
         }
 
@@ -2685,6 +2721,18 @@ where
         let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
         let (application_tx, application_rx) = mpsc::channel(SPLIT_APPLICATION_CAPACITY);
         let shared = SplitShared::new(self.state != StreamState::Open, &self.config);
+        // Splitting must not reopen application writes after a known parse error.
+        // A preceding accepted Close still needs its automatic response.
+        if self.pending_terminal_error.is_some() {
+            shared.begin_closing();
+            if !self.pending_messages[self.pending_index..]
+                .iter()
+                .any(Message::is_close)
+            {
+                shared.terminate(TerminalCause::ConnectionClosed);
+                shared.cancel.cancel();
+            }
+        }
         let terminal_rx = shared.terminal_tx.subscribe();
 
         // Split the protocol into reader and writer halves
@@ -2742,6 +2790,17 @@ where
             if self.terminal_reported {
                 return None;
             }
+            // Stop the connection without discarding its accepted message prefix.
+            // An accepted Close takes precedence over invalid bytes after it.
+            if self.pending_terminal_error.is_some()
+                && self.shared.is_open()
+                && !self.pending_messages[self.pending_index..]
+                    .iter()
+                    .any(Message::is_close)
+            {
+                self.shared.terminate(TerminalCause::ConnectionClosed);
+                self.shared.cancel.cancel();
+            }
             if self.pending_terminal_error.is_none()
                 && let Some(result) = self.take_terminal()
             {
@@ -2761,6 +2820,17 @@ where
                     self.pending_index = 0;
                 }
 
+                if self.pending_terminal_error.is_some()
+                    && self.shared.status.load(Ordering::Acquire) == SPLIT_CLOSED
+                {
+                    if msg.is_close() {
+                        self.pending_messages.clear();
+                        self.pending_index = 0;
+                        self.pending_terminal_error = None;
+                        self.terminal_reported = true;
+                    }
+                    return Some(Ok(msg));
+                }
                 let request = match &msg {
                     Message::Ping(data) => ControlRequest::Ping(data.clone(), Instant::now()),
                     Message::Pong(data) => ControlRequest::Pong(data.clone(), Instant::now()),
@@ -2893,6 +2963,8 @@ impl<S> CompressedSplitWriter<S> {
     ///
     /// Cancelling after queue acceptance closes the connection; the driver may
     /// already have advanced compression state or written a frame prefix.
+    /// Zero transport progress does not make cancellation recoverable. Retain
+    /// the send future across `select!` if the connection must remain usable.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
         let is_close = msg.is_close();
         let close_timeout = self.shared.close_timeout;

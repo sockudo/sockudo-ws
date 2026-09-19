@@ -242,7 +242,9 @@ pub fn build_response(
     if protocol.is_some_and(|value| !is_header_name_token(value)) {
         return Err(Error::InvalidHttp("invalid Sec-WebSocket-Protocol"));
     }
-    if extensions.is_some_and(|value| !is_valid_extension_list(value)) {
+    if extensions.is_some_and(|value| {
+        !is_valid_extension_list(value) || value.split(',').any(|item| item.trim().is_empty())
+    }) {
         return Err(Error::InvalidHttp("invalid Sec-WebSocket-Extensions"));
     }
 
@@ -352,10 +354,14 @@ fn validate_handshake_metadata(
     if !is_valid_request_target(path) {
         return Err(Error::InvalidHttp("invalid request target"));
     }
-    if protocol.is_some_and(|value| !is_valid_protocol_list(value)) {
+    if protocol.is_some_and(|value| {
+        !is_valid_protocol_list(value) || value.split(',').any(|item| item.trim().is_empty())
+    }) {
         return Err(Error::InvalidHttp("invalid Sec-WebSocket-Protocol"));
     }
-    if extensions.is_some_and(|value| !is_valid_extension_list(value)) {
+    if extensions.is_some_and(|value| {
+        !is_valid_extension_list(value) || value.split(',').any(|item| item.trim().is_empty())
+    }) {
         return Err(Error::InvalidHttp("invalid Sec-WebSocket-Extensions"));
     }
     Ok(())
@@ -528,29 +534,37 @@ pub(crate) fn select_subprotocol<'a>(
 }
 
 pub(crate) fn is_valid_protocol_list(value: &str) -> bool {
-    if !value.contains(',') {
-        return is_header_name_token(value.trim());
-    }
     let mut seen = std::collections::HashSet::new();
+    // Recipients ignore empty HTTP list elements, but a required list must
+    // still contain at least one protocol and must not repeat a protocol.
     value
         .split(',')
         .map(str::trim)
+        .filter(|protocol| !protocol.is_empty())
         .all(|protocol| is_header_name_token(protocol) && seen.insert(protocol))
+        && !seen.is_empty()
 }
 
 pub(crate) fn is_valid_extension_list(value: &str) -> bool {
-    !value.is_empty()
-        && value.split(',').all(|extension| {
-            let mut parts = extension.split(';').map(str::trim);
-            parts.next().is_some_and(is_header_name_token)
-                && parts.all(|parameter| {
-                    if let Some((name, value)) = parameter.split_once('=') {
-                        is_header_name_token(name.trim()) && is_valid_extension_value(value.trim())
-                    } else {
-                        is_header_name_token(parameter)
-                    }
-                })
-        })
+    value
+        .split(',')
+        .any(|extension| !extension.trim().is_empty())
+        && value
+            .split(',')
+            .map(str::trim)
+            .filter(|extension| !extension.is_empty())
+            .all(|extension| {
+                let mut parts = extension.split(';').map(str::trim);
+                parts.next().is_some_and(is_header_name_token)
+                    && parts.all(|parameter| {
+                        if let Some((name, value)) = parameter.split_once('=') {
+                            is_header_name_token(name.trim())
+                                && is_valid_extension_value(value.trim())
+                        } else {
+                            is_header_name_token(parameter)
+                        }
+                    })
+            })
 }
 
 fn is_valid_extension_value(value: &str) -> bool {
@@ -637,7 +651,11 @@ pub(crate) fn validate_selected_extensions(
         .split(',')
         .filter_map(|extension| extension.split(';').next())
         .map(str::trim);
-    for selected_extension in selected.split(',') {
+    for selected_extension in selected
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
         let selected_name = selected_extension
             .split(';')
             .next()
