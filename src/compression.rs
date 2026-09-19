@@ -79,7 +79,7 @@ impl CompressionContext {
 
     /// Create a shared context that uses an existing pool
     pub fn with_shared_pool(pool: Arc<SharedCompressorPool>, is_server: bool) -> Self {
-        let config = pool.config.clone();
+        let config = pool.config().clone();
         let decoder = if is_server {
             DeflateDecoder::new(
                 config.client_max_window_bits,
@@ -93,7 +93,7 @@ impl CompressionContext {
         };
 
         CompressionContext::Shared {
-            pool,
+            pool: Arc::new(pool.for_role(is_server)),
             decoder,
             config,
         }
@@ -147,25 +147,22 @@ impl CompressionContext {
 
 /// A pool of shared compressors for the `Shared` compression mode
 ///
-/// This pool allows multiple connections to share compressor instances,
-/// reducing memory usage when you have many connections.
-pub struct SharedCompressorPool {
+/// This pool allows multiple connections to share four synchronous compressor
+/// instances, reducing encoder memory at the cost of possible contention.
+struct SharedEncoderPool {
     /// Pool of encoders
     encoders: Vec<Mutex<DeflateEncoder>>,
-    /// Configuration used for the pool
-    config: DeflateConfig,
     /// Current encoder index (simple round-robin)
     next_encoder: std::sync::atomic::AtomicUsize,
 }
 
-impl SharedCompressorPool {
-    /// Create a new shared compressor pool
-    pub fn new(config: DeflateConfig) -> Self {
+impl SharedEncoderPool {
+    fn new(config: &DeflateConfig, window_bits: u8) -> Self {
         let encoders = (0..SHARED_POOL_SIZE)
             .map(|_| {
                 Mutex::new(DeflateEncoder::new(
-                    config.server_max_window_bits,
-                    true, // Always reset for shared mode (no context takeover)
+                    window_bits,
+                    true,
                     config.compression_level,
                     config.compression_threshold,
                 ))
@@ -174,26 +171,84 @@ impl SharedCompressorPool {
 
         Self {
             encoders,
-            config,
             next_encoder: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn compress(&self, data: &[u8]) -> Result<Option<Bytes>> {
+        // Round-robin selection
+        let index = self
+            .next_encoder
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % SHARED_POOL_SIZE;
+        self.encoders[index].lock().compress(data)
+    }
+}
+
+struct SharedCompressorPoolInner {
+    server: Arc<SharedEncoderPool>,
+    client: Arc<SharedEncoderPool>,
+    /// Configuration used for both role-specific pools
+    config: DeflateConfig,
+}
+
+/// Shared server and client encoder pools selected by the sending role.
+pub struct SharedCompressorPool {
+    inner: Arc<SharedCompressorPoolInner>,
+    is_server: bool,
+}
+
+impl SharedCompressorPool {
+    /// Create a new shared compressor pool for server-side compression
+    ///
+    /// [`CompressionContext::with_shared_pool`] selects the matching sending
+    /// direction when the pool is attached to a client context.
+    pub fn new(config: DeflateConfig) -> Self {
+        // Shared encoders must reset between messages because successive uses
+        // can belong to different connections.
+        let server = Arc::new(SharedEncoderPool::new(
+            &config,
+            config.server_max_window_bits,
+        ));
+        let client = if config.server_max_window_bits == config.client_max_window_bits {
+            Arc::clone(&server)
+        } else {
+            Arc::new(SharedEncoderPool::new(
+                &config,
+                config.client_max_window_bits,
+            ))
+        };
+
+        Self {
+            inner: Arc::new(SharedCompressorPoolInner {
+                server,
+                client,
+                config,
+            }),
+            is_server: true,
+        }
+    }
+
+    fn for_role(&self, is_server: bool) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            is_server,
         }
     }
 
     /// Compress data using a pooled encoder
     pub fn compress(&self, data: &[u8]) -> Result<Option<Bytes>> {
-        // Round-robin selection
-        let idx = self
-            .next_encoder
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            % SHARED_POOL_SIZE;
-
-        let mut encoder = self.encoders[idx].lock();
-        encoder.compress(data)
+        let encoders = if self.is_server {
+            &self.inner.server
+        } else {
+            &self.inner.client
+        };
+        encoders.compress(data)
     }
 
     /// Get the pool's configuration
     pub fn config(&self) -> &DeflateConfig {
-        &self.config
+        &self.inner.config
     }
 }
 
