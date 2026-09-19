@@ -1093,7 +1093,8 @@ impl CompressedProtocol {
     ///
     /// This allows the encoder and decoder to be used independently for
     /// concurrent read/write operations. The reader retains parser state while
-    /// applying the supplied frame and message size limits.
+    /// applying the supplied frame and message size limits. A lower frame limit
+    /// also applies to a partially received frame whose header was already parsed.
     pub fn split(
         mut self,
         max_frame_size: usize,
