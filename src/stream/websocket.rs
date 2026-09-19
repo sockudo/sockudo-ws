@@ -1021,19 +1021,27 @@ where
         if !self.shared.is_open() {
             return Err(self.current_error());
         }
-        let mut sink = self.sink.lock().await;
-        // Re-check under the lock: the control driver may have closed meanwhile.
-        if !self.shared.is_open() {
-            return Err(self.current_error());
-        }
         let is_close = msg.is_close();
         if is_close {
-            let started = tokio::time::Instant::now();
-            self.control_tx
-                .send(ControlRequest::LocalCloseStarted(started))
+            let permit = self
+                .control_tx
+                .reserve()
                 .await
-                .map_err(|_| Error::ConnectionClosed)?;
-            self.shared.begin_closing();
+                .map_err(|_| self.current_error())?;
+            if !self.shared.begin_closing() {
+                return Err(self.current_error());
+            }
+            // Publish before waiting for the sink: a blocked control write must
+            // use the same closing budget as the application Close behind it.
+            permit.send(ControlRequest::LocalCloseStarted(
+                tokio::time::Instant::now(),
+            ));
+        }
+        let mut sink = self.sink.lock().await;
+        // Re-check under the lock: the control driver may have closed meanwhile.
+        let status = self.shared.status.load(Ordering::Acquire);
+        if status != SPLIT_OPEN && !(is_close && status == SPLIT_CLOSING) {
+            return Err(self.current_error());
         }
         let result = sink
             .write_frame(&self.shared.cancel, |encoder, buf| {
