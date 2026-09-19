@@ -87,3 +87,5 @@ Compare each case against the same case in the other binary; zero and nonzero
 cases have different harness overhead. This exercises partial-write/control
 churn costs, not real TCP backpressure or production Ping frequency. Preserve
 A/A runs, fixed paired order, executable hashes and environment with results.
+
+The standalone diagnostics accept Cargo’s `--bench` argument. With no arguments they run a short synthetic case. For file-based receive diagnostics, `-` selects the built-in JSON payload; batch latency CPU `-` leaves affinity unchanged. These defaults check the harness without external fixtures.

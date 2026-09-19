@@ -83,3 +83,78 @@ async fn split_preserves_an_error_after_a_message_from_handshake_leftover() {
     assert!(stream.next().await.unwrap().is_err());
     assert!(stream.next().await.is_none());
 }
+
+#[tokio::test]
+async fn split_parse_error_stops_writes_before_messages_are_drained() {
+    let (io, mut peer) = tokio::io::duplex(128);
+    let (mut reader, mut writer) = WebSocketStream::client(io, config()).split();
+    peer.write_all(b"\x82\x01a\x82\x01b\x83\x00").await.unwrap();
+
+    assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), b"a");
+
+    assert!(writer.is_closed());
+    assert!(matches!(
+        writer.send(sockudo_ws::Message::text("late")).await,
+        Err(sockudo_ws::Error::ConnectionClosed)
+    ));
+    assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), b"b");
+    assert!(reader.next().await.unwrap().is_err());
+    assert!(reader.next().await.is_none());
+}
+
+#[tokio::test]
+async fn unified_parse_error_stops_writes_before_messages_are_drained() {
+    use futures_util::SinkExt;
+    let (io, mut peer) = tokio::io::duplex(128);
+    let mut stream = WebSocketStream::client(io, config());
+    peer.write_all(b"\x82\x01a\x82\x01b\x83\x00").await.unwrap();
+    assert_eq!(stream.next().await.unwrap().unwrap().as_bytes(), b"a");
+
+    let result = stream.send(sockudo_ws::Message::text("late")).await;
+
+    assert!(matches!(result, Err(sockudo_ws::Error::ConnectionClosed)));
+    assert_eq!(stream.next().await.unwrap().unwrap().as_bytes(), b"b");
+    assert!(stream.next().await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn splitting_after_parse_error_does_not_reopen_writes() {
+    let (io, mut peer) = tokio::io::duplex(128);
+    let mut stream = WebSocketStream::client(io, config());
+    peer.write_all(b"\x82\x01a\x82\x01b\x83\x00").await.unwrap();
+    assert_eq!(stream.next().await.unwrap().unwrap().as_bytes(), b"a");
+
+    let (mut reader, mut writer) = stream.split();
+
+    assert!(writer.is_closed());
+    assert!(matches!(
+        writer.send(sockudo_ws::Message::text("late")).await,
+        Err(sockudo_ws::Error::ConnectionClosed)
+    ));
+    assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), b"b");
+    assert!(reader.next().await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn split_after_parse_error_still_replies_to_an_accepted_close() {
+    use tokio::io::AsyncReadExt;
+    let (io, mut peer) = tokio::io::duplex(128);
+    let mut stream = WebSocketStream::client(io, config());
+    peer.write_all(b"\x82\x01a\x88\x02\x03\xe8\x83\x00")
+        .await
+        .unwrap();
+    assert_eq!(stream.next().await.unwrap().unwrap().as_bytes(), b"a");
+
+    let (mut reader, _writer) = stream.split();
+    assert!(reader.next().await.unwrap().unwrap().is_close());
+    let mut header = [0; 2];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        peer.read_exact(&mut header),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(header[0], 0x88);
+}

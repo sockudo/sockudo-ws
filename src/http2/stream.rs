@@ -42,14 +42,6 @@ pub struct Http2Stream {
     capacity_needed: usize,
 }
 
-impl Drop for Http2Stream {
-    fn drop(&mut self) {
-        // Close the send half before h2 drops the last stream references. Otherwise,
-        // h2 may reset the stream and discard DATA still queued by the handler.
-        let _ = self.send.send_data(Bytes::new(), true);
-    }
-}
-
 impl Http2Stream {
     /// Create a new Http2Stream from h2 send and receive streams
     pub fn new(send: SendStream<Bytes>, recv: RecvStream) -> Self {

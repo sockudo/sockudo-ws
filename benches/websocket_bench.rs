@@ -5,7 +5,7 @@
 use std::hint::black_box;
 
 use bytes::BytesMut;
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use sockudo_ws::frame::{FrameParser, OpCode, encode_frame};
 use sockudo_ws::simd::apply_mask;
@@ -107,10 +107,11 @@ fn bench_parse(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("masked", size), &frame_data, |b, data| {
             let mut parser = FrameParser::new(1024 * 1024, true);
 
-            b.iter(|| {
-                let mut buf = BytesMut::from(data.as_ref());
-                parser.parse(black_box(&mut buf)).unwrap()
-            });
+            b.iter_batched(
+                || BytesMut::from(data.as_ref()),
+                |mut buf| parser.parse(black_box(&mut buf)).unwrap(),
+                BatchSize::SmallInput,
+            );
         });
     }
 

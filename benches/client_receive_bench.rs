@@ -178,12 +178,19 @@ where
 }
 
 fn main() {
-    let args: Vec<_> = std::env::args().collect();
+    let mut args: Vec<_> = std::env::args().filter(|arg| arg != "--bench").collect();
+    if args.len() == 1 {
+        args.extend(["-", "tcp", "1", "16", "1", "0", "0", "typed"].map(str::to_owned));
+    }
     assert!(
         args.len() == 9 || (args.len() == 10 && args[9] == "trace"),
         "fixture tls|tcp connections count burst retain pause_us typed|boxed [trace]"
     );
-    let payload = std::fs::read(&args[1]).unwrap();
+    let payload = if args[1] == "-" {
+        br#"{"sequence":1,"value":42}"#.to_vec()
+    } else {
+        std::fs::read(&args[1]).unwrap()
+    };
     std::str::from_utf8(&payload).unwrap();
     assert!(!payload.is_empty());
     let tls = match args[2].as_str() {
