@@ -112,7 +112,7 @@ http3 = [
 ]
 
 # io_uring support (Linux only)
-io-uring = ["dep:tokio-uring"]
+io-uring = ["tokio-runtime", "dep:tokio-uring"]
 
 # All transport features
 all-transports = ["http2", "http3", "io-uring"]
