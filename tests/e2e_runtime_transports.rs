@@ -55,6 +55,7 @@ mod tokio_http2_e2e {
                     let msg = ws.next().await.unwrap().unwrap();
                     assert!(matches!(&msg, Message::Text(text) if text == "tokio-h2"));
                     ws.send(msg).await.unwrap();
+                    SinkExt::close(&mut ws).await.unwrap();
                 })
                 .await
                 .unwrap();
@@ -91,6 +92,7 @@ mod tokio_http2_e2e {
                     assert!(matches!(req.path.as_str(), "/one" | "/two"));
                     let msg = ws.next().await.unwrap().unwrap();
                     ws.send(msg).await.unwrap();
+                    SinkExt::close(&mut ws).await.unwrap();
                 })
                 .await
                 .unwrap();
@@ -350,6 +352,7 @@ mod compio_http1_e2e {
 
 #[cfg(all(feature = "compio-runtime", feature = "http2"))]
 mod compio_http2_e2e {
+    use compio::io::AsyncWrite;
     use sockudo_ws::compio::net::{TcpListener, TcpStream};
     use sockudo_ws::compio::{
         connect_http2, connect_http2_multiplexed, runtime, serve_http2, serve_http2_with_protocols,
@@ -373,6 +376,8 @@ mod compio_http2_e2e {
                     let msg = ws.next().await.unwrap().unwrap();
                     assert!(matches!(&msg, Message::Text(text) if text == "compio-h2"));
                     ws.send(msg).await.unwrap();
+                    ws.close(1000, "").await.unwrap();
+                    ws.get_mut().shutdown().await.unwrap();
                 },
             )
             .await
@@ -408,6 +413,8 @@ mod compio_http2_e2e {
                 assert!(matches!(req.path.as_str(), "/one" | "/two"));
                 let msg = ws.next().await.unwrap().unwrap();
                 ws.send(msg).await.unwrap();
+                ws.close(1000, "").await.unwrap();
+                ws.get_mut().shutdown().await.unwrap();
             })
             .await
             .unwrap();
