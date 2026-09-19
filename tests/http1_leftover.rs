@@ -92,7 +92,8 @@ async fn http1_split_client_replays_frame_read_with_upgrade_response() {
 #[tokio::test]
 async fn http1_server_replays_frame_read_with_upgrade_request() {
     let (mut client_io, server_io) = tokio::io::duplex(4096);
-    let request = build_request("example.com", "/ws", "dGhlIHNhbXBsZSBub25jZQ==", None, None);
+    let request =
+        build_request("example.com", "/ws", "dGhlIHNhbXBsZSBub25jZQ==", None, None).unwrap();
     let masked_text_frame = b"\x81\x85\x01\x02\x03\x04\x69\x67\x6f\x68\x6e";
     client_io.write_all(&request).await.unwrap();
     client_io.write_all(masked_text_frame).await.unwrap();
