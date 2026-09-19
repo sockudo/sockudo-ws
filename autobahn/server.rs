@@ -88,7 +88,7 @@ async fn handle_connection(mut stream: TcpStream) -> Result<()> {
 
             // Check for compression extension
             #[cfg(feature = "permessage-deflate")]
-            let extensions_response = if let Some(ext) = req.extensions.as_deref() {
+            let extensions_response = if let Some(ext) = req.extensions {
                 if DEBUG {
                     println!("Client requested extensions: {}", ext);
                 }
