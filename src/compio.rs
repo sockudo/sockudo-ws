@@ -1991,6 +1991,12 @@ async fn compio_split_writer_driver<W, E>(
                 }
             },
             CompioDriverWake::Timer => {
+                // The reader can publish activity while the old timer is asleep.
+                let observed_inbound = shared.last_inbound_ms.get();
+                if observed_inbound > last_synced_inbound_ms {
+                    last_synced_inbound_ms = observed_inbound;
+                    heartbeat.on_inbound(observed_inbound, None);
+                }
                 if closing_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
                     compio_terminate(&shared, &terminal_tx, CompioTerminalCause::ConnectionClosed);
                     break;
