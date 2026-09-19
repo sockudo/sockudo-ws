@@ -93,7 +93,7 @@ async fn run_benchmark(
 
     // Perform WebSocket handshake
     let key = generate_key();
-    let request = build_request(host, "/", &key, None, None);
+    let request = build_request(host, "/", &key, None, None)?;
     stream.write_all(&request).await?;
     stream.flush().await?;
 

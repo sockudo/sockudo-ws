@@ -156,8 +156,25 @@ pub fn generate_accept_key(key: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(hash)
 }
 
-/// Build a WebSocket upgrade response
-pub fn build_response(accept_key: &str, protocol: Option<&str>, extensions: Option<&str>) -> Bytes {
+/// Build a WebSocket upgrade response.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidHttp`] if a generated header value contains bytes
+/// that cannot appear in an HTTP field value.
+pub fn build_response(
+    accept_key: &str,
+    protocol: Option<&str>,
+    extensions: Option<&str>,
+) -> Result<Bytes> {
+    validate_header_value(accept_key, "invalid Sec-WebSocket-Accept")?;
+    if let Some(protocol) = protocol {
+        validate_header_value(protocol, "invalid Sec-WebSocket-Protocol")?;
+    }
+    if let Some(extensions) = extensions {
+        validate_header_value(extensions, "invalid Sec-WebSocket-Extensions")?;
+    }
+
     let mut buf = BytesMut::with_capacity(256);
 
     buf.put_slice(b"HTTP/1.1 101 Switching Protocols\r\n");
@@ -180,18 +197,26 @@ pub fn build_response(accept_key: &str, protocol: Option<&str>, extensions: Opti
     }
 
     buf.put_slice(b"\r\n");
-    buf.freeze()
+    Ok(buf.freeze())
 }
 
-/// Build a WebSocket upgrade request (client-side)
+/// Build a WebSocket upgrade request (client-side).
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidHttp`] if the request target or a generated header
+/// value contains bytes that could change the HTTP request structure.
 pub fn build_request(
     host: &str,
     path: &str,
     key: &str,
     protocol: Option<&str>,
     extensions: Option<&str>,
-) -> Bytes {
-    build_request_inner(host, path, key, protocol, extensions, None)
+) -> Result<Bytes> {
+    validate_request_fields(host, path, key, protocol, extensions)?;
+    Ok(build_request_inner(
+        host, path, key, protocol, extensions, None,
+    ))
 }
 
 /// Build a WebSocket upgrade request with additional HTTP headers.
@@ -202,8 +227,9 @@ pub fn build_request(
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidHttp`] if a header name or value is invalid, or if
-/// a custom header conflicts with a handshake-managed header.
+/// Returns [`Error::InvalidHttp`] if the request target or a header name or
+/// value is invalid, or if a custom header conflicts with a handshake-managed
+/// header.
 pub fn build_request_with_headers(
     host: &str,
     path: &str,
@@ -212,6 +238,7 @@ pub fn build_request_with_headers(
     extensions: Option<&str>,
     extra_headers: Option<&[(String, String)]>,
 ) -> Result<Bytes> {
+    validate_request_fields(host, path, key, protocol, extensions)?;
     if let Some(headers) = extra_headers {
         validate_extra_headers(headers)?;
     }
@@ -224,6 +251,35 @@ pub fn build_request_with_headers(
         extensions,
         extra_headers,
     ))
+}
+
+fn validate_request_fields(
+    host: &str,
+    path: &str,
+    key: &str,
+    protocol: Option<&str>,
+    extensions: Option<&str>,
+) -> Result<()> {
+    validate_header_value(host, "invalid Host")?;
+    if !path.bytes().all(is_request_target_byte) {
+        return Err(Error::InvalidHttp("invalid request target"));
+    }
+    validate_header_value(key, "invalid Sec-WebSocket-Key")?;
+    if let Some(protocol) = protocol {
+        validate_header_value(protocol, "invalid Sec-WebSocket-Protocol")?;
+    }
+    if let Some(extensions) = extensions {
+        validate_header_value(extensions, "invalid Sec-WebSocket-Extensions")?;
+    }
+    Ok(())
+}
+
+fn validate_header_value(value: &str, error: &'static str) -> Result<()> {
+    if value.bytes().all(is_header_value_byte) {
+        Ok(())
+    } else {
+        Err(Error::InvalidHttp(error))
+    }
 }
 
 fn validate_extra_headers(headers: &[(String, String)]) -> Result<()> {
@@ -251,6 +307,10 @@ fn is_header_value_byte(byte: u8) -> bool {
     // Keep HTTP/1 validation independent of the optional HTTP/2 and HTTP/3
     // `http` dependency. RFC 9110 permits HTAB, visible bytes, and obs-text.
     byte == b'\t' || (byte >= b' ' && byte != 0x7f)
+}
+
+fn is_request_target_byte(byte: u8) -> bool {
+    byte > b' ' && byte != 0x7f
 }
 
 fn is_header_name_byte(byte: u8) -> bool {
@@ -443,7 +503,7 @@ where
             let accept_key = generate_accept_key(req.key);
 
             // Build and send response
-            let response = build_response(&accept_key, req.protocol, None);
+            let response = build_response(&accept_key, req.protocol, None)?;
             stream.write_all(&response).await?;
             stream.flush().await?;
 
@@ -606,12 +666,42 @@ mod tests {
     #[test]
     fn test_build_response() {
         let accept = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
-        let response = build_response(accept, None, None);
+        let response = build_response(accept, None, None).unwrap();
 
         let response_str = std::str::from_utf8(&response).unwrap();
         assert!(response_str.contains("101 Switching Protocols"));
         assert!(response_str.contains("Upgrade: websocket"));
         assert!(response_str.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+    }
+
+    #[test]
+    fn request_builder_rejects_injected_lines() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let injected = "safe\r\nX-Injected: true";
+
+        for result in [
+            build_request(injected, "/ws", key, None, None),
+            build_request("example.com", "/ws\r\nX-Injected: true", key, None, None),
+            build_request("example.com", "/ws", injected, None, None),
+            build_request("example.com", "/ws", key, Some(injected), None),
+            build_request("example.com", "/ws", key, None, Some(injected)),
+        ] {
+            assert!(matches!(result, Err(Error::InvalidHttp(_))));
+        }
+    }
+
+    #[test]
+    fn response_builder_rejects_injected_headers() {
+        let accept = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+        let injected = "safe\r\nX-Injected: true";
+
+        for result in [
+            build_response(injected, None, None),
+            build_response(accept, Some(injected), None),
+            build_response(accept, None, Some(injected)),
+        ] {
+            assert!(matches!(result, Err(Error::InvalidHttp(_))));
+        }
     }
 
     #[test]
