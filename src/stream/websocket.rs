@@ -922,7 +922,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::split_transport::SplitTransport;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 const SPLIT_CONTROL_CAPACITY: usize = 32;
@@ -958,8 +958,8 @@ enum ControlRequest {
 
 #[derive(Debug)]
 enum ApplicationRequest {
-    Send(Message, oneshot::Sender<Result<()>>),
-    Flush(oneshot::Sender<Result<()>>),
+    Send(Message),
+    Flush,
 }
 
 // Outcomes of the driver's shared deadline/application poll.
@@ -1118,6 +1118,7 @@ pub struct SplitReader<S> {
 /// followed by a Close frame; pending peer Ping replies may be coalesced.
 pub struct SplitWriter<S> {
     application_tx: mpsc::Sender<ApplicationRequest>,
+    completion_rx: mpsc::Receiver<Result<()>>,
     shared: Arc<SplitShared>,
     _stream: PhantomData<fn() -> S>,
 }
@@ -1134,6 +1135,7 @@ where
         let (reader, writer) = SplitTransport::pair(self.inner);
         let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
         let (application_tx, application_rx) = mpsc::channel(SPLIT_APPLICATION_CAPACITY);
+        let (completion_tx, completion_rx) = mpsc::channel(1);
         let shared = SplitShared::new(self.state != StreamState::Open, &self.config);
         // Splitting must not reopen application writes after a known parse error.
         // A preceding accepted Close still needs its automatic response.
@@ -1161,6 +1163,7 @@ where
             self.config,
             control_rx,
             application_rx,
+            completion_tx,
             shared.clone(),
         ));
 
@@ -1180,6 +1183,7 @@ where
             },
             SplitWriter {
                 application_tx,
+                completion_rx,
                 shared,
                 _stream: PhantomData,
             },
@@ -1402,16 +1406,19 @@ impl<S> SplitWriter<S> {
             if !self.shared.is_open() {
                 return Err(self.current_error());
             }
-            let (tx, rx) = oneshot::channel();
             self.application_tx
-                .send(ApplicationRequest::Send(msg, tx))
+                .send(ApplicationRequest::Send(msg))
                 .await
                 .map_err(|_| self.current_error())?;
             let mut guard = SplitSendGuard {
                 shared: &self.shared,
                 completed: false,
             };
-            let result = rx.await.map_err(|_| self.current_error());
+            let result = self
+                .completion_rx
+                .recv()
+                .await
+                .ok_or_else(|| self.current_error());
             guard.completed = true;
             result?
         };
@@ -1447,16 +1454,19 @@ impl<S> SplitWriter<S> {
         if !self.shared.is_open() {
             return Err(self.current_error());
         }
-        let (tx, rx) = oneshot::channel();
         self.application_tx
-            .send(ApplicationRequest::Flush(tx))
+            .send(ApplicationRequest::Flush)
             .await
             .map_err(|_| self.current_error())?;
         let mut guard = SplitSendGuard {
             shared: &self.shared,
             completed: false,
         };
-        let result = rx.await.map_err(|_| self.current_error());
+        let result = self
+            .completion_rx
+            .recv()
+            .await
+            .ok_or_else(|| self.current_error());
         guard.completed = true;
         result?
     }
@@ -1486,6 +1496,7 @@ async fn split_writer_driver<S, E>(
     config: Config,
     mut control_rx: mpsc::Receiver<ControlRequest>,
     mut application_rx: mpsc::Receiver<ApplicationRequest>,
+    completion_tx: mpsc::Sender<Result<()>>,
     shared: Arc<SplitShared>,
 ) where
     S: AsyncWrite + Unpin,
@@ -1692,9 +1703,9 @@ async fn split_writer_driver<S, E>(
                     break;
                 };
                 match request {
-                    ApplicationRequest::Send(message, completion) => {
+                    ApplicationRequest::Send(message) => {
                         if !shared.is_open() {
-                            let _ = completion.send(Err(Error::ConnectionClosed));
+                            let _ = completion_tx.send(Err(Error::ConnectionClosed)).await;
                             continue;
                         }
                         let is_close = message.is_close();
@@ -1721,13 +1732,17 @@ async fn split_writer_driver<S, E>(
                             Err(error) => Err(error),
                         };
                         let failed = result.is_err();
-                        let _ = completion.send(result);
+                        // &mut writer permits one in-flight request. Its completion
+                        // is consumed before another request can be published, so
+                        // this connection-owned slot cannot be full. Cancellation
+                        // closes the connection instead of reusing an unread result.
+                        let _ = completion_tx.send(result).await;
                         if failed {
                             terminate(TerminalCause::ConnectionClosed);
                             break;
                         }
                     }
-                    ApplicationRequest::Flush(completion) => {
+                    ApplicationRequest::Flush => {
                         let result = await_split_write(
                             async { writer.flush().await.map_err(Into::into) },
                             &mut heartbeat,
@@ -1738,7 +1753,7 @@ async fn split_writer_driver<S, E>(
                             &mut closing,
                         ).await;
                         let failed = result.is_err();
-                        let _ = completion.send(result);
+                        let _ = completion_tx.send(result).await;
                         if failed {
                             terminate(TerminalCause::ConnectionClosed);
                             break;
@@ -2664,6 +2679,7 @@ pub struct CompressedSplitReader<S> {
 #[cfg(feature = "permessage-deflate")]
 pub struct CompressedSplitWriter<S> {
     application_tx: mpsc::Sender<ApplicationRequest>,
+    completion_rx: mpsc::Receiver<Result<()>>,
     shared: Arc<SplitShared>,
     _stream: PhantomData<fn() -> S>,
 }
@@ -2720,6 +2736,7 @@ where
 
         let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
         let (application_tx, application_rx) = mpsc::channel(SPLIT_APPLICATION_CAPACITY);
+        let (completion_tx, completion_rx) = mpsc::channel(1);
         let shared = SplitShared::new(self.state != StreamState::Open, &self.config);
         // Splitting must not reopen application writes after a known parse error.
         // A preceding accepted Close still needs its automatic response.
@@ -2746,6 +2763,7 @@ where
             self.config,
             control_rx,
             application_rx,
+            completion_tx,
             shared.clone(),
         ));
 
@@ -2765,6 +2783,7 @@ where
             },
             CompressedSplitWriter {
                 application_tx,
+                completion_rx,
                 shared,
                 _stream: PhantomData,
             },
@@ -2972,16 +2991,19 @@ impl<S> CompressedSplitWriter<S> {
             if !self.shared.is_open() {
                 return Err(self.current_error());
             }
-            let (tx, rx) = oneshot::channel();
             self.application_tx
-                .send(ApplicationRequest::Send(msg, tx))
+                .send(ApplicationRequest::Send(msg))
                 .await
                 .map_err(|_| self.current_error())?;
             let mut guard = SplitSendGuard {
                 shared: &self.shared,
                 completed: false,
             };
-            let result = rx.await.map_err(|_| self.current_error());
+            let result = self
+                .completion_rx
+                .recv()
+                .await
+                .ok_or_else(|| self.current_error());
             guard.completed = true;
             result?
         };
@@ -3020,16 +3042,19 @@ impl<S> CompressedSplitWriter<S> {
         if !self.shared.is_open() {
             return Err(self.current_error());
         }
-        let (tx, rx) = oneshot::channel();
         self.application_tx
-            .send(ApplicationRequest::Flush(tx))
+            .send(ApplicationRequest::Flush)
             .await
             .map_err(|_| self.current_error())?;
         let mut guard = SplitSendGuard {
             shared: &self.shared,
             completed: false,
         };
-        let result = rx.await.map_err(|_| self.current_error());
+        let result = self
+            .completion_rx
+            .recv()
+            .await
+            .ok_or_else(|| self.current_error());
         guard.completed = true;
         result?
     }
@@ -3648,13 +3673,10 @@ mod tests {
                 let (application_tx, application_rx) = mpsc::channel(SPLIT_APPLICATION_CAPACITY);
                 let shared = SplitShared::new(false, &config);
                 let mut terminal_rx = shared.terminal_tx.subscribe();
-                let (completion_tx, completion_rx) = oneshot::channel();
+                let (completion_tx, mut completion_rx) = mpsc::channel(1);
 
                 application_tx
-                    .send(ApplicationRequest::Send(
-                        Message::text("accepted"),
-                        completion_tx,
-                    ))
+                    .send(ApplicationRequest::Send(Message::text("accepted")))
                     .await
                     .unwrap();
                 let driver = tokio::spawn(split_writer_driver(
@@ -3665,10 +3687,11 @@ mod tests {
                     config,
                     control_rx,
                     application_rx,
+                    completion_tx,
                     shared,
                 ));
 
-                assert!(completion_rx.await.unwrap().is_ok());
+                assert!(completion_rx.recv().await.unwrap().is_ok());
                 let mut frames = [0; 5];
                 peer.read_exact(&mut frames).await.unwrap();
                 assert_eq!(frames, [0x82, 0x01, b'x', 0x88, 0x00]);

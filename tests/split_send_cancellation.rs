@@ -63,3 +63,46 @@ async fn dropping_unpolled_send_keeps_connection_open() {
     writer.send(Message::text("next")).await.unwrap();
     assert!(!writer.is_closed());
 }
+
+#[tokio::test]
+async fn cancellation_after_driver_completion_does_not_reopen_writer() {
+    let (io, mut peer) = tokio::io::duplex(128);
+    let config = Config::builder().auto_ping(false).idle_timeout(0).build();
+    let (_reader, mut writer) = WebSocketStream::server(io, config).split();
+    {
+        let send = writer.send(Message::binary(Bytes::from_static(b"a")));
+        tokio::pin!(send);
+        assert!(poll!(&mut send).is_pending());
+        // Reading the complete frame lets the driver finish before its result is consumed.
+        let mut frame = [0; 3];
+        peer.read_exact(&mut frame).await.unwrap();
+        assert_eq!(frame, [0x82, 1, b'a']);
+    }
+
+    assert!(matches!(writer.flush().await, Err(Error::ConnectionClosed)));
+    assert!(writer.is_closed());
+}
+
+#[cfg(feature = "permessage-deflate")]
+#[tokio::test]
+async fn compressed_cancellation_after_driver_completion_does_not_reopen_writer() {
+    let (io, mut peer) = tokio::io::duplex(128);
+    let config = Config::builder().auto_ping(false).idle_timeout(0).build();
+    let (_reader, mut writer) = sockudo_ws::CompressedWebSocketStream::server(
+        io,
+        config,
+        sockudo_ws::DeflateConfig::default(),
+    )
+    .split();
+    {
+        let send = writer.send(Message::Ping(Bytes::from_static(b"a")));
+        tokio::pin!(send);
+        assert!(poll!(&mut send).is_pending());
+        let mut frame = [0; 3];
+        peer.read_exact(&mut frame).await.unwrap();
+        assert_eq!(frame, [0x89, 1, b'a']);
+    }
+
+    assert!(matches!(writer.flush().await, Err(Error::ConnectionClosed)));
+    assert!(writer.is_closed());
+}
