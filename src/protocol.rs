@@ -270,6 +270,14 @@ enum State {
     Closed,
 }
 
+#[inline]
+fn ensure_message_size(size: usize, max_message_size: usize) -> Result<()> {
+    if size > max_message_size {
+        return Err(Error::MessageTooLarge);
+    }
+    Ok(())
+}
+
 /// WebSocket protocol handler
 ///
 /// Handles frame parsing, message assembly, and control frame processing.
@@ -469,6 +477,7 @@ impl Protocol {
 
         if frame.header.fin {
             // Complete message in one frame (fast path: one SIMD pass)
+            ensure_message_size(frame.payload.len(), self.max_message_size)?;
             let valid = if prevalidated == 0 {
                 validate_utf8(&frame.payload)
             } else {
@@ -495,6 +504,7 @@ impl Protocol {
 
         if frame.header.fin {
             // Complete message in one frame (fast path)
+            ensure_message_size(frame.payload.len(), self.max_message_size)?;
             Ok(Some(Message::Binary(frame.payload)))
         } else {
             // Start of fragmented message
@@ -510,6 +520,7 @@ impl Protocol {
         }
 
         if frame.header.fin {
+            ensure_message_size(frame.payload.len(), self.max_message_size)?;
             Ok(Some(RawMessage::Text(frame.payload)))
         } else {
             self.start_raw_fragment(OpCode::Text, frame.payload)?;
@@ -524,6 +535,7 @@ impl Protocol {
         }
 
         if frame.header.fin {
+            ensure_message_size(frame.payload.len(), self.max_message_size)?;
             Ok(Some(RawMessage::Binary(frame.payload)))
         } else {
             self.start_raw_fragment(OpCode::Binary, frame.payload)?;
@@ -932,6 +944,7 @@ impl CompressedProtocol {
                 self.deflate
                     .decompress(&frame.payload, self.inner.max_message_size)?
             } else {
+                ensure_message_size(frame.payload.len(), self.inner.max_message_size)?;
                 frame.payload
             };
 
@@ -977,6 +990,7 @@ impl CompressedProtocol {
                 self.deflate
                     .decompress(&frame.payload, self.inner.max_message_size)?
             } else {
+                ensure_message_size(frame.payload.len(), self.inner.max_message_size)?;
                 frame.payload
             };
             Ok(Some(Message::Binary(payload)))
@@ -1229,6 +1243,7 @@ impl CompressedReaderProtocol {
                 self.decoder
                     .decompress(&frame.payload, self.max_message_size)?
             } else {
+                ensure_message_size(frame.payload.len(), self.max_message_size)?;
                 frame.payload
             };
 
@@ -1254,6 +1269,7 @@ impl CompressedReaderProtocol {
                 self.decoder
                     .decompress(&frame.payload, self.max_message_size)?
             } else {
+                ensure_message_size(frame.payload.len(), self.max_message_size)?;
                 frame.payload
             };
             Ok(Some(Message::Binary(payload)))
