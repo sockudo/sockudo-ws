@@ -3,6 +3,14 @@
 //! This module provides WebSocket bootstrapping over HTTP/3 using QUIC,
 //! implementing the Extended CONNECT Protocol defined in RFC 9220.
 //!
+//! # Interoperability limitation
+//!
+//! The pinned h3 0.0.8 release cannot represent `:protocol=websocket`. The
+//! built-in endpoints currently use a `webtransport` protocol label and require
+//! the peer to accept that same nonstandard convention. They do not interoperate
+//! with a strict RFC 9220 endpoint. Correcting the label also requires updating
+//! h3 consistently across the QUIC and runtime integrations.
+//!
 //! # RFC 9220 Compliance
 //!
 //! This implementation follows RFC 9220 "Bootstrapping WebSockets with HTTP/3":
@@ -26,14 +34,13 @@
 //! ├─────────────────────────────────────────┤
 //! │              QUIC Transport              │
 //! │    (multiplexed streams over UDP)        │
-//! │    Uses io_uring on Linux automatically  │
+//! │       Runtime-provided UDP socket        │
 //! └─────────────────────────────────────────┘
 //! ```
 //!
 //! # Benefits of HTTP/3 WebSocket
 //!
 //! - **No head-of-line blocking**: Each WebSocket stream is independent
-//! - **Faster connection setup**: 0-RTT support for returning clients
 //! - **Better mobile performance**: Handles network changes gracefully
 //! - **Multiplexing**: Multiple WebSocket connections over one QUIC connection
 //! - **Built-in encryption**: TLS 1.3 is mandatory in QUIC
@@ -98,11 +105,11 @@
 //! }
 //! ```
 //!
-//! # io_uring Integration
+//! # Runtime integration
 //!
-//! The `quinn` crate (QUIC implementation) automatically uses io_uring
-//! on Linux when available, providing optimal performance without
-//! any extra configuration.
+//! This implementation uses Quinn's Tokio runtime integration. The
+//! sockudo-ws `io-uring` feature only provides a TCP adapter and does not
+//! change the HTTP/3 UDP transport.
 
 #[cfg(feature = "tokio-runtime")]
 pub mod stream;
@@ -141,3 +148,44 @@ pub const PROTOCOL_WEBSOCKET: &str = "websocket";
 /// Used when closing a WebSocket connection abnormally, analogous to
 /// TCP RST in RFC 6455.
 pub const H3_REQUEST_CANCELLED: u64 = 0x10c;
+
+pub(crate) fn validate_config(config: &crate::Http3Config) -> crate::Result<()> {
+    if config.enable_0rtt {
+        return Err(crate::Error::Http3(
+            "HTTP/3 0-RTT is not supported by the built-in client or server".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+pub(crate) fn quic_transport_config(
+    config: &crate::Http3Config,
+) -> crate::Result<std::sync::Arc<quinn::TransportConfig>> {
+    validate_config(config)?;
+
+    let idle_timeout = quinn::VarInt::from_u64(config.max_idle_timeout_ms)
+        .map_err(|_| crate::Error::Http3("HTTP/3 idle timeout exceeds QUIC limits".to_string()))?;
+    let stream_window = quinn::VarInt::from_u64(config.initial_stream_window_size)
+        .map_err(|_| crate::Error::Http3("HTTP/3 stream window exceeds QUIC limits".to_string()))?;
+
+    let mut transport = quinn::TransportConfig::default();
+    transport
+        .max_idle_timeout(Some(idle_timeout.into()))
+        .stream_receive_window(stream_window);
+    Ok(std::sync::Arc::new(transport))
+}
+
+pub(crate) fn quic_endpoint_config(
+    config: &crate::Http3Config,
+) -> crate::Result<quinn::EndpointConfig> {
+    let mut endpoint = quinn::EndpointConfig::default();
+    endpoint
+        .max_udp_payload_size(config.max_udp_payload_size)
+        .map_err(|_| {
+            crate::Error::Http3(
+                "HTTP/3 maximum UDP payload size must be between 1200 and 65527 bytes".to_string(),
+            )
+        })?;
+    Ok(endpoint)
+}

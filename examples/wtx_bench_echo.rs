@@ -43,7 +43,7 @@ async fn handle_connection(mut stream: TcpStream) -> sockudo_ws::Result<()> {
 
         if let Some((req, consumed)) = parse_request(&read_buf)? {
             let accept_key = generate_accept_key(req.key);
-            let response = build_response(&accept_key, None, None);
+            let response = build_response(&accept_key, None, None)?;
             stream.write_all(&response).await?;
             read_buf.advance(consumed);
             break;

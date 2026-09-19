@@ -3,7 +3,7 @@
 //! This module provides an ultra-fast topic-based publish/subscribe system
 //! inspired by uWebSockets, designed for maximum throughput with:
 //!
-//! - **DashMap/DashSet**: Lock-free concurrent hash maps for minimal contention
+//! - **Linearized membership state**: Subscriber, socket, and topic indexes stay consistent
 //! - **Lock-free subscriber IDs**: Atomic allocation of subscriber identifiers
 //! - **Zero-copy messages**: Uses `Bytes` for efficient message sharing
 //! - **Pusher-style string IDs**: Optional string-based subscriber identifiers
@@ -65,10 +65,10 @@
 //! pubsub.remove_subscriber_by_socket_id(socket_id);
 //! ```
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use dashmap::{DashMap, DashSet};
+use parking_lot::RwLock;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::protocol::Message;
@@ -125,20 +125,31 @@ struct Subscriber {
     /// Channel for sending messages to this subscriber
     sender: UnboundedSender<Message>,
     /// Topics this subscriber is subscribed to (for cleanup)
-    topics: DashSet<String>,
+    topics: HashSet<String>,
     /// Optional Pusher-style socket ID (e.g., "1234.5678")
     socket_id: Option<String>,
+}
+
+#[derive(Default)]
+struct PubSubData {
+    /// Topics mapped to their subscriber sets
+    topics: HashMap<String, HashSet<SubscriberId>>,
+    /// All subscribers indexed by ID
+    subscribers: HashMap<SubscriberId, Subscriber>,
+    /// Socket ID to SubscriberId mapping (for Pusher-style IDs)
+    socket_id_map: HashMap<String, SubscriberId>,
 }
 
 /// High-performance pub/sub state
 ///
 /// This is the main entry point for the pub/sub system. It manages
-/// topics, subscribers, and message delivery with minimal locking.
+/// topics, subscribers, and message delivery while keeping all indexes consistent.
 ///
 /// # Thread Safety
 ///
-/// `PubSub` is fully thread-safe and can be shared across async tasks.
-/// It uses `DashMap` and `DashSet` for lock-free concurrent access.
+/// `PubSub` is fully thread-safe and can be shared across async tasks. Membership
+/// changes are linearized through one state lock. Publishing snapshots recipient
+/// senders under a read lock and performs channel sends after releasing the lock.
 ///
 /// # Subscriber ID Modes
 ///
@@ -151,16 +162,10 @@ struct Subscriber {
 ///    Use `create_subscriber_with_id()` for this mode. String IDs are mapped
 ///    to internal numeric IDs for efficient lookup.
 pub struct PubSub {
-    /// Topics mapped to their subscriber sets
-    topics: DashMap<String, DashSet<SubscriberId>>,
-    /// All subscribers indexed by ID
-    subscribers: DashMap<SubscriberId, Arc<Subscriber>>,
-    /// Socket ID to SubscriberId mapping (for Pusher-style IDs)
-    socket_id_map: DashMap<String, SubscriberId>,
+    /// Authoritative subscriber, socket ID, and topic membership state
+    state: RwLock<PubSubData>,
     /// Next subscriber ID (atomic counter)
     next_subscriber_id: AtomicU64,
-    /// Total number of active subscribers
-    subscriber_count: AtomicUsize,
     /// Total messages published (for stats)
     messages_published: AtomicU64,
 }
@@ -172,13 +177,115 @@ impl PubSub {
     /// Create a new pub/sub system
     pub fn new() -> Self {
         Self {
-            topics: DashMap::new(),
-            subscribers: DashMap::new(),
-            socket_id_map: DashMap::new(),
+            state: RwLock::new(PubSubData::default()),
             next_subscriber_id: AtomicU64::new(1),
-            subscriber_count: AtomicUsize::new(0),
             messages_published: AtomicU64::new(0),
         }
+    }
+
+    fn insert_subscriber(
+        data: &mut PubSubData,
+        id: SubscriberId,
+        sender: UnboundedSender<Message>,
+        socket_id: Option<&str>,
+    ) {
+        let socket_id = socket_id.map(str::to_owned);
+        let subscriber = Subscriber {
+            sender,
+            topics: HashSet::new(),
+            socket_id: socket_id.clone(),
+        };
+
+        let previous = data.subscribers.insert(id, subscriber);
+        debug_assert!(previous.is_none(), "subscriber IDs must be unique");
+
+        if let Some(socket_id) = socket_id {
+            // Insert into socket_id_map
+            let previous = data.socket_id_map.insert(socket_id, id);
+            debug_assert!(previous.is_none(), "socket IDs must be unique");
+        }
+    }
+
+    fn remove_subscriber_from(data: &mut PubSubData, id: SubscriberId) -> bool {
+        // Get the subscriber
+        let Some(subscriber) = data.subscribers.remove(&id) else {
+            return false;
+        };
+
+        // Remove from socket_id_map if present
+        if let Some(socket_id) = subscriber.socket_id {
+            let removed = data.socket_id_map.remove(&socket_id);
+            debug_assert_eq!(removed, Some(id), "socket ID index must match subscriber");
+        }
+
+        // Unsubscribe from all topics
+        for topic in subscriber.topics {
+            let remove_topic = {
+                let topic_subscribers = data
+                    .topics
+                    .get_mut(&topic)
+                    .expect("subscriber topic must exist in topic index");
+                let removed = topic_subscribers.remove(&id);
+                debug_assert!(removed, "topic index must contain subscriber");
+                topic_subscribers.is_empty()
+            };
+
+            if remove_topic {
+                // Remove empty topics
+                data.topics.remove(&topic);
+            }
+        }
+
+        true
+    }
+
+    fn subscribe_in(data: &mut PubSubData, id: SubscriberId, topic: &str) -> bool {
+        // Add topic to subscriber's set
+        let Some(subscriber) = data.subscribers.get_mut(&id) else {
+            // Subscriber doesn't exist
+            return false;
+        };
+
+        if !subscriber.topics.insert(topic.to_owned()) {
+            // Already subscribed
+            return false;
+        }
+
+        // Add subscriber to topic
+        let inserted = data.topics.entry(topic.to_owned()).or_default().insert(id);
+        debug_assert!(
+            inserted,
+            "subscriber topic index must be updated atomically"
+        );
+        true
+    }
+
+    fn unsubscribe_in(data: &mut PubSubData, id: SubscriberId, topic: &str) -> bool {
+        // Remove topic from subscriber's set
+        let Some(subscriber) = data.subscribers.get_mut(&id) else {
+            return false;
+        };
+
+        if !subscriber.topics.remove(topic) {
+            return false;
+        }
+
+        let remove_topic = {
+            let topic_subscribers = data
+                .topics
+                .get_mut(topic)
+                .expect("subscriber topic must exist in topic index");
+            let removed = topic_subscribers.remove(&id);
+            debug_assert!(removed, "topic index must contain subscriber");
+            topic_subscribers.is_empty()
+        };
+
+        if remove_topic {
+            // Remove empty topics
+            data.topics.remove(topic);
+        }
+
+        true
     }
 
     // =========================================================================
@@ -198,15 +305,7 @@ impl PubSub {
     /// A unique `SubscriberId` for this subscriber
     pub fn create_subscriber(&self, sender: UnboundedSender<Message>) -> SubscriberId {
         let id = SubscriberId(self.next_subscriber_id.fetch_add(1, Ordering::Relaxed));
-
-        let subscriber = Arc::new(Subscriber {
-            sender,
-            topics: DashSet::new(),
-            socket_id: None,
-        });
-
-        self.subscribers.insert(id, subscriber);
-        self.subscriber_count.fetch_add(1, Ordering::Relaxed);
+        Self::insert_subscriber(&mut self.state.write(), id, sender, None);
 
         id
     }
@@ -215,21 +314,7 @@ impl PubSub {
     ///
     /// This should be called when a WebSocket connection closes.
     pub fn remove_subscriber(&self, id: SubscriberId) {
-        // Get the subscriber
-        let subscriber = self.subscribers.remove(&id);
-
-        if let Some((_, sub)) = subscriber {
-            // Remove from socket_id_map if present
-            if let Some(ref socket_id) = sub.socket_id {
-                self.socket_id_map.remove(socket_id);
-            }
-
-            // Unsubscribe from all topics
-            for topic in sub.topics.iter() {
-                self.unsubscribe_internal(id, topic.key());
-            }
-            self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
-        }
+        Self::remove_subscriber_from(&mut self.state.write(), id);
     }
 
     // =========================================================================
@@ -279,22 +364,15 @@ impl PubSub {
         socket_id: &str,
         sender: UnboundedSender<Message>,
     ) -> SubscriberId {
-        let id = SubscriberId(self.next_subscriber_id.fetch_add(1, Ordering::Relaxed));
-
-        let subscriber = Arc::new(Subscriber {
-            sender,
-            topics: DashSet::new(),
-            socket_id: Some(socket_id.to_string()),
-        });
-
-        // Insert into socket_id_map
-        if self.socket_id_map.contains_key(socket_id) {
+        let mut data = self.state.write();
+        // Check if already exists
+        if data.socket_id_map.contains_key(socket_id) {
             panic!("Socket ID '{}' is already in use", socket_id);
         }
-        self.socket_id_map.insert(socket_id.to_string(), id);
 
-        self.subscribers.insert(id, subscriber);
-        self.subscriber_count.fetch_add(1, Ordering::Relaxed);
+        // Create new subscriber
+        let id = SubscriberId(self.next_subscriber_id.fetch_add(1, Ordering::Relaxed));
+        Self::insert_subscriber(&mut data, id, sender, Some(socket_id));
 
         id
     }
@@ -312,33 +390,15 @@ impl PubSub {
         socket_id: &str,
         sender: UnboundedSender<Message>,
     ) -> (SubscriberId, bool) {
+        let mut data = self.state.write();
         // Check if already exists
-        if let Some(entry) = self.socket_id_map.get(socket_id) {
-            return (*entry.value(), false);
+        if let Some(id) = data.socket_id_map.get(socket_id) {
+            return (*id, false);
         }
 
         // Create new subscriber
         let id = SubscriberId(self.next_subscriber_id.fetch_add(1, Ordering::Relaxed));
-
-        let subscriber = Arc::new(Subscriber {
-            sender,
-            topics: DashSet::new(),
-            socket_id: Some(socket_id.to_string()),
-        });
-
-        // Try to insert - handle race condition
-        match self.socket_id_map.entry(socket_id.to_string()) {
-            dashmap::mapref::entry::Entry::Occupied(entry) => {
-                // Race condition: someone else created it
-                return (*entry.get(), false);
-            }
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                entry.insert(id);
-            }
-        }
-
-        self.subscribers.insert(id, subscriber);
-        self.subscriber_count.fetch_add(1, Ordering::Relaxed);
+        Self::insert_subscriber(&mut data, id, sender, Some(socket_id));
 
         (id, true)
     }
@@ -353,7 +413,7 @@ impl PubSub {
     ///
     /// The `SubscriberId` if found, or `None`
     pub fn get_subscriber_by_socket_id(&self, socket_id: &str) -> Option<SubscriberId> {
-        self.socket_id_map.get(socket_id).map(|r| *r.value())
+        self.state.read().socket_id_map.get(socket_id).copied()
     }
 
     /// Get the socket ID for a subscriber
@@ -366,9 +426,11 @@ impl PubSub {
     ///
     /// The socket ID if the subscriber has one, or `None`
     pub fn get_socket_id(&self, id: SubscriberId) -> Option<String> {
-        self.subscribers
+        self.state
+            .read()
+            .subscribers
             .get(&id)
-            .and_then(|sub| sub.socket_id.clone())
+            .and_then(|subscriber| subscriber.socket_id.clone())
     }
 
     /// Remove a subscriber by its socket ID
@@ -381,12 +443,12 @@ impl PubSub {
     ///
     /// `true` if the subscriber was removed, `false` if not found
     pub fn remove_subscriber_by_socket_id(&self, socket_id: &str) -> bool {
-        if let Some(id) = self.get_subscriber_by_socket_id(socket_id) {
-            self.remove_subscriber(id);
-            true
-        } else {
-            false
-        }
+        let mut data = self.state.write();
+        let Some(id) = data.socket_id_map.get(socket_id).copied() else {
+            return false;
+        };
+
+        Self::remove_subscriber_from(&mut data, id)
     }
 
     /// Subscribe to a topic using socket ID
@@ -400,11 +462,12 @@ impl PubSub {
     ///
     /// `true` if newly subscribed, `false` if already subscribed or subscriber not found
     pub fn subscribe_by_socket_id(&self, socket_id: &str, topic: &str) -> bool {
-        if let Some(id) = self.get_subscriber_by_socket_id(socket_id) {
-            self.subscribe(id, topic)
-        } else {
-            false
-        }
+        let mut data = self.state.write();
+        let Some(id) = data.socket_id_map.get(socket_id).copied() else {
+            return false;
+        };
+
+        Self::subscribe_in(&mut data, id, topic)
     }
 
     /// Unsubscribe from a topic using socket ID
@@ -418,11 +481,12 @@ impl PubSub {
     ///
     /// `true` if was subscribed, `false` if wasn't subscribed or subscriber not found
     pub fn unsubscribe_by_socket_id(&self, socket_id: &str, topic: &str) -> bool {
-        if let Some(id) = self.get_subscriber_by_socket_id(socket_id) {
-            self.unsubscribe(id, topic)
-        } else {
-            false
-        }
+        let mut data = self.state.write();
+        let Some(id) = data.socket_id_map.get(socket_id).copied() else {
+            return false;
+        };
+
+        Self::unsubscribe_in(&mut data, id, topic)
     }
 
     /// Publish a message excluding a subscriber by socket ID
@@ -442,30 +506,38 @@ impl PubSub {
         topic: &str,
         message: Message,
     ) -> PublishResult {
-        if let Some(id) = self.get_subscriber_by_socket_id(socket_id) {
-            self.publish_excluding(id, topic, message)
-        } else {
-            // Socket ID not found, publish to all
-            self.publish(topic, message)
-        }
+        let data = self.state.read();
+        // Socket ID not found means publish to all subscribers.
+        let exclude = data.socket_id_map.get(socket_id).copied();
+        let recipients = Self::recipient_snapshot(&data, topic, exclude);
+        drop(data);
+
+        self.send_to_recipients(recipients, message)
     }
 
     /// Check if a socket ID is subscribed to a topic
     pub fn is_subscribed_by_socket_id(&self, socket_id: &str, topic: &str) -> bool {
-        if let Some(id) = self.get_subscriber_by_socket_id(socket_id) {
-            self.is_subscribed(id, topic)
-        } else {
-            false
-        }
+        let data = self.state.read();
+        let Some(id) = data.socket_id_map.get(socket_id) else {
+            return false;
+        };
+
+        data.subscribers
+            .get(id)
+            .is_some_and(|subscriber| subscriber.topics.contains(topic))
     }
 
     /// Get all topics a subscriber is subscribed to by socket ID
     pub fn subscriber_topics_by_socket_id(&self, socket_id: &str) -> Vec<String> {
-        if let Some(id) = self.get_subscriber_by_socket_id(socket_id) {
-            self.subscriber_topics(id)
-        } else {
-            Vec::new()
-        }
+        let data = self.state.read();
+        let Some(id) = data.socket_id_map.get(socket_id) else {
+            return Vec::new();
+        };
+
+        data.subscribers
+            .get(id)
+            .map(|subscriber| subscriber.topics.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     // =========================================================================
@@ -485,19 +557,7 @@ impl PubSub {
     ///
     /// `true` if newly subscribed, `false` if already subscribed
     pub fn subscribe(&self, id: SubscriberId, topic: &str) -> bool {
-        // Add topic to subscriber's set
-        let subscriber = self.subscribers.get(&id);
-
-        if let Some(sub) = subscriber {
-            if !sub.topics.insert(topic.to_string()) {
-                return false; // Already subscribed
-            }
-        } else {
-            return false; // Subscriber doesn't exist
-        }
-
-        // Add subscriber to topic
-        self.topics.entry(topic.to_string()).or_default().insert(id)
+        Self::subscribe_in(&mut self.state.write(), id, topic)
     }
 
     /// Unsubscribe from a topic
@@ -511,26 +571,7 @@ impl PubSub {
     ///
     /// `true` if was subscribed, `false` if wasn't subscribed
     pub fn unsubscribe(&self, id: SubscriberId, topic: &str) -> bool {
-        // Remove topic from subscriber's set
-        if let Some(sub) = self.subscribers.get(&id) {
-            sub.topics.remove(topic);
-        }
-
-        self.unsubscribe_internal(id, topic)
-    }
-
-    /// Internal unsubscribe (doesn't update subscriber's topic set)
-    fn unsubscribe_internal(&self, id: SubscriberId, topic: &str) -> bool {
-        let mut removed = false;
-
-        if let Some(topic_subs) = self.topics.get(topic) {
-            removed = topic_subs.remove(&id).is_some();
-        }
-
-        // Remove empty topics
-        self.topics.remove_if(topic, |_, subs| subs.is_empty());
-
-        removed
+        Self::unsubscribe_in(&mut self.state.write(), id, topic)
     }
 
     // =========================================================================
@@ -540,6 +581,9 @@ impl PubSub {
     /// Publish a message to all subscribers of a topic
     ///
     /// The message is cloned for each subscriber (zero-copy due to `Bytes`).
+    /// Recipients are snapshotted atomically with membership changes, then sent
+    /// outside the state lock. A concurrent removal ordered after that snapshot
+    /// does not cancel delivery already selected by this publish operation.
     ///
     /// # Arguments
     ///
@@ -550,7 +594,8 @@ impl PubSub {
     ///
     /// Result indicating how many subscribers received the message
     pub fn publish(&self, topic: &str, message: Message) -> PublishResult {
-        self.publish_impl(topic, message, None)
+        let recipients = Self::recipient_snapshot(&self.state.read(), topic, None);
+        self.send_to_recipients(recipients, message)
     }
 
     /// Publish a message to all subscribers except one
@@ -573,39 +618,45 @@ impl PubSub {
         topic: &str,
         message: Message,
     ) -> PublishResult {
-        self.publish_impl(topic, message, Some(exclude))
+        let recipients = Self::recipient_snapshot(&self.state.read(), topic, Some(exclude));
+        self.send_to_recipients(recipients, message)
     }
 
-    /// Internal publish implementation
-    fn publish_impl(
-        &self,
+    fn recipient_snapshot(
+        data: &PubSubData,
         topic: &str,
-        message: Message,
         exclude: Option<SubscriberId>,
+    ) -> Option<Vec<UnboundedSender<Message>>> {
+        let topic_subscribers = data.topics.get(topic)?;
+        let recipients = topic_subscribers
+            .iter()
+            .filter(|id| Some(**id) != exclude)
+            .map(|id| {
+                data.subscribers
+                    .get(id)
+                    .expect("topic index must reference an active subscriber")
+                    .sender
+                    .clone()
+            })
+            .collect();
+
+        Some(recipients)
+    }
+
+    fn send_to_recipients(
+        &self,
+        recipients: Option<Vec<UnboundedSender<Message>>>,
+        message: Message,
     ) -> PublishResult {
-        let topic_subs = match self.topics.get(topic) {
-            Some(t) => t,
-            None => return PublishResult::NoSubscribers,
+        let Some(recipients) = recipients else {
+            return PublishResult::NoSubscribers;
         };
 
-        if topic_subs.is_empty() {
-            return PublishResult::NoSubscribers;
-        }
-
         let mut sent = 0;
-
-        for sub_id in topic_subs.iter() {
-            let sub_id = *sub_id.key();
-
-            if Some(sub_id) == exclude {
-                continue;
-            }
-
-            if let Some(subscriber) = self.subscribers.get(&sub_id) {
-                // Clone is O(1) for Message because it uses Bytes internally
-                if subscriber.sender.send(message.clone()).is_ok() {
-                    sent += 1;
-                }
+        for sender in recipients {
+            // Clone is O(1) for Message because it uses Bytes internally
+            if sender.send(message.clone()).is_ok() {
+                sent += 1;
             }
         }
 
@@ -624,25 +675,31 @@ impl PubSub {
 
     /// Check if a subscriber is subscribed to a topic
     pub fn is_subscribed(&self, id: SubscriberId, topic: &str) -> bool {
-        self.topics
-            .get(topic)
-            .map(|t| t.contains(&id))
-            .unwrap_or(false)
+        self.state
+            .read()
+            .subscribers
+            .get(&id)
+            .is_some_and(|subscriber| subscriber.topics.contains(topic))
     }
 
     /// Get the number of subscribers to a topic
     pub fn topic_subscriber_count(&self, topic: &str) -> usize {
-        self.topics.get(topic).map(|t| t.len()).unwrap_or(0)
+        self.state
+            .read()
+            .topics
+            .get(topic)
+            .map(HashSet::len)
+            .unwrap_or(0)
     }
 
     /// Get the total number of topics (with at least one subscriber)
     pub fn topic_count(&self) -> usize {
-        self.topics.len()
+        self.state.read().topics.len()
     }
 
     /// Get the total number of subscribers
     pub fn subscriber_count(&self) -> usize {
-        self.subscriber_count.load(Ordering::Relaxed)
+        self.state.read().subscribers.len()
     }
 
     /// Get the total number of messages published
@@ -652,25 +709,27 @@ impl PubSub {
 
     /// Get all topics a subscriber is subscribed to
     pub fn subscriber_topics(&self, id: SubscriberId) -> Vec<String> {
-        self.subscribers
+        self.state
+            .read()
+            .subscribers
             .get(&id)
-            .map(|sub| sub.topics.iter().map(|t| t.key().clone()).collect())
+            .map(|subscriber| subscriber.topics.iter().cloned().collect())
             .unwrap_or_default()
     }
 
     /// Get all topic names in the system
     pub fn all_topics(&self) -> Vec<String> {
-        self.topics.iter().map(|e| e.key().clone()).collect()
+        self.state.read().topics.keys().cloned().collect()
     }
 
     /// Get all socket IDs in the system
     pub fn all_socket_ids(&self) -> Vec<String> {
-        self.socket_id_map.iter().map(|e| e.key().clone()).collect()
+        self.state.read().socket_id_map.keys().cloned().collect()
     }
 
     /// Check if a socket ID exists
     pub fn has_socket_id(&self, socket_id: &str) -> bool {
-        self.socket_id_map.contains_key(socket_id)
+        self.state.read().socket_id_map.contains_key(socket_id)
     }
 }
 
@@ -683,7 +742,46 @@ impl Default for PubSub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
     use tokio::sync::mpsc;
+
+    fn assert_consistent(pubsub: &PubSub) {
+        let data = pubsub.state.read();
+
+        for (id, subscriber) in &data.subscribers {
+            if let Some(socket_id) = &subscriber.socket_id {
+                assert_eq!(data.socket_id_map.get(socket_id), Some(id));
+            }
+
+            for topic in &subscriber.topics {
+                assert!(
+                    data.topics
+                        .get(topic)
+                        .is_some_and(|subscribers| subscribers.contains(id))
+                );
+            }
+        }
+
+        for (socket_id, id) in &data.socket_id_map {
+            assert_eq!(
+                data.subscribers
+                    .get(id)
+                    .and_then(|subscriber| subscriber.socket_id.as_ref()),
+                Some(socket_id)
+            );
+        }
+
+        for (topic, subscribers) in &data.topics {
+            assert!(!subscribers.is_empty());
+            for id in subscribers {
+                assert!(
+                    data.subscribers
+                        .get(id)
+                        .is_some_and(|subscriber| subscriber.topics.contains(topic))
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_subscriber_lifecycle() {
@@ -794,7 +892,7 @@ mod tests {
     fn test_many_topics() {
         let pubsub = PubSub::new();
 
-        // Create many topics to test DashMap performance
+        // Create many topics to exercise the membership indexes
         let (tx, _rx) = mpsc::unbounded_channel();
         let id = pubsub.create_subscriber(tx);
 
@@ -922,6 +1020,140 @@ mod tests {
 
         // Only one subscriber
         assert_eq!(pubsub.subscriber_count(), 1);
+    }
+
+    #[test]
+    fn concurrent_duplicate_socket_id_creates_exactly_one_subscriber() {
+        let pubsub = Arc::new(PubSub::new());
+        let barrier = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let pubsub = Arc::clone(&pubsub);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let (tx, _rx) = mpsc::unbounded_channel();
+                    barrier.wait();
+                    pubsub.create_subscriber_with_id("1234.5678", tx)
+                })
+            })
+            .collect();
+
+        barrier.wait();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(std::thread::JoinHandle::join)
+            .collect();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert_eq!(pubsub.subscriber_count(), 1);
+        assert_consistent(&pubsub);
+    }
+
+    #[test]
+    fn concurrent_idempotent_socket_id_creation_returns_one_subscriber() {
+        let pubsub = Arc::new(PubSub::new());
+        let barrier = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let pubsub = Arc::clone(&pubsub);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let (tx, _rx) = mpsc::unbounded_channel();
+                    barrier.wait();
+                    pubsub.create_subscriber_with_id_or_get("1234.5678", tx)
+                })
+            })
+            .collect();
+
+        barrier.wait();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("creation thread must not panic"))
+            .collect();
+
+        assert!(results[0].0 == results[1].0);
+        assert_eq!(results.iter().filter(|(_, created)| *created).count(), 1);
+        assert_eq!(pubsub.subscriber_count(), 1);
+        assert_consistent(&pubsub);
+    }
+
+    #[test]
+    fn concurrent_membership_changes_and_removal_leave_no_stale_indexes() {
+        let pubsub = Arc::new(PubSub::new());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let id = pubsub.create_subscriber(tx);
+        let barrier = Arc::new(Barrier::new(4));
+        let mut handles = Vec::new();
+
+        for _ in 0..2 {
+            let pubsub = Arc::clone(&pubsub);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..1_000 {
+                    pubsub.subscribe(id, "topic");
+                    std::thread::yield_now();
+                    pubsub.unsubscribe(id, "topic");
+                }
+            }));
+        }
+
+        let remover = {
+            let pubsub = Arc::clone(&pubsub);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                pubsub.remove_subscriber(id);
+            })
+        };
+
+        barrier.wait();
+        for handle in handles {
+            handle.join().expect("membership thread must not panic");
+        }
+        remover.join().expect("removal thread must not panic");
+
+        assert_eq!(pubsub.subscriber_count(), 0);
+        assert_eq!(pubsub.topic_count(), 0);
+        assert_consistent(&pubsub);
+    }
+
+    #[test]
+    fn concurrent_publish_and_removal_follow_snapshot_order() {
+        let pubsub = Arc::new(PubSub::new());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let id = pubsub.create_subscriber(tx);
+        pubsub.subscribe(id, "topic");
+        let barrier = Arc::new(Barrier::new(3));
+
+        let publisher = {
+            let pubsub = Arc::clone(&pubsub);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                pubsub.publish("topic", Message::text("message"))
+            })
+        };
+        let remover = {
+            let pubsub = Arc::clone(&pubsub);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                pubsub.remove_subscriber(id);
+            })
+        };
+
+        barrier.wait();
+        let result = publisher.join().expect("publish thread must not panic");
+        remover.join().expect("removal thread must not panic");
+
+        match result {
+            PublishResult::Published(1) => assert!(rx.try_recv().is_ok()),
+            PublishResult::NoSubscribers => assert!(rx.try_recv().is_err()),
+            PublishResult::Published(count) => panic!("unexpected recipient count: {count}"),
+        }
+        assert_consistent(&pubsub);
     }
 
     #[test]
