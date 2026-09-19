@@ -104,7 +104,7 @@ impl H2HandshakeRequest {
     pub fn has_protocol(&self, proto: &str) -> bool {
         self.protocol
             .as_ref()
-            .map(|p| p.split(',').any(|s| s.trim().eq_ignore_ascii_case(proto)))
+            .map(|p| p.split(',').any(|s| s.trim() == proto))
             .unwrap_or(false)
     }
 
@@ -341,6 +341,7 @@ mod tests {
 
         assert!(req.has_protocol("graphql-ws"));
         assert!(req.has_protocol("subscriptions-transport-ws"));
+        assert!(!req.has_protocol("GRAPHQL-WS"));
         assert!(!req.has_protocol("unknown"));
 
         let protocols = req.protocols();

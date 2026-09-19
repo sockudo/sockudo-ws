@@ -18,13 +18,15 @@
 //!
 //! # Alignment Strategy
 //!
-//! For optimal performance, all SIMD implementations use an alignment-aware strategy:
+//! The x86_64 SIMD implementations use an alignment-aware strategy:
 //! 1. Process unaligned prefix bytes with scalar operations
 //! 2. Process aligned chunks with SIMD operations
 //! 3. Process unaligned suffix bytes with scalar operations
 //!
-//! This ensures optimal memory access patterns and avoids potential performance
-//! penalties from unaligned loads/stores on some architectures.
+//! This retains aligned loads/stores on those architectures. The aarch64 kernel
+//! uses unaligned, non-overlapping chunks. This differs from the upstream
+//! word-loop strategy for short payloads; neither path requires alignment
+//! prefixes in that size range.
 //!
 //! # Architecture Support
 //!
@@ -43,6 +45,9 @@
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 
 /// Apply WebSocket mask using the fastest available SIMD instructions
 ///
@@ -74,10 +79,7 @@ pub fn apply_mask(data: &mut [u8], mask: [u8; 4]) {
 
     #[cfg(target_arch = "aarch64")]
     {
-        // A word loop over 64-byte blocks is what LLVM vectorises best here;
-        // it beat a hand-written 16-byte NEON loop at every size (see the
-        // benchmark notes on `apply_mask_blocks`).
-        apply_mask_blocks(data, mask);
+        unsafe { apply_mask_neon(data, mask) };
     }
 
     #[cfg(target_arch = "loongarch64")]
@@ -117,16 +119,13 @@ pub fn apply_mask(data: &mut [u8], mask: [u8; 4]) {
     apply_mask_blocks(data, mask);
 }
 
-/// Below this length the unaligned block loop wins; above it, aligning the
-/// stores first is worth a short byte prefix.
+/// Alignment threshold used by the portable fallback.
 const ALIGNED_BLOCKS_MIN_LEN: usize = 2048;
 
 /// Portable masking over 64-byte blocks of `u64` words.
 ///
-/// LLVM turns the inner loop into full-width vector XORs on every target and
-/// unrolls it further than a hand-written 16-byte SIMD loop. Measured on an
-/// Apple M5 Pro against the previous NEON loop: 64 B 12 -> 19 GB/s, 1 KiB
-/// 53 -> 84 GB/s, 16 KiB 67 -> 127 GB/s, 256 KiB 70 -> 79 GB/s.
+/// The fixed-size word loop allows LLVM to vectorize without target intrinsics.
+/// Code generation and performance depend on the target and compiler.
 #[inline]
 fn apply_mask_blocks(data: &mut [u8], mask: [u8; 4]) {
     if data.len() < ALIGNED_BLOCKS_MIN_LEN {
@@ -134,8 +133,7 @@ fn apply_mask_blocks(data: &mut [u8], mask: [u8; 4]) {
         return;
     }
 
-    // Align the block loop to 16 bytes so the vector stores never straddle
-    // cache lines; this is what lifts the large sizes above the plain loop.
+    // Align the body to 16 bytes and preserve mask phase across the prefix.
     let misalign = (data.as_ptr() as usize) & 15;
     let prefix_len = if misalign == 0 {
         0
@@ -408,6 +406,40 @@ unsafe fn apply_mask_sse2_aligned(data: &mut [u8], mask: [u8; 4]) {
     }
 }
 
+/// NEON implementation for ARM64 using non-overlapping unaligned chunks.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn apply_mask_neon(data: &mut [u8], mask: [u8; 4]) {
+    let mask_word = u32::from_ne_bytes(mask);
+    let mask_vec = vreinterpretq_u8_u32(vdupq_n_u32(mask_word));
+    let (chunks, mut tail) = data.as_chunks_mut::<16>();
+
+    // Process 16 bytes at a time. Each chunk is disjoint and keeps mask phase zero.
+    for chunk in chunks {
+        // SAFETY: Each chunk contains 16 readable/writable bytes. NEON byte
+        // loads and stores accept unaligned pointers, and do not cross the slice.
+        unsafe {
+            let data_vec = vld1q_u8(chunk.as_ptr());
+            vst1q_u8(chunk.as_mut_ptr(), veorq_u8(data_vec, mask_vec));
+        }
+    }
+
+    // Handle remaining bytes with scalar operations, without overlapping a vector.
+    if tail.len() >= 8 {
+        let mask_word = u64::from(mask_word);
+        let mask_u64 = mask_word | (mask_word << u32::BITS);
+        // SAFETY: The tail has at least eight bytes and unaligned access is explicit.
+        unsafe {
+            let ptr = tail.as_mut_ptr().cast::<u64>();
+            ptr.write_unaligned(ptr.read_unaligned() ^ mask_u64);
+        }
+        tail = &mut tail[8..];
+    }
+    for (index, byte) in tail.iter_mut().enumerate() {
+        *byte ^= mask[index & 3];
+    }
+}
+
 /// LoongArch64 implementation using LSX/LASX SIMD
 ///
 /// On nightly with the `nightly` feature, uses native LASX (256-bit) or LSX (128-bit).
@@ -669,7 +701,7 @@ pub fn generate_mask() -> [u8; 4] {
     #[cfg(all(feature = "getrandom", not(feature = "fastrand")))]
     {
         let mut buf = [0u8; 4];
-        getrandom::getrandom(&mut buf).expect("getrandom failed");
+        getrandom::fill(&mut buf).expect("getrandom failed");
         return buf;
     }
 
@@ -679,7 +711,7 @@ pub fn generate_mask() -> [u8; 4] {
         not(feature = "getrandom")
     ))]
     {
-        use rand::Rng;
+        use rand::RngExt;
         return rand::rng().random::<[u8; 4]>();
     }
 
@@ -754,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_mask_matches_naive_for_all_lengths_and_alignments() {
+    fn portable_mask_matches_naive_for_lengths_and_alignments() {
         let mask = [0x37, 0xfa, 0x21, 0x3d];
         for len in (0..300).chain([2047, 2048, 2049, 4096, 4099, 65_536 + 7]) {
             for offset in 0..16 {
@@ -764,7 +796,7 @@ mod tests {
                     .enumerate()
                     .map(|(i, b)| b ^ mask[i & 3])
                     .collect();
-                apply_mask(&mut backing[offset..offset + len], mask);
+                apply_mask_blocks(&mut backing[offset..offset + len], mask);
                 assert_eq!(
                     &backing[offset..offset + len],
                     &expected[..],
