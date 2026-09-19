@@ -108,6 +108,7 @@ fn connection(write_limit: usize) -> (GatedIo, DuplexStream, Arc<WriteGate>) {
     )
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn idle_timeout_releases_transport_after_partial_write() {
     let (io, _peer, gate) = connection(3);
@@ -142,6 +143,7 @@ async fn idle_timeout_releases_transport_after_partial_write() {
     ));
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn active_send_timeout_is_retained_for_later_sends() {
     let (io, _peer, gate) = connection(3);
@@ -166,6 +168,7 @@ async fn active_send_timeout_is_retained_for_later_sends() {
     assert_eq!(gate.bytes.lock().unwrap().len(), 3);
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn inbound_data_postpones_idle_timeout_during_blocked_write() {
     let (io, mut peer, gate) = connection(3);
@@ -192,6 +195,7 @@ async fn inbound_data_postpones_idle_timeout_during_blocked_write() {
     assert!(matches!(result, Err(Error::IdleTimeout)));
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn due_ping_does_not_hide_idle_expiry_during_blocked_write() {
     let (io, _peer, gate) = connection(3);
@@ -241,6 +245,7 @@ async fn outstanding_ping() -> (
     (reader, writer, peer, gate, payload)
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn data_does_not_postpone_pong_timeout_during_blocked_write() {
     let (mut reader, mut writer, mut peer, gate, _) = outstanding_ping().await;
@@ -263,6 +268,7 @@ async fn data_does_not_postpone_pong_timeout_during_blocked_write() {
     assert_eq!(gate.bytes.lock().unwrap().len(), 17);
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn timely_pong_behind_peer_ping_keeps_blocked_write_alive() {
     let (mut reader, mut writer, mut peer, gate, payload) = outstanding_ping().await;
@@ -306,6 +312,7 @@ async fn timely_pong_behind_peer_ping_keeps_blocked_write_alive() {
     assert!(matches!(messages.last(), Some(Message::Pong(pong)) if pong == b"new".as_slice()));
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn deferred_ping_starts_pong_timeout_only_after_writing() {
     let (io, _peer, gate) = connection(3);
@@ -345,6 +352,7 @@ async fn deferred_ping_starts_pong_timeout_only_after_writing() {
     ));
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn idle_timeout_interrupts_blocked_flush() {
     let (io, _peer, gate) = connection(usize::MAX);
@@ -365,6 +373,7 @@ async fn idle_timeout_interrupts_blocked_flush() {
 }
 
 #[cfg(feature = "permessage-deflate")]
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn compressed_write_observes_idle_timeout() {
     let (io, _peer, gate) = connection(3);
@@ -389,6 +398,7 @@ async fn compressed_write_observes_idle_timeout() {
     assert_eq!(gate.bytes.lock().unwrap().len(), 3);
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn pending_reader_observes_timeout_after_transport_release() {
     let (io, _peer, gate) = connection(3);

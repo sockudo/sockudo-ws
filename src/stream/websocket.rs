@@ -357,9 +357,12 @@ where
         // Reuse the message Vec across reads (no allocation per read). Messages
         // are popped from the back, so store them in reverse order.
         debug_assert!(self.pending_messages.is_empty());
-        let result = self.protocol.process_into_with_activity(&mut self.read_buf, &mut self.pending_messages);
+        let result = self
+            .protocol
+            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages);
         if matches!(result, Ok(true)) {
-            self.heartbeat.on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
+            self.heartbeat
+                .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
         }
         // Preserve accepted messages even when a later frame fails.
         self.pending_messages.reverse();
@@ -1179,9 +1182,13 @@ where
             self.config.max_message_size,
         );
         let reader_protocol = self.protocol;
-        let sink: SharedSink<SplitTransport<S>, Protocol> = Arc::new(tokio::sync::Mutex::new(
-            SplitSink::new(writer, writer_protocol, self.config.write_buffer_size, self.config.max_backpressure),
-        ));
+        let sink: SharedSink<SplitTransport<S>, Protocol> =
+            Arc::new(tokio::sync::Mutex::new(SplitSink::new(
+                writer,
+                writer_protocol,
+                self.config.write_buffer_size,
+                self.config.max_backpressure,
+            )));
 
         tokio::spawn(split_writer_driver(
             transport,
@@ -1936,9 +1943,12 @@ where
         // Reuse the message Vec across reads (no allocation per read). Messages
         // are popped from the back, so store them in reverse order.
         debug_assert!(self.pending_messages.is_empty());
-        let result = self.protocol.process_into_with_activity(&mut self.read_buf, &mut self.pending_messages);
+        let result = self
+            .protocol
+            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages);
         if matches!(result, Ok(true)) {
-            self.heartbeat.on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
+            self.heartbeat
+                .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
         }
         // Preserve accepted messages even when a later frame fails.
         self.pending_messages.reverse();
@@ -2520,11 +2530,18 @@ where
             if self.has_unprocessed_read_data {
                 self.has_unprocessed_read_data = false;
                 debug_assert!(self.pending_messages.is_empty());
-                match self.protocol.process_into_with_activity(&mut self.read_buf, &mut self.pending_messages) {
+                match self
+                    .protocol
+                    .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)
+                {
                     Ok(fragment_activity) => {
-                        if fragment_activity { self.shared.note_inbound(); }
+                        if fragment_activity {
+                            self.shared.note_inbound();
+                        }
                         self.pending_messages.reverse();
-                        if !self.pending_messages.is_empty() { continue; }
+                        if !self.pending_messages.is_empty() {
+                            continue;
+                        }
                     }
                     Err(error) => {
                         self.pending_messages.reverse();

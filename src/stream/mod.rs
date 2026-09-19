@@ -29,8 +29,8 @@
 //! writer.send(Message::Text("Hello".into())).await?;
 //! ```
 
-mod split_transport;
 mod clock;
+mod split_transport;
 mod transport_stream;
 mod websocket;
 
