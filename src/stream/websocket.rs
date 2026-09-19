@@ -76,6 +76,8 @@ pin_project! {
         config: Config,
         // Pending messages from last process() call
         pending_messages: Vec<Message>,
+        // Deliver successfully parsed messages before a later parse failure.
+        pending_parse_error: Option<Error>,
         // Deadline (ms since clock_epoch) the heartbeat timer is currently armed for
         heartbeat_armed_ms: u64,
         // A control message is only returned after its automatic response is flushed.
@@ -139,6 +141,7 @@ where
             state: StreamState::Open,
             config,
             pending_messages: Vec::new(),
+            pending_parse_error: None,
             heartbeat_armed_ms: 0,
             pending_control_message: None,
             pending_terminal_error: None,
@@ -355,11 +358,12 @@ where
         // Reuse the message Vec across reads (no allocation per read). Messages
         // are popped from the back, so store them in reverse order.
         debug_assert!(self.pending_messages.is_empty());
-        self.protocol
-            .process_into(&mut self.read_buf, &mut self.pending_messages)?;
+        let result = self
+            .protocol
+            .process_into(&mut self.read_buf, &mut self.pending_messages);
+        // process_into preserves accepted messages even when a later frame fails.
         self.pending_messages.reverse();
-
-        Ok(())
+        result
     }
 
     /// Get the next pending message (moved out, no clone)
@@ -495,9 +499,23 @@ where
                 return Poll::Ready(None);
             }
 
+            if self.pending_messages.is_empty()
+                && let Some(error) = self.as_mut().get_mut().pending_parse_error.take()
+            {
+                let this = self.as_mut().get_mut();
+                this.state = StreamState::Closed;
+                this.heartbeat.stop();
+                this.heartbeat_sleep = None;
+                return Poll::Ready(Some(Err(error)));
+            }
+
             // Heartbeat deadlines are based on inbound inactivity. A Pong
             // deadline starts only after the corresponding Ping is flushed.
-            let deadline = self.heartbeat.next_deadline();
+            let deadline = self
+                .pending_parse_error
+                .is_none()
+                .then(|| self.heartbeat.next_deadline())
+                .flatten();
             if let Some(deadline) = deadline {
                 let now = self.clock_epoch.elapsed().as_millis() as u64;
                 if deadline.at() <= now {
@@ -588,6 +606,9 @@ where
                         let this = self.as_mut().get_mut();
                         this.heartbeat.stop();
                         this.heartbeat_sleep = None;
+                        this.pending_messages.clear();
+                        this.pending_parse_error = None;
+                        this.read_buf.clear();
                         if this.state == StreamState::Open {
                             // Send close response
                             this.protocol
@@ -611,11 +632,8 @@ where
                     Ok(()) if !self.pending_messages.is_empty() => continue,
                     Ok(()) => {}
                     Err(e) => {
-                        let this = self.as_mut().get_mut();
-                        this.state = StreamState::Closed;
-                        this.heartbeat.stop();
-                        this.heartbeat_sleep = None;
-                        return Poll::Ready(Some(Err(e)));
+                        self.as_mut().get_mut().pending_parse_error = Some(e);
+                        continue;
                     }
                 }
             }
@@ -648,11 +666,8 @@ where
                 Poll::Ready(Ok(_n)) => match self.as_mut().get_mut().process_read_buf() {
                     Ok(()) => continue,
                     Err(e) => {
-                        let this = self.as_mut().get_mut();
-                        this.state = StreamState::Closed;
-                        this.heartbeat.stop();
-                        this.heartbeat_sleep = None;
-                        return Poll::Ready(Some(Err(e)));
+                        self.as_mut().get_mut().pending_parse_error = Some(e);
+                        continue;
                     }
                 },
                 Poll::Ready(Err(e)) => {
@@ -1092,6 +1107,8 @@ pub struct SplitReader<S> {
     read_buf: BytesMut,
     has_unprocessed_read_data: bool,
     pending_messages: Vec<Message>,
+    // Deliver successfully parsed messages before a later parse failure.
+    pending_parse_error: Option<Error>,
     control_tx: mpsc::Sender<ControlRequest>,
     terminal_rx: watch::Receiver<Option<TerminalCause>>,
     shared: Arc<SplitShared>,
@@ -1141,6 +1158,7 @@ where
                 read_buf: self.read_buf,
                 has_unprocessed_read_data: self.has_unprocessed_read_data,
                 pending_messages: self.pending_messages,
+                pending_parse_error: self.pending_parse_error,
                 control_tx: control_tx.clone(),
                 terminal_rx,
                 shared: shared.clone(),
@@ -1167,7 +1185,12 @@ where
     /// processing. A terminal heartbeat/idle cause is yielded once as an error.
     pub async fn next(&mut self) -> Option<Result<Message>> {
         loop {
-            if let Some(result) = self.take_terminal() {
+            if self.terminal_reported {
+                return None;
+            }
+            if self.pending_parse_error.is_none()
+                && let Some(result) = self.take_terminal()
+            {
                 return result;
             }
 
@@ -1181,6 +1204,10 @@ where
                     }
                     Message::Close(_) => {
                         self.shared.begin_closing();
+                        self.pending_messages.clear();
+                        self.pending_parse_error = None;
+                        self.read_buf.clear();
+                        self.terminal_reported = true;
                         ControlRequest::PeerClose
                     }
                     _ => {
@@ -1197,6 +1224,12 @@ where
                 return Some(Ok(msg));
             }
 
+            if let Some(error) = self.pending_parse_error.take() {
+                self.shared.terminate(TerminalCause::ConnectionClosed);
+                self.terminal_reported = true;
+                return Some(Err(error));
+            }
+
             if self.has_unprocessed_read_data {
                 self.has_unprocessed_read_data = false;
                 debug_assert!(self.pending_messages.is_empty());
@@ -1211,8 +1244,9 @@ where
                         }
                     }
                     Err(error) => {
-                        self.shared.terminate(TerminalCause::ConnectionClosed);
-                        return Some(Err(error));
+                        self.pending_messages.reverse();
+                        self.pending_parse_error = Some(error);
+                        continue;
                     }
                 }
             }
@@ -1240,8 +1274,8 @@ where
                         {
                             Ok(()) => self.pending_messages.reverse(),
                             Err(error) => {
-                                self.shared.terminate(TerminalCause::ConnectionClosed);
-                                return Some(Err(error));
+                                self.pending_messages.reverse();
+                                self.pending_parse_error = Some(error);
                             }
                         },
                         Err(error) => {
@@ -1563,6 +1597,8 @@ pin_project! {
         state: StreamState,
         config: Config,
         pending_messages: Vec<Message>,
+        // Deliver successfully parsed messages before a later parse failure.
+        pending_parse_error: Option<Error>,
         // Deadline (ms since clock_epoch) the heartbeat timer is currently armed for
         heartbeat_armed_ms: u64,
         pending_control_message: Option<Message>,
@@ -1601,6 +1637,7 @@ where
             state: StreamState::Open,
             config,
             pending_messages: Vec::new(),
+            pending_parse_error: None,
             heartbeat_armed_ms: 0,
             pending_control_message: None,
             pending_terminal_error: None,
@@ -1633,6 +1670,7 @@ where
             state: StreamState::Open,
             config,
             pending_messages: Vec::new(),
+            pending_parse_error: None,
             heartbeat_armed_ms: 0,
             pending_control_message: None,
             pending_terminal_error: None,
@@ -1755,11 +1793,12 @@ where
         // Reuse the message Vec across reads (no allocation per read). Messages
         // are popped from the back, so store them in reverse order.
         debug_assert!(self.pending_messages.is_empty());
-        self.protocol
-            .process_into(&mut self.read_buf, &mut self.pending_messages)?;
+        let result = self
+            .protocol
+            .process_into(&mut self.read_buf, &mut self.pending_messages);
+        // process_into preserves accepted messages even when a later frame fails.
         self.pending_messages.reverse();
-
-        Ok(())
+        result
     }
 
     /// Get the next pending message (moved out, no clone)
@@ -1888,7 +1927,21 @@ where
                 return Poll::Ready(None);
             }
 
-            let deadline = self.heartbeat.next_deadline();
+            if self.pending_messages.is_empty()
+                && let Some(error) = self.as_mut().get_mut().pending_parse_error.take()
+            {
+                let this = self.as_mut().get_mut();
+                this.state = StreamState::Closed;
+                this.heartbeat.stop();
+                this.heartbeat_sleep = None;
+                return Poll::Ready(Some(Err(error)));
+            }
+
+            let deadline = self
+                .pending_parse_error
+                .is_none()
+                .then(|| self.heartbeat.next_deadline())
+                .flatten();
             if let Some(deadline) = deadline {
                 let now = self.clock_epoch.elapsed().as_millis() as u64;
                 if deadline.at() <= now {
@@ -1976,6 +2029,9 @@ where
                         let this = self.as_mut().get_mut();
                         this.heartbeat.stop();
                         this.heartbeat_sleep = None;
+                        this.pending_messages.clear();
+                        this.pending_parse_error = None;
+                        this.read_buf.clear();
                         if this.state == StreamState::Open {
                             this.protocol
                                 .encode_close_response(this.write_buf.buffer_mut());
@@ -2017,11 +2073,8 @@ where
                 Poll::Ready(Ok(_n)) => match self.as_mut().get_mut().process_read_buf() {
                     Ok(()) => continue,
                     Err(e) => {
-                        let this = self.as_mut().get_mut();
-                        this.state = StreamState::Closed;
-                        this.heartbeat.stop();
-                        this.heartbeat_sleep = None;
-                        return Poll::Ready(Some(Err(e)));
+                        self.as_mut().get_mut().pending_parse_error = Some(e);
+                        continue;
                     }
                 },
                 Poll::Ready(Err(e)) => {
@@ -2134,6 +2187,8 @@ pub struct CompressedSplitReader<S> {
     read_buf: BytesMut,
     /// Pending messages from last decode
     pending_messages: Vec<Message>,
+    // Deliver successfully parsed messages before a later parse failure.
+    pending_parse_error: Option<Error>,
     control_tx: mpsc::Sender<ControlRequest>,
     terminal_rx: watch::Receiver<Option<TerminalCause>>,
     shared: Arc<SplitShared>,
@@ -2226,6 +2281,7 @@ where
                 protocol: reader_protocol,
                 read_buf: self.read_buf,
                 pending_messages: self.pending_messages,
+                pending_parse_error: self.pending_parse_error,
                 control_tx: control_tx.clone(),
                 terminal_rx,
                 shared: shared.clone(),
@@ -2253,7 +2309,12 @@ where
     /// This method NEVER blocks the writer - true concurrent I/O!
     pub async fn next(&mut self) -> Option<Result<Message>> {
         loop {
-            if let Some(result) = self.take_terminal() {
+            if self.terminal_reported {
+                return None;
+            }
+            if self.pending_parse_error.is_none()
+                && let Some(result) = self.take_terminal()
+            {
                 return result;
             }
 
@@ -2267,6 +2328,10 @@ where
                     }
                     Message::Close(_) => {
                         self.shared.begin_closing();
+                        self.pending_messages.clear();
+                        self.pending_parse_error = None;
+                        self.read_buf.clear();
+                        self.terminal_reported = true;
                         ControlRequest::PeerClose
                     }
                     _ => {
@@ -2281,6 +2346,12 @@ where
                     continue;
                 }
                 return Some(Ok(msg));
+            }
+
+            if let Some(error) = self.pending_parse_error.take() {
+                self.shared.terminate(TerminalCause::ConnectionClosed);
+                self.terminal_reported = true;
+                return Some(Err(error));
             }
 
             if self.read_buf.capacity() - self.read_buf.len() < 4096 {
@@ -2306,8 +2377,8 @@ where
                         {
                             Ok(()) => self.pending_messages.reverse(),
                             Err(error) => {
-                                self.shared.terminate(TerminalCause::ConnectionClosed);
-                                return Some(Err(error));
+                                self.pending_messages.reverse();
+                                self.pending_parse_error = Some(error);
                             }
                         },
                         Err(error) => {
