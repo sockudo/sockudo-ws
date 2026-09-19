@@ -134,6 +134,7 @@ fn main() {
     }
     frame.extend_from_slice(&payload);
     let wire = Arc::new(frame.repeat(batch));
+    sockudo_ws::stream::init_clock();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
