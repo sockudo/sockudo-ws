@@ -9,11 +9,12 @@ mod h3_support {
             let _ = rustls::crypto::ring::default_provider().install_default();
         });
 
-        let rcgen::CertifiedKey { cert, key_pair } =
+        let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
 
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
-        let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
 
         let mut server_tls = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -51,6 +52,7 @@ mod tokio_http2_e2e {
                     let msg = ws.next().await.unwrap().unwrap();
                     assert!(matches!(&msg, Message::Text(text) if text == "tokio-h2"));
                     ws.send(msg).await.unwrap();
+                    SinkExt::close(&mut ws).await.unwrap();
                 })
                 .await
                 .unwrap();
@@ -87,6 +89,7 @@ mod tokio_http2_e2e {
                     assert!(matches!(req.path.as_str(), "/one" | "/two"));
                     let msg = ws.next().await.unwrap().unwrap();
                     ws.send(msg).await.unwrap();
+                    SinkExt::close(&mut ws).await.unwrap();
                 })
                 .await
                 .unwrap();
@@ -252,6 +255,7 @@ mod compio_http1_e2e {
 
 #[cfg(all(feature = "compio-runtime", feature = "http2"))]
 mod compio_http2_e2e {
+    use compio::io::AsyncWrite;
     use sockudo_ws::compio::net::{TcpListener, TcpStream};
     use sockudo_ws::compio::{connect_http2, connect_http2_multiplexed, runtime, serve_http2};
     use sockudo_ws::{Config, Message};
@@ -268,6 +272,8 @@ mod compio_http2_e2e {
                 let msg = ws.next().await.unwrap().unwrap();
                 assert!(matches!(&msg, Message::Text(text) if text == "compio-h2"));
                 ws.send(msg).await.unwrap();
+                ws.close(1000, "").await.unwrap();
+                ws.get_mut().shutdown().await.unwrap();
             })
             .await
             .unwrap();
@@ -302,6 +308,8 @@ mod compio_http2_e2e {
                 assert!(matches!(req.path.as_str(), "/one" | "/two"));
                 let msg = ws.next().await.unwrap().unwrap();
                 ws.send(msg).await.unwrap();
+                ws.close(1000, "").await.unwrap();
+                ws.get_mut().shutdown().await.unwrap();
             })
             .await
             .unwrap();

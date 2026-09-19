@@ -14,7 +14,9 @@ use crate::frame::{Frame, FrameParser, OpCode, encode_frame};
 use crate::utf8::{Utf8Stream, validate_utf8};
 
 #[cfg(feature = "permessage-deflate")]
-use crate::deflate::{DeflateConfig, DeflateContext};
+use crate::compression::{CompressionContext, CompressionEncoder};
+#[cfg(feature = "permessage-deflate")]
+use crate::deflate::{DeflateConfig, DeflateEncoder};
 
 /// WebSocket endpoint role
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,10 +30,10 @@ pub enum Role {
 /// WebSocket message (complete, possibly assembled from fragments)
 ///
 /// Text messages use `Bytes` internally for zero-copy efficiency.
-/// The payload is UTF-8 validated during parsing, so `as_text()` is safe.
+/// Parsing validates UTF-8; text accessors also check publicly constructed payloads.
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// Text message (UTF-8 validated, stored as Bytes for zero-copy)
+    /// Text message (validated when parsed, stored as Bytes for zero-copy)
     Text(Bytes),
     /// Binary message
     Binary(Bytes),
@@ -164,16 +166,16 @@ impl Message {
         )
     }
 
-    /// Get message as text (returns None for non-text messages)
+    /// Get message as text (returns None for non-text or invalid UTF-8 messages)
     ///
     /// This is zero-copy - it returns a reference to the underlying bytes.
-    /// The text is guaranteed to be valid UTF-8 as it was validated during parsing.
+    /// Publicly constructed Text payloads are checked before returning a string.
     #[inline]
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Message::Text(b) => {
-                // SAFETY: Text messages are UTF-8 validated during parsing
-                Some(unsafe { std::str::from_utf8_unchecked(b) })
+                // Public Text variants can bypass the parser's UTF-8 validation.
+                std::str::from_utf8(b).ok()
             }
             _ => None,
         }
@@ -193,12 +195,12 @@ impl Message {
 
     /// Convert to text message (allocates a String)
     ///
-    /// Returns None for non-text messages.
+    /// Returns None for non-text or invalid UTF-8 messages.
     pub fn into_text(self) -> Option<String> {
         match self {
             Message::Text(b) => {
-                // SAFETY: Text messages are UTF-8 validated during parsing
-                Some(unsafe { String::from_utf8_unchecked(b.to_vec()) })
+                // Public Text variants can bypass the parser's UTF-8 validation.
+                String::from_utf8(b.to_vec()).ok()
             }
             _ => None,
         }
@@ -270,6 +272,14 @@ enum State {
     Closed,
 }
 
+#[inline]
+fn ensure_message_size(size: usize, max_message_size: usize) -> Result<()> {
+    if size > max_message_size {
+        return Err(Error::MessageTooLarge);
+    }
+    Ok(())
+}
+
 /// WebSocket protocol handler
 ///
 /// Handles frame parsing, message assembly, and control frame processing.
@@ -284,14 +294,15 @@ pub struct Protocol {
     pub(crate) fragment_buf: BytesMut,
     /// Opcode of current fragmented message
     pub(crate) fragment_opcode: Option<OpCode>,
+    // Bytes before this offset form complete, validated UTF-8 code points.
+    fragment_validated_len: usize,
     /// Maximum message size
     pub(crate) max_message_size: usize,
     /// Pending close reason (if we received a close frame)
     pending_close: Option<CloseReason>,
-    /// Incremental UTF-8 validator for the text message currently being received
-    pub(crate) utf8: Utf8Stream,
-    /// Payload bytes of the frame currently being received that were already
-    /// fed to `utf8` before the frame completed
+    /// Validator for the current text frame, including any preceding incomplete code point.
+    utf8: Utf8Stream,
+    /// Payload bytes already validated before the current frame completes.
     partial_checked: usize,
 }
 
@@ -306,6 +317,7 @@ impl Protocol {
             parser: FrameParser::new(max_frame_size, expect_masked),
             fragment_buf: BytesMut::new(),
             fragment_opcode: None,
+            fragment_validated_len: 0,
             max_message_size,
             pending_close: None,
             utf8: Utf8Stream::new(),
@@ -336,8 +348,16 @@ impl Protocol {
             return Ok(());
         }
 
-        if self.partial_checked == 0 && pending.opcode == OpCode::Text {
+        if self.partial_checked == 0 {
             self.utf8.reset();
+            // Raw calls can leave an unvalidated suffix, not just a split code point.
+            if pending.opcode == OpCode::Continuation
+                && !self
+                    .utf8
+                    .push(&self.fragment_buf[self.fragment_validated_len..])
+            {
+                return Err(Error::InvalidUtf8);
+            }
         }
         let ready = pending.ready.min(buf.len());
         if !self.utf8.push(&buf[self.partial_checked..ready]) {
@@ -375,15 +395,39 @@ impl Protocol {
     /// This variant allows reusing a Vec<Message> across calls to avoid allocations.
     #[inline]
     pub fn process_into(&mut self, buf: &mut BytesMut, messages: &mut Vec<Message>) -> Result<()> {
+        self.process_frames::<false>(buf, messages).map(|_| ())
+    }
+
+    /// Report accepted non-final data frames, which do not yield a message.
+    /// Complete messages and control frames retain stream-level activity handling.
+    pub(crate) fn process_into_with_activity(
+        &mut self,
+        buf: &mut BytesMut,
+        messages: &mut Vec<Message>,
+    ) -> Result<bool> {
+        self.process_frames::<true>(buf, messages)
+    }
+
+    // Public message-only callers do not need fragment activity bookkeeping.
+    #[inline]
+    fn process_frames<const TRACK_ACTIVITY: bool>(
+        &mut self,
+        buf: &mut BytesMut,
+        messages: &mut Vec<Message>,
+    ) -> Result<bool> {
         messages.clear();
+        let mut fragment_activity = false;
 
         while !buf.is_empty() {
             match self.parser.parse(buf)? {
                 Some(frame) => {
+                    let is_fragment =
+                        TRACK_ACTIVITY && frame.header.opcode.is_data() && !frame.header.fin;
                     let prevalidated = std::mem::take(&mut self.partial_checked);
                     if let Some(msg) = self.handle_frame(frame, prevalidated)? {
                         messages.push(msg);
                     }
+                    fragment_activity |= is_fragment;
                 }
                 None => {
                     self.prevalidate_partial_text(buf)?;
@@ -392,7 +436,7 @@ impl Protocol {
             }
         }
 
-        Ok(())
+        Ok(fragment_activity)
     }
 
     /// Process incoming data and return complete raw messages.
@@ -468,11 +512,11 @@ impl Protocol {
         }
 
         if frame.header.fin {
-            // Complete message in one frame (fast path: one SIMD pass)
+            // Complete message in one frame (fast path)
+            ensure_message_size(frame.payload.len(), self.max_message_size)?;
             let valid = if prevalidated == 0 {
                 validate_utf8(&frame.payload)
             } else {
-                let prevalidated = prevalidated.min(frame.payload.len());
                 self.utf8.push(&frame.payload[prevalidated..]) && self.utf8.finish()
             };
             if !valid {
@@ -495,6 +539,7 @@ impl Protocol {
 
         if frame.header.fin {
             // Complete message in one frame (fast path)
+            ensure_message_size(frame.payload.len(), self.max_message_size)?;
             Ok(Some(Message::Binary(frame.payload)))
         } else {
             // Start of fragmented message
@@ -510,6 +555,7 @@ impl Protocol {
         }
 
         if frame.header.fin {
+            ensure_message_size(frame.payload.len(), self.max_message_size)?;
             Ok(Some(RawMessage::Text(frame.payload)))
         } else {
             self.start_raw_fragment(OpCode::Text, frame.payload)?;
@@ -524,6 +570,7 @@ impl Protocol {
         }
 
         if frame.header.fin {
+            ensure_message_size(frame.payload.len(), self.max_message_size)?;
             Ok(Some(RawMessage::Binary(frame.payload)))
         } else {
             self.start_raw_fragment(OpCode::Binary, frame.payload)?;
@@ -547,22 +594,32 @@ impl Protocol {
             return Err(Error::MessageTooLarge);
         }
 
-        // Text fragments are validated incrementally: only the bytes that were
-        // not already checked while the frame was incomplete are scanned, so a
-        // message costs one linear pass no matter how many fragments it has.
+        // Validate only new bytes; re-seed from the complete validated prefix
+        // when raw processing or a split code point preceded this frame.
         if opcode == OpCode::Text {
-            let prevalidated = prevalidated.min(frame.payload.len());
+            if prevalidated == 0 {
+                self.utf8.reset();
+                if !self
+                    .utf8
+                    .push(&self.fragment_buf[self.fragment_validated_len..])
+                {
+                    return Err(Error::InvalidUtf8);
+                }
+            }
             if !self.utf8.push(&frame.payload[prevalidated..]) {
                 return Err(Error::InvalidUtf8);
             }
         }
-
         self.fragment_buf.extend_from_slice(&frame.payload);
 
         if frame.header.fin {
             // Complete the fragmented message
             self.complete_fragment(opcode)
         } else {
+            // Validate partial UTF-8 for text messages, retaining only a code-point tail.
+            if opcode == OpCode::Text {
+                self.fragment_validated_len = self.fragment_buf.len() - self.utf8.pending();
+            }
             Ok(None)
         }
     }
@@ -578,6 +635,7 @@ impl Protocol {
             return Err(Error::MessageTooLarge);
         }
 
+        // Keep the validated prefix unchanged so a later typed call checks these bytes.
         self.fragment_buf.extend_from_slice(&frame.payload);
 
         if frame.header.fin {
@@ -601,20 +659,21 @@ impl Protocol {
             return Err(Error::MessageTooLarge);
         }
 
-        // Validate the first fragment of a text message incrementally
+        self.fragment_opcode = Some(opcode);
+        self.fragment_validated_len = 0;
+        self.fragment_buf.clear();
+        self.fragment_buf.extend_from_slice(&payload);
+
+        // Validate partial UTF-8 for text messages
         if opcode == OpCode::Text {
             if prevalidated == 0 {
                 self.utf8.reset();
             }
-            let prevalidated = prevalidated.min(payload.len());
-            if !self.utf8.push(&payload[prevalidated..]) {
+            if !self.utf8.push(&self.fragment_buf[prevalidated..]) {
                 return Err(Error::InvalidUtf8);
             }
+            self.fragment_validated_len = self.fragment_buf.len() - self.utf8.pending();
         }
-
-        self.fragment_opcode = Some(opcode);
-        self.fragment_buf.clear();
-        self.fragment_buf.extend_from_slice(&payload);
 
         Ok(())
     }
@@ -626,6 +685,7 @@ impl Protocol {
         }
 
         self.fragment_opcode = Some(opcode);
+        self.fragment_validated_len = 0;
         self.fragment_buf.clear();
         self.fragment_buf.extend_from_slice(&payload);
         Ok(())
@@ -638,11 +698,10 @@ impl Protocol {
 
         match opcode {
             OpCode::Text => {
-                // Every fragment was validated as it arrived; only an incomplete
-                // trailing sequence can still make the message invalid.
                 if !self.utf8.finish() {
                     return Err(Error::InvalidUtf8);
                 }
+                // Zero-copy: just return the Bytes directly (already UTF-8 validated)
                 Ok(Some(Message::Text(data)))
             }
             OpCode::Binary => Ok(Some(Message::Binary(data))),
@@ -803,7 +862,7 @@ pub struct CompressedProtocol {
     /// Base protocol handler
     inner: Protocol,
     /// Deflate compression context
-    deflate: DeflateContext,
+    deflate: CompressionContext,
     /// Whether the current fragmented message is compressed
     fragment_compressed: bool,
     /// Buffer for decompressed fragment data
@@ -812,30 +871,51 @@ pub struct CompressedProtocol {
 
 #[cfg(feature = "permessage-deflate")]
 impl CompressedProtocol {
-    /// Create a new compressed protocol handler for server role
-    pub fn server(max_frame_size: usize, max_message_size: usize, config: DeflateConfig) -> Self {
-        let mut inner = Protocol::new(Role::Server, max_frame_size, max_message_size);
+    fn new(
+        role: Role,
+        max_frame_size: usize,
+        max_message_size: usize,
+        deflate: CompressionContext,
+    ) -> Self {
+        let mut inner = Protocol::new(role, max_frame_size, max_message_size);
         inner.enable_compression();
 
         Self {
             inner,
-            deflate: DeflateContext::server(config),
+            deflate,
             fragment_compressed: false,
             decompress_buf: BytesMut::new(),
         }
     }
 
+    /// Create a new compressed protocol handler for server role
+    pub fn server(max_frame_size: usize, max_message_size: usize, config: DeflateConfig) -> Self {
+        let deflate = CompressionContext::server_with_config(config, false);
+        Self::new(Role::Server, max_frame_size, max_message_size, deflate)
+    }
+
+    pub(crate) fn server_with_shared_compression(
+        max_frame_size: usize,
+        max_message_size: usize,
+        config: DeflateConfig,
+    ) -> Self {
+        let deflate = CompressionContext::server_with_config(config, true);
+        Self::new(Role::Server, max_frame_size, max_message_size, deflate)
+    }
+
     /// Create a new compressed protocol handler for client role
     pub fn client(max_frame_size: usize, max_message_size: usize, config: DeflateConfig) -> Self {
-        let mut inner = Protocol::new(Role::Client, max_frame_size, max_message_size);
-        inner.enable_compression();
+        let deflate = CompressionContext::client_with_config(config, false);
+        Self::new(Role::Client, max_frame_size, max_message_size, deflate)
+    }
 
-        Self {
-            inner,
-            deflate: DeflateContext::client(config),
-            fragment_compressed: false,
-            decompress_buf: BytesMut::new(),
-        }
+    pub(crate) fn client_with_shared_compression(
+        max_frame_size: usize,
+        max_message_size: usize,
+        config: DeflateConfig,
+    ) -> Self {
+        let deflate = CompressionContext::client_with_config(config, true);
+        Self::new(Role::Client, max_frame_size, max_message_size, deflate)
     }
 
     /// Check if connection is closed
@@ -860,8 +940,19 @@ impl CompressedProtocol {
     /// Process incoming data into a reusable message buffer
     #[inline]
     pub fn process_into(&mut self, buf: &mut BytesMut, messages: &mut Vec<Message>) -> Result<()> {
+        self.process_into_with_activity(buf, messages).map(|_| ())
+    }
+
+    /// Report accepted non-final data frames, which do not yield a message.
+    /// Complete messages and control frames retain stream-level activity handling.
+    pub(crate) fn process_into_with_activity(
+        &mut self,
+        buf: &mut BytesMut,
+        messages: &mut Vec<Message>,
+    ) -> Result<bool> {
         const DEBUG: bool = false;
         messages.clear();
+        let mut fragment_activity = false;
 
         while !buf.is_empty() {
             if DEBUG {
@@ -869,6 +960,7 @@ impl CompressedProtocol {
             }
             match self.inner.parser.parse(buf)? {
                 Some(frame) => {
+                    let is_fragment = frame.header.opcode.is_data() && !frame.header.fin;
                     if DEBUG {
                         eprintln!("[PROTOCOL] Parsed frame, handling...");
                     }
@@ -880,6 +972,7 @@ impl CompressedProtocol {
                     } else if DEBUG {
                         eprintln!("[PROTOCOL] No message from handle_frame (fragment or control)");
                     }
+                    fragment_activity |= is_fragment;
                 }
                 None => {
                     if DEBUG {
@@ -894,12 +987,15 @@ impl CompressedProtocol {
             eprintln!("[PROTOCOL] process_into done, {} messages", messages.len());
         }
 
-        Ok(())
+        Ok(fragment_activity)
     }
 
     /// Handle a parsed frame with decompression support
     fn handle_frame(&mut self, frame: Frame) -> Result<Option<Message>> {
         let is_compressed = frame.header.rsv1;
+        if is_compressed && !matches!(frame.header.opcode, OpCode::Text | OpCode::Binary) {
+            return Err(Error::Protocol("RSV1 on control or continuation frame"));
+        }
 
         match frame.header.opcode {
             OpCode::Continuation => self.handle_continuation(frame),
@@ -932,6 +1028,7 @@ impl CompressedProtocol {
                 self.deflate
                     .decompress(&frame.payload, self.inner.max_message_size)?
             } else {
+                ensure_message_size(frame.payload.len(), self.inner.max_message_size)?;
                 frame.payload
             };
 
@@ -977,6 +1074,7 @@ impl CompressedProtocol {
                 self.deflate
                     .decompress(&frame.payload, self.inner.max_message_size)?
             } else {
+                ensure_message_size(frame.payload.len(), self.inner.max_message_size)?;
                 frame.payload
             };
             Ok(Some(Message::Binary(payload)))
@@ -1092,30 +1190,36 @@ impl CompressedProtocol {
     /// Split the compressed protocol into separate reader and writer halves
     ///
     /// This allows the encoder and decoder to be used independently for
-    /// concurrent read/write operations.
+    /// concurrent read/write operations. The reader retains parser state while
+    /// applying the supplied frame and message size limits.
     pub fn split(
-        self,
+        mut self,
         max_frame_size: usize,
         max_message_size: usize,
     ) -> (CompressedReaderProtocol, CompressedWriterProtocol) {
-        let role = self.inner.role;
+        self.inner.parser.set_max_frame_size(max_frame_size);
+        let Protocol {
+            role,
+            parser,
+            fragment_buf,
+            fragment_opcode,
+            ..
+        } = self.inner;
+        let (encoder, decoder) = self.deflate.into_parts();
 
-        // Create fresh reader protocol (decoder state)
+        // Keep parser and fragment state already consumed by the unified stream.
         let reader = CompressedReaderProtocol {
             role,
-            parser: FrameParser::new(max_frame_size, role == Role::Server),
-            fragment_buf: self.inner.fragment_buf,
-            fragment_opcode: self.inner.fragment_opcode,
+            parser,
+            fragment_buf,
+            fragment_opcode,
             max_message_size,
-            decoder: self.deflate.decoder,
+            decoder,
             fragment_compressed: self.fragment_compressed,
         };
 
         // Create fresh writer protocol (encoder state)
-        let writer = CompressedWriterProtocol {
-            role,
-            encoder: self.deflate.encoder,
-        };
+        let writer = CompressedWriterProtocol { role, encoder };
 
         (reader, writer)
     }
@@ -1185,7 +1289,18 @@ impl CompressedReaderProtocol {
 
     /// Process incoming data into a reusable message buffer
     pub fn process_into(&mut self, buf: &mut BytesMut, messages: &mut Vec<Message>) -> Result<()> {
+        self.process_into_with_activity(buf, messages).map(|_| ())
+    }
+
+    /// Report accepted non-final data frames, which do not yield a message.
+    /// Complete messages and control frames retain stream-level activity handling.
+    pub(crate) fn process_into_with_activity(
+        &mut self,
+        buf: &mut BytesMut,
+        messages: &mut Vec<Message>,
+    ) -> Result<bool> {
         messages.clear();
+        let mut fragment_activity = false;
 
         // Enable compression in parser
         self.parser.set_compression(true);
@@ -1193,20 +1308,25 @@ impl CompressedReaderProtocol {
         while !buf.is_empty() {
             match self.parser.parse(buf)? {
                 Some(frame) => {
+                    let is_fragment = frame.header.opcode.is_data() && !frame.header.fin;
                     if let Some(msg) = self.handle_frame(frame)? {
                         messages.push(msg);
                     }
+                    fragment_activity |= is_fragment;
                 }
                 None => break,
             }
         }
 
-        Ok(())
+        Ok(fragment_activity)
     }
 
     /// Handle a parsed frame with decompression support
     fn handle_frame(&mut self, frame: Frame) -> Result<Option<Message>> {
         let is_compressed = frame.header.rsv1;
+        if is_compressed && !matches!(frame.header.opcode, OpCode::Text | OpCode::Binary) {
+            return Err(Error::Protocol("RSV1 on control or continuation frame"));
+        }
 
         match frame.header.opcode {
             OpCode::Continuation => self.handle_continuation(frame),
@@ -1229,6 +1349,7 @@ impl CompressedReaderProtocol {
                 self.decoder
                     .decompress(&frame.payload, self.max_message_size)?
             } else {
+                ensure_message_size(frame.payload.len(), self.max_message_size)?;
                 frame.payload
             };
 
@@ -1254,6 +1375,7 @@ impl CompressedReaderProtocol {
                 self.decoder
                     .decompress(&frame.payload, self.max_message_size)?
             } else {
+                ensure_message_size(frame.payload.len(), self.max_message_size)?;
                 frame.payload
             };
             Ok(Some(Message::Binary(payload)))
@@ -1359,7 +1481,7 @@ pub struct CompressedWriterProtocol {
     /// Endpoint role
     role: Role,
     /// Deflate encoder
-    encoder: crate::deflate::DeflateEncoder,
+    encoder: CompressionEncoder,
 }
 
 #[cfg(feature = "permessage-deflate")]
@@ -1368,12 +1490,12 @@ impl CompressedWriterProtocol {
     pub fn server(config: &DeflateConfig) -> Self {
         Self {
             role: Role::Server,
-            encoder: crate::deflate::DeflateEncoder::new(
+            encoder: CompressionEncoder::Dedicated(DeflateEncoder::new(
                 config.server_max_window_bits,
                 config.server_no_context_takeover,
                 config.compression_level,
                 config.compression_threshold,
-            ),
+            )),
         }
     }
 
@@ -1381,12 +1503,12 @@ impl CompressedWriterProtocol {
     pub fn client(config: &DeflateConfig) -> Self {
         Self {
             role: Role::Client,
-            encoder: crate::deflate::DeflateEncoder::new(
+            encoder: CompressionEncoder::Dedicated(DeflateEncoder::new(
                 config.client_max_window_bits,
                 config.client_no_context_takeover,
                 config.compression_level,
                 config.compression_threshold,
-            ),
+            )),
         }
     }
 
@@ -1459,6 +1581,20 @@ impl CompressedWriterProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_accessors_reject_publicly_constructed_invalid_utf8() {
+        let message = Message::Text(Bytes::from_static(b"\xff"));
+        assert!(message.as_text().is_none());
+        assert!(message.into_text().is_none());
+    }
+
+    #[test]
+    fn text_accessors_preserve_publicly_constructed_unicode() {
+        let message = Message::Text(Bytes::from_static("行情".as_bytes()));
+        assert_eq!(message.as_text(), Some("行情"));
+        assert_eq!(message.into_text().as_deref(), Some("行情"));
+    }
 
     #[test]
     fn test_message_text() {
@@ -1542,5 +1678,22 @@ mod tests {
 
         let validated = validated_protocol.process(&mut validated_buf);
         assert!(matches!(validated, Err(Error::InvalidUtf8)));
+    }
+    #[cfg(feature = "permessage-deflate")]
+    #[test]
+    fn shared_compression_survives_protocol_split() {
+        let config = crate::Compression::Shared.to_deflate_config().unwrap();
+        let protocol = CompressedProtocol::server_with_shared_compression(
+            1024 * 1024,
+            64 * 1024 * 1024,
+            config,
+        );
+
+        assert!(matches!(
+            protocol.deflate,
+            CompressionContext::Shared { .. }
+        ));
+        let (_reader, writer) = protocol.split(1024 * 1024, 64 * 1024 * 1024);
+        assert!(matches!(writer.encoder, CompressionEncoder::Shared(_)));
     }
 }
