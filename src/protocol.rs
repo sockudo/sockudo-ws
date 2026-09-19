@@ -28,10 +28,10 @@ pub enum Role {
 /// WebSocket message (complete, possibly assembled from fragments)
 ///
 /// Text messages use `Bytes` internally for zero-copy efficiency.
-/// The payload is UTF-8 validated during parsing, so `as_text()` is safe.
+/// Parsing validates UTF-8; text accessors also check publicly constructed payloads.
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// Text message (UTF-8 validated, stored as Bytes for zero-copy)
+    /// Text message (validated when parsed, stored as Bytes for zero-copy)
     Text(Bytes),
     /// Binary message
     Binary(Bytes),
@@ -164,16 +164,16 @@ impl Message {
         )
     }
 
-    /// Get message as text (returns None for non-text messages)
+    /// Get message as text (returns None for non-text or invalid UTF-8 messages)
     ///
     /// This is zero-copy - it returns a reference to the underlying bytes.
-    /// The text is guaranteed to be valid UTF-8 as it was validated during parsing.
+    /// Publicly constructed Text payloads are checked before returning a string.
     #[inline]
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Message::Text(b) => {
-                // SAFETY: Text messages are UTF-8 validated during parsing
-                Some(unsafe { std::str::from_utf8_unchecked(b) })
+                // Public Text variants can bypass the parser's UTF-8 validation.
+                std::str::from_utf8(b).ok()
             }
             _ => None,
         }
@@ -193,12 +193,12 @@ impl Message {
 
     /// Convert to text message (allocates a String)
     ///
-    /// Returns None for non-text messages.
+    /// Returns None for non-text or invalid UTF-8 messages.
     pub fn into_text(self) -> Option<String> {
         match self {
             Message::Text(b) => {
-                // SAFETY: Text messages are UTF-8 validated during parsing
-                Some(unsafe { String::from_utf8_unchecked(b.to_vec()) })
+                // Public Text variants can bypass the parser's UTF-8 validation.
+                String::from_utf8(b.to_vec()).ok()
             }
             _ => None,
         }
@@ -1459,6 +1459,20 @@ impl CompressedWriterProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_accessors_reject_publicly_constructed_invalid_utf8() {
+        let message = Message::Text(Bytes::from_static(b"\xff"));
+        assert!(message.as_text().is_none());
+        assert!(message.into_text().is_none());
+    }
+
+    #[test]
+    fn text_accessors_preserve_publicly_constructed_unicode() {
+        let message = Message::Text(Bytes::from_static("行情".as_bytes()));
+        assert_eq!(message.as_text(), Some("行情"));
+        assert_eq!(message.into_text().as_deref(), Some("行情"));
+    }
 
     #[test]
     fn test_message_text() {
