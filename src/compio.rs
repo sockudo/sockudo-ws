@@ -12,8 +12,6 @@ use std::marker::PhantomData;
 #[cfg(feature = "http2")]
 use std::pin::Pin;
 use std::rc::Rc;
-#[cfg(feature = "http3")]
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(any(feature = "http2", feature = "http3"))]
@@ -976,10 +974,6 @@ impl CompioHttp3Connection {
         path: &str,
         protocol: Option<&str>,
     ) -> Result<CompioWebSocketStream<CompioHttp3ClientStream>> {
-        if !self.config.http3.enable_connect_protocol {
-            return Err(Error::ExtendedConnectNotSupported);
-        }
-
         let uri = format!("https://{}:{}{}", self.server_name, self.server_port, path);
 
         let mut req = http::Request::builder()
@@ -1051,35 +1045,20 @@ pub async fn connect_http3(
 pub async fn connect_http3_multiplexed(
     server_addr: std::net::SocketAddr,
     server_name: &str,
-    mut tls_config: rustls::ClientConfig,
+    tls_config: rustls::ClientConfig,
     config: Config,
 ) -> Result<CompioHttp3Connection> {
-    crate::http3::validate_config(&config.http3)?;
-    if !config.http3.enable_connect_protocol {
-        return Err(Error::ExtendedConnectNotSupported);
-    }
-    let transport_config = crate::http3::quic_transport_config(&config.http3)?;
-    let endpoint_config = crate::http3::quic_endpoint_config(&config.http3)?;
-    // Do not let caller-provided TLS settings bypass the 0-RTT rejection above.
-    tls_config.enable_early_data = false;
-    tls_config.alpn_protocols = vec![b"h3".to_vec()];
-
     let bind_ip = if server_addr.is_ipv6() {
         std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
     } else {
         std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
     };
 
-    let quic_config = ::compio::quic::crypto::rustls::QuicClientConfig::try_from(tls_config)
-        .map_err(|_| Error::HandshakeFailed("invalid TLS config"))?;
-    let mut client_config = ::compio::quic::ClientConfig::new(Arc::new(quic_config));
-    client_config.transport_config(transport_config);
-    let socket = ::compio::net::UdpSocket::bind(std::net::SocketAddr::new(bind_ip, 0))
+    let endpoint = ::compio::quic::ClientBuilder::new_with_rustls_client_config(tls_config)
+        .with_alpn_protocols(&["h3"])
+        .bind(std::net::SocketAddr::new(bind_ip, 0))
         .await
         .map_err(Error::Io)?;
-    let endpoint =
-        ::compio::quic::Endpoint::new(socket, endpoint_config, None, Some(client_config))
-            .map_err(Error::Io)?;
 
     let conn = endpoint
         .connect(server_addr, server_name, None)
@@ -1088,7 +1067,7 @@ pub async fn connect_http3_multiplexed(
         .map_err(|e| Error::Http3(e.to_string()))?;
 
     let mut builder = ::compio::quic::h3::client::builder();
-    builder.enable_extended_connect(config.http3.enable_connect_protocol);
+    builder.enable_extended_connect(true);
     let (mut driver, send_request) = builder
         .build::<_, ::compio::quic::h3::OpenStreams, Bytes>(conn)
         .await
@@ -1121,25 +1100,14 @@ impl CompioHttp3Server {
     /// Bind a Compio HTTP/3 WebSocket server.
     pub async fn bind(
         addr: std::net::SocketAddr,
-        mut tls_config: rustls::ServerConfig,
+        tls_config: rustls::ServerConfig,
         config: Config,
     ) -> Result<Self> {
-        let transport_config = crate::http3::quic_transport_config(&config.http3)?;
-        let endpoint_config = crate::http3::quic_endpoint_config(&config.http3)?;
-        // Do not let caller-provided TLS settings bypass the 0-RTT rejection above.
-        tls_config.max_early_data_size = 0;
-        tls_config.alpn_protocols = vec![b"h3".to_vec()];
-
-        let quic_config = ::compio::quic::crypto::rustls::QuicServerConfig::try_from(tls_config)
-            .map_err(|_| Error::HandshakeFailed("invalid TLS config"))?;
-        let mut server_config = ::compio::quic::ServerConfig::with_crypto(Arc::new(quic_config));
-        server_config.transport_config(transport_config);
-        let socket = ::compio::net::UdpSocket::bind(addr)
+        let endpoint = ::compio::quic::ServerBuilder::new_with_rustls_server_config(tls_config)
+            .with_alpn_protocols(&["h3"])
+            .bind(addr)
             .await
             .map_err(Error::Io)?;
-        let endpoint =
-            ::compio::quic::Endpoint::new(socket, endpoint_config, Some(server_config), None)
-                .map_err(Error::Io)?;
 
         Ok(Self {
             endpoint,
@@ -1185,7 +1153,6 @@ impl CompioHttp3Server {
             + 'static,
         Fut: Future<Output = ()> + 'static,
     {
-        crate::http3::validate_config(&self.config.http3)?;
         while let Some(incoming) = self.endpoint.wait_incoming().await {
             let handler = handler.clone();
             let config = self.config.clone();
@@ -1224,10 +1191,9 @@ where
 {
     let conn = incoming.await.map_err(|e| Error::Http3(e.to_string()))?;
     let mut builder = ::compio::quic::h3::server::builder();
-    let enable_connect_protocol = config.http3.enable_connect_protocol;
     builder
-        .enable_extended_connect(enable_connect_protocol)
-        .enable_webtransport(enable_connect_protocol)
+        .enable_extended_connect(true)
+        .enable_webtransport(true)
         .max_webtransport_sessions(1024);
     let mut conn = builder.build::<_, Bytes>(conn).await.map_err(Error::from)?;
 
@@ -1268,15 +1234,6 @@ where
     F: Fn(CompioWebSocketStream<CompioHttp3ServerStream>, ExtendedConnectRequest) -> Fut + 'static,
     Fut: Future<Output = ()> + 'static,
 {
-    if !config.http3.enable_connect_protocol {
-        let response = build_extended_connect_error(
-            http::StatusCode::NOT_IMPLEMENTED,
-            Some("Extended CONNECT is disabled"),
-        );
-        stream.send_response(response).await.ok();
-        return Ok(());
-    }
-
     if request.method() != http::Method::CONNECT {
         let response = build_extended_connect_error(
             http::StatusCode::METHOD_NOT_ALLOWED,

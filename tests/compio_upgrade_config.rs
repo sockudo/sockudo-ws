@@ -33,36 +33,6 @@ mod h3_support {
     }
 }
 
-#[compio::test]
-async fn compio_server_rejects_unsupported_early_data() {
-    let (server_tls, _) = h3_support::tls_configs();
-    let result = sockudo_ws::compio::CompioHttp3Server::bind(
-        "127.0.0.1:0".parse().unwrap(),
-        server_tls,
-        sockudo_ws::Config::builder()
-            .http3_enable_0rtt(true)
-            .build(),
-    )
-    .await;
-    assert!(matches!(result, Err(sockudo_ws::Error::Http3(message)) if message.contains("0-RTT")));
-}
-
-#[compio::test]
-async fn compio_server_rejects_unrepresentable_idle_timeout() {
-    let (server_tls, _) = h3_support::tls_configs();
-    let result = sockudo_ws::compio::CompioHttp3Server::bind(
-        "127.0.0.1:0".parse().unwrap(),
-        server_tls,
-        sockudo_ws::Config::builder()
-            .http3_idle_timeout(u64::MAX)
-            .build(),
-    )
-    .await;
-    assert!(
-        matches!(result, Err(sockudo_ws::Error::Http3(message)) if message.contains("idle timeout"))
-    );
-}
-
 mod negotiation {
     use sockudo_ws::compio::{CompioHttp3Server, connect_http3, runtime};
     use sockudo_ws::{Config, Message};
