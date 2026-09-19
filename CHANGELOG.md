@@ -106,7 +106,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - HTTP request/response builders now return `Result`, and `HandshakeRequest`
   path, protocol, and extension fields use `Cow<str>` so repeated fields and
   absolute request targets can be normalized. These changes affect source
-  compatibility.
+  compatibility. Incoming HTTP lists ignore empty elements; outbound builders
+  continue to reject invalid metadata.
 - Restored Compio `server_handshake_with_extensions` as a deprecated wrapper;
   request-aware code should use `server_handshake_with`.
 
