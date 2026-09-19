@@ -1455,10 +1455,9 @@ where
         // Reuse the message Vec across reads; messages are popped from the
         // back, so keep them in reverse order.
         debug_assert!(self.pending_messages.is_empty());
-        let fragment_activity = self
-            .protocol
-            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)?;
-        if fragment_activity && self.heartbeat.tracks_inbound_activity() {
+        self.protocol
+            .process_into(&mut self.read_buf, &mut self.pending_messages)?;
+        if self.protocol.has_incomplete_message() && self.heartbeat.tracks_inbound_activity() {
             self.heartbeat
                 .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
         }
@@ -1706,10 +1705,10 @@ where
                 debug_assert!(self.pending_messages.is_empty());
                 match self
                     .protocol
-                    .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)
+                    .process_into(&mut self.read_buf, &mut self.pending_messages)
                 {
-                    Ok(fragment_activity) => {
-                        if fragment_activity {
+                    Ok(()) => {
+                        if self.protocol.has_incomplete_message() {
                             self.shared.note_inbound();
                         }
                         self.pending_messages.reverse();
@@ -2437,10 +2436,9 @@ where
         // Reuse the message Vec across reads; messages are popped from the
         // back, so keep them in reverse order.
         debug_assert!(self.pending_messages.is_empty());
-        let fragment_activity = self
-            .protocol
-            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)?;
-        if fragment_activity && self.heartbeat.tracks_inbound_activity() {
+        self.protocol
+            .process_into(&mut self.read_buf, &mut self.pending_messages)?;
+        if self.protocol.has_incomplete_message() && self.heartbeat.tracks_inbound_activity() {
             self.heartbeat
                 .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
         }
@@ -2616,10 +2614,10 @@ where
                 debug_assert!(self.pending_messages.is_empty());
                 match self
                     .protocol
-                    .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)
+                    .process_into(&mut self.read_buf, &mut self.pending_messages)
                 {
-                    Ok(fragment_activity) => {
-                        if fragment_activity {
+                    Ok(()) => {
+                        if self.protocol.has_incomplete_message() {
                             self.shared.note_inbound();
                         }
                         self.pending_messages.reverse();
