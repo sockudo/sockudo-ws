@@ -33,6 +33,11 @@
 /// Automatically selects the fastest available implementation for the platform.
 #[inline]
 pub fn validate_utf8(data: &[u8]) -> bool {
+    // Below simdutf8's 64-byte threshold, ASCII can skip the scalar UTF-8 decoder.
+    if data.len() < 64 && data.is_ascii() {
+        return true;
+    }
+
     // For x86_64/x86, try simdutf8 first (handles SSE4.2+, AVX2, AVX-512)
     // If not available, fall back to custom SSE2 implementation
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
