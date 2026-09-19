@@ -150,7 +150,7 @@ impl H3HandshakeRequest {
     pub fn has_subprotocol(&self, proto: &str) -> bool {
         self.subprotocols
             .as_ref()
-            .is_some_and(|p| p.split(',').any(|s| s.trim().eq_ignore_ascii_case(proto)))
+            .is_some_and(|p| p.split(',').any(|s| s.trim() == proto))
     }
 
     /// Get the list of requested subprotocols
@@ -396,7 +396,7 @@ mod tests {
         let protos = req.subprotocol_list();
         assert_eq!(protos, vec!["graphql-ws", "json", "binary"]);
         assert!(req.has_subprotocol("json"));
-        assert!(req.has_subprotocol("GRAPHQL-WS")); // case insensitive
+        assert!(!req.has_subprotocol("GRAPHQL-WS"));
         assert!(!req.has_subprotocol("xml"));
     }
 }

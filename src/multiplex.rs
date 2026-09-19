@@ -29,6 +29,8 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 
 use crate::error::{Error, Result};
+#[cfg(any(feature = "http2", feature = "http3"))]
+use crate::extended_connect::validate_extended_connect_response;
 use crate::protocol::Role;
 use crate::transport::Transport;
 use crate::{Config, WebSocketStream};
@@ -163,6 +165,7 @@ impl MultiplexedConnection<Http2> {
         if response.status() != http::StatusCode::OK {
             return Err(Error::HandshakeFailed("server rejected WebSocket upgrade"));
         }
+        validate_extended_connect_response(response.headers(), protocol)?;
 
         let recv_stream = response.into_body();
         let h2_stream = Stream::<Http2>::from_h2(send_stream, recv_stream);
@@ -265,6 +268,7 @@ impl MultiplexedConnection<Http3> {
         if response.status() != StatusCode::OK {
             return Err(Error::HandshakeFailed("server rejected WebSocket upgrade"));
         }
+        validate_extended_connect_response(response.headers(), subprotocol)?;
 
         let h3_stream = H3Stream::<Http3>::from_h3_client_with_handles(
             stream,
