@@ -206,21 +206,21 @@ impl Default for Http2Config {
 }
 
 /// HTTP/3 configuration (RFC 9220)
+///
+/// The built-in endpoints do not currently apply these fields. Configure an
+/// external QUIC endpoint directly when transport settings are required.
 #[cfg(feature = "http3")]
 #[derive(Debug, Clone)]
 pub struct Http3Config {
     /// Maximum idle timeout for QUIC connection in milliseconds (default: 30000)
     pub max_idle_timeout_ms: u64,
-    /// Initial per-stream receive window size (default: 1MB)
+    /// Initial stream-level flow control window size (default: 1MB)
     pub initial_stream_window_size: u64,
-    /// Request 0-RTT support (default: false)
-    ///
-    /// The built-in HTTP/3 client and server reject `true` because their H3 layer
-    /// cannot safely restore peer settings after resumption.
+    /// Enable 0-RTT for faster reconnection (default: false)
     pub enable_0rtt: bool,
     /// Enable Extended CONNECT protocol for WebSocket (default: true)
     pub enable_connect_protocol: bool,
-    /// Maximum accepted UDP payload size (default: 1350)
+    /// Maximum UDP payload size (default: 1350)
     pub max_udp_payload_size: u16,
 }
 
