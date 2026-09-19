@@ -89,3 +89,50 @@ async fn compressed_unified_read_preserves_partial_payload_across_ping_deadline(
     );
     let _peer = send.await.unwrap();
 }
+
+struct NonCooperativeRead;
+
+impl compio::io::AsyncRead for NonCooperativeRead {
+    async fn read<B: compio::buf::IoBufMut>(
+        &mut self,
+        _buf: B,
+    ) -> compio::buf::BufResult<usize, B> {
+        std::future::pending().await
+    }
+}
+
+impl compio::io::AsyncWrite for NonCooperativeRead {
+    async fn write<B: compio::buf::IoBuf>(&mut self, buf: B) -> compio::buf::BufResult<usize, B> {
+        compio::buf::BufResult(Ok(buf.buf_len()), buf)
+    }
+    async fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[compio::test]
+async fn idle_timeout_does_not_wait_for_read_cancellation() {
+    let config = Config::builder()
+        .auto_ping(false)
+        .idle_timeout(1)
+        .close_timeout(0)
+        .build();
+    let mut ws = CompioWebSocketStream::client(NonCooperativeRead, config);
+    let result = compio::time::timeout(Duration::from_millis(1500), ws.next()).await;
+    assert!(matches!(result, Ok(Some(Err(Error::IdleTimeout)))));
+}
+
+#[compio::test]
+async fn idle_timeout_bounds_ping_read_recovery() {
+    let config = Config::builder()
+        .ping_interval(1)
+        .idle_timeout(2)
+        .close_timeout(0)
+        .build();
+    let mut ws = CompioWebSocketStream::client(NonCooperativeRead, config);
+    let result = compio::time::timeout(Duration::from_millis(2500), ws.next()).await;
+    assert!(matches!(result, Ok(Some(Err(Error::IdleTimeout)))));
+}

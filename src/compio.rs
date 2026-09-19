@@ -206,33 +206,57 @@ where
 
 enum DeadlineReadOutcome {
     Read(io::Result<usize>),
-    Deadline(Option<io::Result<usize>>),
+    Deadline(Deadline, Option<io::Result<usize>>),
 }
 
 async fn read_more_until<R>(
     reader: &mut R,
     buf: &mut BytesMut,
-    delay: Duration,
+    deadline: Deadline,
+    hard_timeout: Option<Deadline>,
+    epoch: Instant,
 ) -> DeadlineReadOutcome
 where
     R: AsyncRead + ?Sized,
 {
     let cancel = CancelToken::new();
     let read = CompioFutureExt::with_cancel(read_more(reader, buf), cancel.clone()).fuse();
+    let delay = Duration::from_millis(
+        deadline
+            .at()
+            .saturating_sub(epoch.elapsed().as_millis() as u64),
+    );
     let timer = ::compio::time::sleep(delay).fuse();
     futures_util::pin_mut!(read, timer);
 
     futures_util::select! {
         result = read => DeadlineReadOutcome::Read(result),
         () = timer => {
-            // A Compio read owns the buffer until completion. Use fail-slow
-            // cancellation so read_more restores it before heartbeat handling.
             cancel.cancel();
-            let result = read.await;
-            if read_was_cancelled(&result) {
-                DeadlineReadOutcome::Deadline(None)
-            } else {
-                DeadlineReadOutcome::Deadline(Some(result))
+            if !matches!(deadline, Deadline::Ping(_)) {
+                // The connection is terminal; it will never reuse this buffer.
+                // A custom reader must not postpone a hard timeout indefinitely.
+                return DeadlineReadOutcome::Deadline(deadline, None);
+            }
+            // Continuing after Ping requires the owned buffer back. Native Compio
+            // reads and our poll-based adapters cooperate with the cancellation.
+            // A hard idle/Pong deadline still bounds a non-cooperative reader.
+            let hard_timer = async {
+                let Some(at) = hard_timeout else {
+                    return std::future::pending::<Deadline>().await;
+                };
+                ::compio::time::sleep(Duration::from_millis(
+                    at.at().saturating_sub(epoch.elapsed().as_millis() as u64)
+                )).await;
+                at
+            }.fuse();
+            futures_util::pin_mut!(hard_timer);
+            futures_util::select_biased! {
+                at = hard_timer => DeadlineReadOutcome::Deadline(at, None),
+                result = read => {
+                    let result = (!read_was_cancelled(&result)).then_some(result);
+                    DeadlineReadOutcome::Deadline(deadline, result)
+                },
             }
         }
     }
@@ -1384,6 +1408,11 @@ where
     }
 
     /// Receive the next WebSocket message.
+    ///
+    /// With automatic Ping enabled, custom `AsyncRead` implementations must
+    /// cooperate with Compio's current `CancelToken` so a pending read can return
+    /// its owned buffer before Ping is sent. The built-in transports do this.
+    /// Hard idle/Pong timeouts terminate without waiting for buffer recovery.
     pub async fn next(&mut self) -> Option<Result<Message>> {
         loop {
             if self.state == CompioStreamState::Closed {
@@ -1411,14 +1440,20 @@ where
             }
 
             let read_result = if let Some(deadline) = self.heartbeat.next_deadline() {
-                let now = self.clock_epoch.elapsed().as_millis() as u64;
-                let delay = Duration::from_millis(deadline.at().saturating_sub(now));
-                match read_more_until(&mut self.inner, &mut self.read_buf, delay).await {
+                match read_more_until(
+                    &mut self.inner,
+                    &mut self.read_buf,
+                    deadline,
+                    self.heartbeat.next_timeout(),
+                    self.clock_epoch,
+                )
+                .await
+                {
                     DeadlineReadOutcome::Read(result) => Some(result),
-                    DeadlineReadOutcome::Deadline(read_result) => {
+                    DeadlineReadOutcome::Deadline(deadline, read_result) => {
                         let now = self.clock_epoch.elapsed().as_millis() as u64;
-                        match self.heartbeat.next_deadline() {
-                            Some(Deadline::Ping(at)) if at <= now => {
+                        match deadline {
+                            Deadline::Ping(at) if at <= now => {
                                 if let Some(payload) = self.heartbeat.ping_due(now) {
                                     if let Err(error) = self.protocol.encode_message(
                                         &Message::Ping(payload),
@@ -1435,7 +1470,7 @@ where
                                 }
                                 read_result
                             }
-                            Some(Deadline::Pong(at)) if at <= now => {
+                            Deadline::Pong(at) if at <= now => {
                                 self.heartbeat.stop();
                                 self.state = CompioStreamState::CloseSent;
                                 let close = Message::Close(Some(CloseReason::new(
@@ -1451,7 +1486,7 @@ where
                                 self.state = CompioStreamState::Closed;
                                 return Some(Err(Error::HeartbeatTimeout));
                             }
-                            Some(Deadline::Idle(at)) if at <= now => {
+                            Deadline::Idle(at) if at <= now => {
                                 self.heartbeat.stop();
                                 self.state = CompioStreamState::CloseSent;
                                 let close = Message::Close(Some(CloseReason::new(
@@ -2323,6 +2358,11 @@ where
     }
 
     /// Receive the next WebSocket message.
+    ///
+    /// With automatic Ping enabled, custom `AsyncRead` implementations must
+    /// cooperate with Compio's current `CancelToken` so a pending read can return
+    /// its owned buffer before Ping is sent. The built-in transports do this.
+    /// Hard idle/Pong timeouts terminate without waiting for buffer recovery.
     pub async fn next(&mut self) -> Option<Result<Message>> {
         loop {
             if self.state == CompioStreamState::Closed {
@@ -2350,14 +2390,20 @@ where
             }
 
             let read_result = if let Some(deadline) = self.heartbeat.next_deadline() {
-                let now = self.clock_epoch.elapsed().as_millis() as u64;
-                let delay = Duration::from_millis(deadline.at().saturating_sub(now));
-                match read_more_until(&mut self.inner, &mut self.read_buf, delay).await {
+                match read_more_until(
+                    &mut self.inner,
+                    &mut self.read_buf,
+                    deadline,
+                    self.heartbeat.next_timeout(),
+                    self.clock_epoch,
+                )
+                .await
+                {
                     DeadlineReadOutcome::Read(result) => Some(result),
-                    DeadlineReadOutcome::Deadline(read_result) => {
+                    DeadlineReadOutcome::Deadline(deadline, read_result) => {
                         let now = self.clock_epoch.elapsed().as_millis() as u64;
-                        match self.heartbeat.next_deadline() {
-                            Some(Deadline::Ping(at)) if at <= now => {
+                        match deadline {
+                            Deadline::Ping(at) if at <= now => {
                                 if let Some(payload) = self.heartbeat.ping_due(now) {
                                     if let Err(error) = self.protocol.encode_message(
                                         &Message::Ping(payload),
@@ -2374,7 +2420,7 @@ where
                                 }
                                 read_result
                             }
-                            Some(Deadline::Pong(at)) if at <= now => {
+                            Deadline::Pong(at) if at <= now => {
                                 self.heartbeat.stop();
                                 self.state = CompioStreamState::CloseSent;
                                 let close = Message::Close(Some(CloseReason::new(
@@ -2390,7 +2436,7 @@ where
                                 self.state = CompioStreamState::Closed;
                                 return Some(Err(Error::HeartbeatTimeout));
                             }
-                            Some(Deadline::Idle(at)) if at <= now => {
+                            Deadline::Idle(at) if at <= now => {
                                 self.heartbeat.stop();
                                 self.state = CompioStreamState::CloseSent;
                                 let close = Message::Close(Some(CloseReason::new(
