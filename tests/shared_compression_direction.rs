@@ -7,8 +7,8 @@ use std::sync::Arc;
 #[test]
 fn shared_client_encoder_uses_the_client_window() {
     let config = DeflateConfig {
-        server_max_window_bits: 15,
-        client_max_window_bits: 10,
+        server_max_window_bits: sockudo_ws::DeflateWindowBits::Bits15,
+        client_max_window_bits: sockudo_ws::DeflateWindowBits::Bits10,
         compression_threshold: 0,
         ..DeflateConfig::default()
     };
@@ -22,7 +22,12 @@ fn shared_client_encoder_uses_the_client_window() {
         })
         .collect();
     let payload = [prefix.as_slice(), prefix.as_slice(), &[b'a'; 8192]].concat();
-    let mut expected = DeflateEncoder::new(10, true, config.compression_level, 0);
+    let mut expected = DeflateEncoder::new(
+        sockudo_ws::DeflateWindowBits::Bits10,
+        true,
+        config.compression_level,
+        0,
+    );
     let expected = expected.compress(&payload).unwrap();
     let pool = Arc::new(SharedCompressorPool::new(config));
     let mut client = CompressionContext::with_shared_pool(pool, false);
