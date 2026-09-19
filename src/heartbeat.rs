@@ -60,13 +60,11 @@ impl Heartbeat {
             return None;
         }
 
-        // A Pong timeout deliberately wins ties with the hard idle timeout.
-        if let Some(deadline) = self.outstanding.as_ref().and_then(|ping| ping.deadline_ms) {
-            return Some(Deadline::Pong(deadline));
+        let timeout = self.next_timeout();
+        if matches!(timeout, Some(Deadline::Pong(_))) {
+            return timeout;
         }
-
-        let idle = (self.idle_timeout_ms != 0)
-            .then(|| self.last_inbound_ms.saturating_add(self.idle_timeout_ms));
+        let idle = timeout.map(Deadline::at);
         let ping = (self.auto_ping && self.outstanding.is_none())
             .then(|| self.last_inbound_ms.saturating_add(self.ping_interval_ms));
 
@@ -277,5 +275,23 @@ mod tests {
             .idle_timeout(0)
             .build();
         assert_eq!(Heartbeat::new(&zero_interval, 0).next_deadline(), None);
+    }
+}
+
+#[cfg(test)]
+mod deadline_order_test {
+    use super::*;
+
+    #[test]
+    fn earlier_idle_timeout_is_not_hidden_by_outstanding_pong() {
+        let config = Config::builder()
+            .ping_interval(1)
+            .pong_timeout(5)
+            .idle_timeout(2)
+            .build();
+        let mut heartbeat = Heartbeat::new(&config, 0);
+        assert!(heartbeat.ping_due(1000).is_some());
+        heartbeat.ping_flushed(1000);
+        assert_eq!(heartbeat.next_deadline(), Some(Deadline::Idle(2000)));
     }
 }
