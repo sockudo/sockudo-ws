@@ -309,3 +309,13 @@ strip = true
 opt-level = 3
 lto = "thin"
 debug = true
+
+[[bench]]
+name = "client_receive_bench"
+harness = false
+required-features = ["tokio-runtime", "rustls-webpki-roots"]
+
+[[bench]]
+name = "delivery_diagnostic_bench"
+harness = false
+required-features = ["tokio-runtime"]
