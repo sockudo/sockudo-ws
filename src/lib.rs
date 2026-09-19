@@ -461,6 +461,18 @@ pub struct Config {
     /// Maximum time spent flushing a timeout/handshake Close and shutting down
     /// the transport (default: 5 seconds, 0 = immediate best effort).
     pub close_timeout: u32,
+    /// Coalesce outbound frames while inbound messages are still queued
+    /// (default: true).
+    ///
+    /// When the stream has already parsed more inbound messages than the
+    /// application has consumed, `poll_flush` keeps the encoded frames in the
+    /// write buffer instead of issuing a write per `send()`. Everything is
+    /// written in one vectored write before the stream next waits for the
+    /// transport, or as soon as the buffer reaches the high water mark. This
+    /// turns a read batch of N messages answered with N `send()` calls into
+    /// one syscall instead of N. Disable for strict "returned means written"
+    /// semantics on every `send()`.
+    pub write_coalescing: bool,
     /// Per-message deflate configuration (requires `permessage-deflate` feature)
     #[cfg(feature = "permessage-deflate")]
     pub deflate: Option<crate::deflate::DeflateConfig>,
@@ -492,6 +504,7 @@ impl Default for Config {
             pong_timeout_close_code: crate::error::CloseReason::GOING_AWAY,
             pong_timeout_close_reason: "Pong reply not received in time".to_string(),
             close_timeout: 5,
+            write_coalescing: true,
             #[cfg(feature = "permessage-deflate")]
             deflate: None,
             #[cfg(feature = "http2")]
@@ -528,6 +541,7 @@ impl Config {
             pong_timeout_close_code: crate::error::CloseReason::GOING_AWAY,
             pong_timeout_close_reason: "Pong reply not received in time".to_string(),
             close_timeout: 5,
+            write_coalescing: true,
             #[cfg(feature = "permessage-deflate")]
             deflate: None,
             #[cfg(feature = "http2")]
@@ -631,6 +645,14 @@ impl ConfigBuilder {
     /// Set the bounded Close flush/shutdown deadline in seconds.
     pub fn close_timeout(mut self, seconds: u32) -> Self {
         self.config.close_timeout = seconds;
+        self
+    }
+
+    /// Enable or disable coalescing of outbound frames across `send()` calls
+    /// while inbound messages are still queued (see
+    /// [`Config::write_coalescing`]).
+    pub fn write_coalescing(mut self, enabled: bool) -> Self {
+        self.config.write_coalescing = enabled;
         self
     }
 

@@ -27,22 +27,31 @@ pub enum CorkState {
 /// Write buffer for batching small writes
 ///
 /// This implements the "corking" optimization from uWebSockets:
-/// - Small writes accumulate in a buffer
-/// - When buffer is full or uncorked, all data is flushed at once
-/// - Large writes bypass the cork for efficiency
+/// - Small writes accumulate in a buffer and go out in one `writev`
+/// - Large payloads are queued as `Bytes` segments without copying
+/// - Output order is always the order of the `write*` calls
+///
+/// Internally the pending output is an ordered list of frozen `Bytes`
+/// segments followed by the open `buffer` that new small writes append to.
+/// Queueing a large `Bytes` freezes the open buffer into a segment first, so a
+/// header written just before it and a frame written just after it stay in
+/// order around it.
 #[repr(C, align(64))] // Cache-line aligned
 pub struct CorkBuffer {
-    /// Main cork buffer for small writes
+    /// Open tail buffer that small writes append to
     buffer: BytesMut,
-    /// Maximum cork buffer size
+    /// Soft limit for the open buffer; `write` reports when it is exceeded
     max_size: usize,
     /// Current cork state
     state: CorkState,
-    /// Overflow queue for large messages and backpressure
-    overflow: VecDeque<Bytes>,
-    /// Total bytes in overflow queue
-    overflow_bytes: usize,
+    /// Frozen segments queued before `buffer`, in output order
+    segments: VecDeque<Bytes>,
+    /// Total bytes in `segments`
+    segment_bytes: usize,
 }
+
+/// Payloads at least this large are queued by reference instead of copied.
+pub const ZERO_COPY_MIN: usize = 8 * 1024;
 
 impl CorkBuffer {
     /// Create a new cork buffer with default size
@@ -56,8 +65,8 @@ impl CorkBuffer {
             buffer: BytesMut::with_capacity(capacity),
             max_size: capacity,
             state: CorkState::Uncorked,
-            overflow: VecDeque::new(),
-            overflow_bytes: 0,
+            segments: VecDeque::new(),
+            segment_bytes: 0,
         }
     }
 
@@ -88,96 +97,89 @@ impl CorkBuffer {
     /// Check if there's any pending data
     #[inline]
     pub fn has_data(&self) -> bool {
-        !self.buffer.is_empty() || !self.overflow.is_empty()
+        !self.buffer.is_empty() || !self.segments.is_empty()
     }
 
     /// Get total pending bytes
     #[inline]
     pub fn pending_bytes(&self) -> usize {
-        self.buffer.len() + self.overflow_bytes
+        self.buffer.len() + self.segment_bytes
     }
 
-    /// Write data to the buffer
+    /// Copy data into the buffer
     ///
-    /// Returns:
-    /// - `Ok(true)` if data fits in cork buffer
-    /// - `Ok(false)` if data was queued (needs flush)
+    /// Returns `true` while the open buffer is within its configured size and
+    /// `false` once it has grown past it, which is the caller's cue to flush.
     #[inline]
     pub fn write(&mut self, data: &[u8]) -> bool {
-        let len = data.len();
-
-        // Fast path: data fits in cork buffer
-        if self.buffer.len() + len <= self.max_size {
-            self.buffer.extend_from_slice(data);
-            return true;
-        }
-
-        // Large message or buffer full: queue for later
-        self.overflow.push_back(Bytes::copy_from_slice(data));
-        self.overflow_bytes += len;
-        false
+        self.buffer.extend_from_slice(data);
+        self.buffer.len() <= self.max_size
     }
 
-    /// Write bytes (zero-copy for Bytes)
+    /// Queue bytes for writing, without copying large payloads
+    ///
+    /// Small payloads are copied into the open buffer. Payloads of at least
+    /// [`ZERO_COPY_MIN`] bytes are queued by reference behind everything
+    /// written so far, so a frame header written just before stays in front.
     #[inline]
     pub fn write_bytes(&mut self, data: Bytes) {
-        let len = data.len();
-
-        // Small data: try to fit in cork buffer
-        if len <= 128 && self.buffer.len() + len <= self.max_size {
+        if data.len() < ZERO_COPY_MIN {
             self.buffer.extend_from_slice(&data);
             return;
         }
-
-        // Large or doesn't fit: queue directly
-        self.overflow.push_back(data);
-        self.overflow_bytes += len;
+        self.push_segment(data);
     }
 
-    /// Fill `out` with pending data as IoSlices, without allocating.
+    /// Queue bytes by reference regardless of size, preserving order.
+    #[inline]
+    pub fn push_segment(&mut self, data: Bytes) {
+        if data.is_empty() {
+            return;
+        }
+        if !self.buffer.is_empty() {
+            let closed = self.buffer.split().freeze();
+            self.segment_bytes += closed.len();
+            self.segments.push_back(closed);
+        }
+        self.segment_bytes += data.len();
+        self.segments.push_back(data);
+    }
+
+    /// Fill `out` with pending data as IoSlices, in output order, without
+    /// allocating.
     ///
     /// Returns the number of slices written. At most `out.len()` slices are
-    /// produced; if more chunks are pending, they are picked up by the next
-    /// call after `consume`. Use this in hot paths instead of
+    /// produced; anything left over is picked up by the next call after
+    /// `consume`. Use this in hot paths instead of
     /// [`CorkBuffer::get_write_slices`].
     #[inline]
     pub fn fill_write_slices<'a>(&'a self, out: &mut [IoSlice<'a>]) -> usize {
         let mut n = 0;
-        if out.is_empty() {
-            return 0;
+        for segment in &self.segments {
+            if n == out.len() {
+                return n;
+            }
+            out[n] = IoSlice::new(segment);
+            n += 1;
         }
-
-        if !self.buffer.is_empty() {
+        if n < out.len() && !self.buffer.is_empty() {
             out[n] = IoSlice::new(&self.buffer);
             n += 1;
         }
-
-        for chunk in &self.overflow {
-            if n == out.len() {
-                break;
-            }
-            out[n] = IoSlice::new(chunk);
-            n += 1;
-        }
-
         n
     }
 
     /// Get data for writing as IoSlices (for vectored I/O)
     ///
-    /// This is optimized for `writev` syscall to minimize copies.
     /// Allocates a `Vec`; prefer [`CorkBuffer::fill_write_slices`] in hot paths.
     pub fn get_write_slices(&self) -> Vec<IoSlice<'_>> {
-        let mut slices = Vec::with_capacity(1 + self.overflow.len());
-
+        let mut slices = Vec::with_capacity(self.segments.len() + 1);
+        for segment in &self.segments {
+            slices.push(IoSlice::new(segment));
+        }
         if !self.buffer.is_empty() {
             slices.push(IoSlice::new(&self.buffer));
         }
-
-        for chunk in &self.overflow {
-            slices.push(IoSlice::new(chunk));
-        }
-
         slices
     }
 
@@ -185,34 +187,30 @@ impl CorkBuffer {
     ///
     /// Call this after a successful write to remove sent data.
     pub fn consume(&mut self, mut n: usize) {
-        // First consume from main buffer
-        if !self.buffer.is_empty() {
-            let to_consume = n.min(self.buffer.len());
-            self.buffer.advance(to_consume);
-            n -= to_consume;
-        }
-
-        // Then consume from overflow
-        while n > 0 && !self.overflow.is_empty() {
-            let front_len = self.overflow.front().unwrap().len();
-            if n >= front_len {
-                self.overflow.pop_front();
-                self.overflow_bytes -= front_len;
-                n -= front_len;
-            } else {
-                // Partial consume - this is rare
-                let front = self.overflow.pop_front().unwrap();
-                self.overflow_bytes -= front.len();
-                self.overflow.push_front(front.slice(n..));
-                self.overflow_bytes += self.overflow.front().unwrap().len();
+        while n > 0 {
+            let Some(front) = self.segments.front_mut() else {
                 break;
+            };
+            if n >= front.len() {
+                n -= front.len();
+                self.segment_bytes -= front.len();
+                self.segments.pop_front();
+            } else {
+                front.advance(n);
+                self.segment_bytes -= n;
+                return;
             }
+        }
+        if n > 0 {
+            let take = n.min(self.buffer.len());
+            self.buffer.advance(take);
         }
     }
 
-    /// Take the cork buffer contents
+    /// Take the open buffer contents
     ///
-    /// This is used when we need to move the data elsewhere.
+    /// This is used when we need to move the data elsewhere. Queued segments
+    /// are unaffected.
     pub fn take_buffer(&mut self) -> BytesMut {
         std::mem::replace(&mut self.buffer, BytesMut::with_capacity(self.max_size))
     }
@@ -220,18 +218,19 @@ impl CorkBuffer {
     /// Clear all pending data
     pub fn clear(&mut self) {
         self.buffer.clear();
-        self.overflow.clear();
-        self.overflow_bytes = 0;
+        self.segments.clear();
+        self.segment_bytes = 0;
     }
 
-    /// Reserve additional capacity in the main buffer
+    /// Reserve additional capacity in the open buffer
     pub fn reserve(&mut self, additional: usize) {
         self.buffer.reserve(additional);
     }
 
-    /// Get mutable access to the internal buffer
+    /// Get mutable access to the open buffer
     ///
-    /// This is for direct frame encoding into the cork buffer.
+    /// This is for direct frame encoding into the cork buffer. Data appended
+    /// here is ordered after every segment queued so far.
     #[inline]
     pub fn buffer_mut(&mut self) -> &mut BytesMut {
         &mut self.buffer
@@ -252,12 +251,10 @@ impl Buf for CorkBuffer {
     }
 
     fn chunk(&self) -> &[u8] {
-        if !self.buffer.is_empty() {
-            &self.buffer
-        } else if let Some(front) = self.overflow.front() {
+        if let Some(front) = self.segments.front() {
             front
         } else {
-            &[]
+            &self.buffer
         }
     }
 
@@ -334,11 +331,42 @@ mod tests {
         // First write fits
         assert!(cork.write(b"hello"));
 
-        // Second write overflows
+        // Second write grows past the soft limit; data is still one slice
         assert!(!cork.write(b"world! this is a longer message"));
 
         let slices = cork.get_write_slices();
+        assert_eq!(slices.len(), 1);
+        assert_eq!(cork.pending_bytes(), 5 + 31);
+    }
+
+    #[test]
+    fn test_cork_zero_copy_keeps_order() {
+        let mut cork = CorkBuffer::with_capacity(1024);
+        let big = Bytes::from(vec![0xAB; ZERO_COPY_MIN]);
+
+        cork.write(b"header");
+        cork.write_bytes(big.clone());
+        cork.write(b"next frame");
+
+        let slices = cork.get_write_slices();
+        assert_eq!(slices.len(), 3);
+        assert_eq!(&slices[0][..], b"header");
+        assert_eq!(slices[1].len(), ZERO_COPY_MIN);
+        assert_eq!(&slices[2][..], b"next frame");
+        assert_eq!(cork.pending_bytes(), 6 + ZERO_COPY_MIN + 10);
+
+        // Partial consume inside the large segment, then the rest
+        cork.consume(6 + 100);
+        let slices = cork.get_write_slices();
         assert_eq!(slices.len(), 2);
+        assert_eq!(slices[0].len(), ZERO_COPY_MIN - 100);
+        cork.consume(ZERO_COPY_MIN - 100 + 10);
+        assert!(!cork.has_data());
+        assert_eq!(cork.pending_bytes(), 0);
+
+        // Buffer is reusable after the segments are gone
+        cork.write(b"again");
+        assert_eq!(cork.get_write_slices().len(), 1);
     }
 
     #[test]
