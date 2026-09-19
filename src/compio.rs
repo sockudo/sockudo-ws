@@ -1868,7 +1868,10 @@ async fn compio_split_writer_driver<W, E>(
     } = channels;
     let epoch = shared.epoch;
     let mut heartbeat = Heartbeat::new(&config, epoch.elapsed().as_millis() as u64);
-    let mut closing_deadline: Option<Instant> = None;
+    let mut closing = CompioClosing {
+        deadline: None,
+        timeout: Duration::from_secs(config.close_timeout.into()),
+    };
     let mut local_close_sent = false;
     let mut write_buf = BytesMut::with_capacity(config.write_buffer_size);
     let mut deferred_control = None;
@@ -1885,7 +1888,8 @@ async fn compio_split_writer_driver<W, E>(
         let heartbeat_delay = heartbeat_deadline
             .map(|deadline| Duration::from_millis(deadline.at().saturating_sub(now_ms)))
             .unwrap_or(Duration::from_secs(365 * 24 * 60 * 60));
-        let close_delay = closing_deadline
+        let close_delay = closing
+            .deadline
             .map(|deadline| deadline.saturating_duration_since(Instant::now()))
             .unwrap_or(Duration::from_secs(365 * 24 * 60 * 60));
         let timer_delay = heartbeat_delay.min(close_delay);
@@ -1905,7 +1909,7 @@ async fn compio_split_writer_driver<W, E>(
             // Check the clock on every poll, including when the runtime has not
             // dispatched the timer yet but application requests are already ready.
             let timer = std::future::poll_fn(|cx| {
-                if closing_deadline.is_some_and(|at| Instant::now() >= at)
+                if closing.deadline.is_some_and(|at| Instant::now() >= at)
                     || heartbeat_deadline
                         .is_some_and(|deadline| epoch.elapsed().as_millis() as u64 >= deadline.at())
                 {
@@ -1949,6 +1953,7 @@ async fn compio_split_writer_driver<W, E>(
                         &mut deferred_control,
                         &mut cancel_rx,
                         &shared,
+                        &mut closing,
                     )
                     .await
                     {
@@ -1957,11 +1962,12 @@ async fn compio_split_writer_driver<W, E>(
                 }
                 ControlRequest::PeerClose => {
                     heartbeat.stop();
+                    let deadline = closing.begin();
                     if !local_close_sent {
                         write_buf.clear();
                         encoder.encode_close_response(&mut write_buf);
                         let _ = ::compio::time::timeout(
-                            Duration::from_secs(config.close_timeout.into()),
+                            deadline.saturating_duration_since(Instant::now()),
                             flush_bytes(&mut writer, &mut write_buf),
                         )
                         .await;
@@ -1980,6 +1986,7 @@ async fn compio_split_writer_driver<W, E>(
                         shared.begin_closing();
                         heartbeat.stop();
                         local_close_sent = true;
+                        closing.begin();
                     }
                     write_buf.clear();
                     let result = match encoder.encode_message(&message, &mut write_buf) {
@@ -1991,6 +1998,7 @@ async fn compio_split_writer_driver<W, E>(
                                 &mut deferred_control,
                                 &mut cancel_rx,
                                 &shared,
+                                &mut closing,
                             )
                             .await
                         }
@@ -2002,10 +2010,6 @@ async fn compio_split_writer_driver<W, E>(
                         break cause;
                     }
                     let _ = completion.send(Ok(()));
-                    if is_close {
-                        closing_deadline =
-                            Some(Instant::now() + Duration::from_secs(config.close_timeout.into()));
-                    }
                 }
                 ApplicationRequest::Flush(completion) => {
                     write_buf.clear();
@@ -2016,6 +2020,7 @@ async fn compio_split_writer_driver<W, E>(
                         &mut deferred_control,
                         &mut cancel_rx,
                         &shared,
+                        &mut closing,
                     )
                     .await;
                     if let Err(error) = result {
@@ -2029,7 +2034,10 @@ async fn compio_split_writer_driver<W, E>(
             CompioDriverWake::Timer => {
                 // Recheck activity recorded while the old timer was asleep.
                 heartbeat.on_inbound(shared.last_inbound_ms.get(), None);
-                if closing_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+                if closing
+                    .deadline
+                    .is_some_and(|deadline| deadline <= Instant::now())
+                {
                     break CompioTerminalCause::ConnectionClosed;
                 }
 
@@ -2051,6 +2059,7 @@ async fn compio_split_writer_driver<W, E>(
                                 &mut deferred_control,
                                 &mut cancel_rx,
                                 &shared,
+                                &mut closing,
                             )
                             .await
                             {
@@ -2099,6 +2108,20 @@ async fn compio_split_writer_driver<W, E>(
     }
 }
 
+// One budget covers finishing the current frame and the Close response.
+struct CompioClosing {
+    deadline: Option<Instant>,
+    timeout: Duration,
+}
+
+impl CompioClosing {
+    fn begin(&mut self) -> Instant {
+        *self
+            .deadline
+            .get_or_insert_with(|| Instant::now() + self.timeout)
+    }
+}
+
 // Keep the same owned write alive across controls and timer wakes. Restarting
 // write_all after a partial write would duplicate bytes in the current frame.
 async fn await_compio_write(
@@ -2108,12 +2131,14 @@ async fn await_compio_write(
     deferred_control: &mut Option<ControlRequest>,
     cancel_rx: &mut mpsc::UnboundedReceiver<()>,
     shared: &CompioSplitShared,
+    closing: &mut CompioClosing,
 ) -> Result<()> {
     let write = write.fuse();
     futures_util::pin_mut!(write);
     loop {
         heartbeat.on_inbound(shared.last_inbound_ms.get(), None);
         let deadline = heartbeat.next_timeout();
+        let close_at = closing.deadline;
         let can_read_control = !matches!(deferred_control, Some(ControlRequest::PeerClose));
         let control = async {
             if can_read_control {
@@ -2125,16 +2150,27 @@ async fn await_compio_write(
         .fuse();
         let cancel = cancel_rx.next().fuse();
         let timer = async {
-            let Some(deadline) = deadline else {
-                return std::future::pending::<()>().await;
+            let heartbeat_delay = deadline.map(|deadline| {
+                Duration::from_millis(
+                    deadline
+                        .at()
+                        .saturating_sub(shared.epoch.elapsed().as_millis() as u64),
+                )
+            });
+            let close_delay = close_at.map(|at| at.saturating_duration_since(Instant::now()));
+            let delay = match (heartbeat_delay, close_delay) {
+                (Some(a), Some(b)) => a.min(b),
+                (Some(a), None) | (None, Some(a)) => a,
+                (None, None) => return std::future::pending::<()>().await,
             };
-            let delay = deadline
-                .at()
-                .saturating_sub(shared.epoch.elapsed().as_millis() as u64);
-            let sleep = ::compio::time::sleep(Duration::from_millis(delay));
+            let sleep = ::compio::time::sleep(delay);
             futures_util::pin_mut!(sleep);
             std::future::poll_fn(|cx| {
-                if shared.epoch.elapsed().as_millis() as u64 >= deadline.at() {
+                if close_at.is_some_and(|at| Instant::now() >= at)
+                    || deadline.is_some_and(|deadline| {
+                        shared.epoch.elapsed().as_millis() as u64 >= deadline.at()
+                    })
+                {
                     std::task::Poll::Ready(())
                 } else {
                     sleep.as_mut().poll(cx)
@@ -2159,12 +2195,18 @@ async fn await_compio_write(
                     *deferred_control = Some(ControlRequest::PeerPing(payload, received_at));
                 }
                 Some(ControlRequest::PeerClose) => {
-                    // Complete the current frame before encoding a Close response.
+                    // Complete the current frame before encoding a Close response,
+                    // within the same closing budget as that response.
+                    heartbeat.stop();
+                    closing.begin();
                     *deferred_control = Some(ControlRequest::PeerClose);
                 }
                 None => return Err(Error::ConnectionClosed),
             },
             _ = timer => {
+                if close_at.is_some_and(|at| Instant::now() >= at) {
+                    return Err(Error::ConnectionClosed);
+                }
                 heartbeat.on_inbound(shared.last_inbound_ms.get(), None);
                 let now_ms = shared.epoch.elapsed().as_millis() as u64;
                 match heartbeat.next_timeout() {

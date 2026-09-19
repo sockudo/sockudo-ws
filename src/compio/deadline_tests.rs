@@ -1,7 +1,7 @@
 use super::*;
 use std::cell::RefCell;
 
-struct RecordingWriter(Rc<RefCell<Vec<u8>>>);
+struct RecordingWriter(Rc<RefCell<Vec<u8>>>, Rc<Cell<bool>>);
 
 impl AsyncWrite for RecordingWriter {
     async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
@@ -11,7 +11,14 @@ impl AsyncWrite for RecordingWriter {
     }
 
     async fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        std::future::poll_fn(|_| {
+            if self.1.get() {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(Ok(()))
+            }
+        })
+        .await
     }
 
     async fn shutdown(&mut self) -> io::Result<()> {
@@ -21,6 +28,7 @@ impl AsyncWrite for RecordingWriter {
 
 struct DriverPeer {
     bytes: Rc<RefCell<Vec<u8>>>,
+    flush_blocked: Rc<Cell<bool>>,
     application: mpsc::Sender<ApplicationRequest>,
     control: mpsc::Sender<ControlRequest>,
     _cancel: mpsc::UnboundedSender<()>,
@@ -51,8 +59,9 @@ fn driver(
     let (terminal_tx, _) = mpsc::unbounded();
     let shared = CompioSplitShared::new(false);
     let bytes = Rc::new(RefCell::new(Vec::new()));
+    let flush_blocked = Rc::new(Cell::new(false));
     let task = compio_split_writer_driver(
-        RecordingWriter(bytes.clone()),
+        RecordingWriter(bytes.clone(), flush_blocked.clone()),
         encoder,
         config,
         CompioDriverChannels {
@@ -66,6 +75,7 @@ fn driver(
     (
         DriverPeer {
             bytes,
+            flush_blocked,
             application,
             control,
             _cancel: cancel,
@@ -199,4 +209,77 @@ async fn compressed_idle_timeout_precedes_queued_data() {
         peer.shared.terminal.get(),
         Some(CompioTerminalCause::IdleTimeout)
     ));
+}
+
+#[compio::test]
+async fn application_close_bounds_a_blocked_flush() {
+    let config = Config::builder()
+        .auto_ping(false)
+        .idle_timeout(0)
+        .close_timeout(0)
+        .build();
+    let (mut peer, task) = driver(
+        Protocol::new(Role::Server, config.max_frame_size, config.max_message_size),
+        config,
+    );
+    peer.flush_blocked.set(true);
+    let (completion, _) = oneshot::channel();
+    peer.application
+        .try_send(ApplicationRequest::Send(Message::Close(None), completion))
+        .unwrap();
+    let mut task = std::pin::pin!(task);
+    assert!(futures_util::poll!(task.as_mut()).is_ready());
+    assert!(peer.shared.terminal.get().is_some());
+}
+
+#[compio::test]
+async fn peer_close_bounds_an_existing_blocked_write() {
+    let config = Config::builder()
+        .auto_ping(false)
+        .idle_timeout(0)
+        .close_timeout(0)
+        .build();
+    let (mut peer, task) = driver(
+        Protocol::new(Role::Server, config.max_frame_size, config.max_message_size),
+        config,
+    );
+    peer.flush_blocked.set(true);
+    peer.queue_data();
+    let mut task = std::pin::pin!(task);
+    assert!(futures_util::poll!(task.as_mut()).is_pending());
+    peer.control.try_send(ControlRequest::PeerClose).unwrap();
+    assert!(futures_util::poll!(task.as_mut()).is_ready());
+    assert!(peer.shared.terminal.get().is_some());
+}
+
+#[compio::test]
+async fn pong_received_during_ping_flush_prevents_false_timeout() {
+    let config = Config::builder()
+        .ping_interval(1)
+        .pong_timeout(1)
+        .idle_timeout(0)
+        .build();
+    let (mut peer, task) = driver(
+        Protocol::new(Role::Server, config.max_frame_size, config.max_message_size),
+        config,
+    );
+    peer.flush_blocked.set(true);
+    let mut task = std::pin::pin!(task);
+    assert!(futures_util::poll!(task.as_mut()).is_pending());
+    ::compio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(futures_util::poll!(task.as_mut()).is_pending());
+    let frame = peer.bytes.borrow().clone();
+    assert_eq!(&frame[..2], &[0x89, 8]);
+    peer.control
+        .try_send(ControlRequest::Pong(
+            Bytes::copy_from_slice(&frame[2..]),
+            Instant::now(),
+        ))
+        .unwrap();
+    assert!(futures_util::poll!(task.as_mut()).is_pending());
+    peer.flush_blocked.set(false);
+    assert!(futures_util::poll!(task.as_mut()).is_pending());
+    ::compio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(futures_util::poll!(task.as_mut()).is_pending());
+    assert!(peer.shared.terminal.get().is_none());
 }

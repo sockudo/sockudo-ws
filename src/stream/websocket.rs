@@ -1386,8 +1386,6 @@ async fn split_writer_driver<S, E>(
     let mut local_close_sent = false;
     let mut peer_close = false;
     let mut pending_pong = None;
-    let mut ping_payload = None;
-    let mut early_pong_ms = None;
     let pending_write = None;
     tokio::pin!(pending_write);
 
@@ -1410,7 +1408,9 @@ async fn split_writer_driver<S, E>(
                 if local_close_sent {
                     // Include acquiring the sink in the shutdown bound, too.
                     let _ = tokio::time::timeout(
-                        Duration::from_secs(config.close_timeout.into()),
+                        closing_deadline
+                            .unwrap_or_else(tokio::time::Instant::now)
+                            .saturating_duration_since(tokio::time::Instant::now()),
                         async {
                             let mut guard = sink.lock().await;
                             guard.writer.flush().await?;
@@ -1481,11 +1481,6 @@ async fn split_writer_driver<S, E>(
                     }
                     ControlRequest::Pong(payload, received_at) => {
                         let received_ms = received_at.saturating_duration_since(epoch).as_millis() as u64;
-                        if ping_payload.as_ref() == Some(&payload) {
-                            // The peer may see the Ping before our transport's flush
-                            // finishes. Apply its acknowledgement after ping_flushed.
-                            early_pong_ms = Some(received_ms);
-                        }
                         heartbeat.on_inbound(received_ms, Some(&payload));
                     }
                     ControlRequest::PeerClose => {
@@ -1524,7 +1519,6 @@ async fn split_writer_driver<S, E>(
                 match if pending_write.is_some() { heartbeat.next_timeout() } else { heartbeat.next_deadline() } {
                     Some(Deadline::Ping(at)) if at <= now_ms && pending_write.is_none() => {
                         if let Some(payload) = heartbeat.ping_due(now_ms) {
-                            ping_payload = Some(payload.clone());
                             pending_write.set(Some(write_split_control(sink.clone(), SplitControlFrame::Ping(payload), shared.cancel.clone())));
                         }
                     }
@@ -1547,12 +1541,8 @@ async fn split_writer_driver<S, E>(
                     break;
                 }
                 match frame {
-                    SplitControlFrame::Ping(payload) => {
+                    SplitControlFrame::Ping(_) => {
                         heartbeat.ping_flushed(epoch.elapsed().as_millis() as u64);
-                        if let Some(received_ms) = early_pong_ms.take() {
-                            heartbeat.on_inbound(received_ms, Some(&payload));
-                        }
-                        ping_payload = None;
                     },
                     SplitControlFrame::Close => local_close_sent = true,
                     SplitControlFrame::Pong(_) => {}
@@ -1580,19 +1570,6 @@ where
     }
 }
 
-async fn bounded_shutdown<W>(writer: &mut W, seconds: u32) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    tokio::time::timeout(Duration::from_secs(seconds.into()), async {
-        writer.flush().await?;
-        writer.shutdown().await
-    })
-    .await
-    .map_err(|_| Error::ConnectionClosed)?
-    .map_err(Into::into)
-}
-
 async fn timeout_close<S, E>(
     transport: &SplitTransport<S>,
     sink: &SharedSink<SplitTransport<S>, E>,
@@ -1607,14 +1584,17 @@ async fn timeout_close<S, E>(
 {
     if let Ok(mut guard) = sink.try_lock() {
         let close = Message::Close(Some(CloseReason::new(code, bounded_close_reason(reason))));
-        let _ = tokio::time::timeout(
-            Duration::from_secs(config.close_timeout.into()),
-            guard.write_frame(&shared.cancel, |encoder, buf| {
-                encoder.encode_message(&close, buf)
-            }),
-        )
+        let _ = tokio::time::timeout(Duration::from_secs(config.close_timeout.into()), async {
+            guard
+                .write_frame(&shared.cancel, |encoder, buf| {
+                    encoder.encode_message(&close, buf)
+                })
+                .await?;
+            guard.writer.flush().await?;
+            guard.writer.shutdown().await?;
+            Ok::<(), Error>(())
+        })
         .await;
-        let _ = bounded_shutdown(&mut guard.writer, config.close_timeout).await;
     }
     // Release the transport and publish its typed cause before waking either handle.
     transport.close_with(|| shared.terminate(cause));
