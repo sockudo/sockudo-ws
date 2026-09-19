@@ -60,7 +60,10 @@ impl AsyncWrite for Input {
 }
 
 fn main() {
-    let args: Vec<_> = std::env::args().collect();
+    let mut args: Vec<_> = std::env::args().filter(|arg| arg != "--bench").collect();
+    if args.len() == 1 {
+        args.extend(["0"].map(str::to_owned));
+    }
     assert_eq!(
         args.len(),
         2,

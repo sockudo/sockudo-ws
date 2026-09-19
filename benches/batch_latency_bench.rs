@@ -12,6 +12,9 @@ use sockudo_ws::{Config, Message, WebSocketStream};
 use tokio::net::TcpStream;
 
 fn pin_thread(cpu: &str) {
+    if cpu == "-" {
+        return;
+    }
     let thread = std::fs::read_link("/proc/thread-self").unwrap();
     let tid = thread.file_name().unwrap().to_str().unwrap();
     let result = std::process::Command::new("taskset")
@@ -38,10 +41,13 @@ fn stamp(epoch: Instant) -> u64 {
 }
 
 fn main() {
-    let args: Vec<_> = std::env::args()
+    let mut args: Vec<_> = std::env::args()
         .skip(1)
         .filter(|x| x != "--bench")
         .collect();
+    if args.is_empty() {
+        args.extend(["--case", "send", "64", "1", "8", "-", "-", "0", "true"].map(str::to_owned));
+    }
     assert_eq!(
         args.len(),
         9,
