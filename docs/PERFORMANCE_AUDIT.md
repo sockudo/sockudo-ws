@@ -284,15 +284,15 @@ All of section 4 except the runtime is now done, in the working tree after v2.1.
 
 ### 6.1 Batch-scoped write coalescing (`Config::write_coalescing`, default on)
 
-`send_coalesced()` may return without writing while parsed inbound messages remain queued
-and the write buffer is under the high-water mark. `poll_next` flushes before waiting on the
-transport. Standard `SinkExt::send` and `SinkExt::flush` always flush; callers opting into
-coalescing must explicitly flush before pausing reads or waiting for a reply. The
-`Config::write_coalescing` setting applies only to the explicit coalesced-send methods.
+`SinkExt::feed()` buffers frames; `poll_ready` drains at the high-water mark before
+accepting another frame. With `Config::write_coalescing=false`, readiness drains
+any pending frame. Standard `SinkExt::send` and `SinkExt::flush` always flush.
+Flush after feeding a batch before pausing reads or waiting for replies.
+`poll_next` also flushes before waiting on the transport.
 
-The measurements below were collected with the earlier implicit coalescing API; using the
-explicit API preserves the batching mechanism, but these measurements have not been rerun
-for the API change.
+The measurements below were collected with the earlier implicit coalescing API.
+The standard feed/flush API retains the batching mechanism, but these historical
+measurements have not been rerun for this change.
 
 Same neutral client as section 2.2, `depth` messages in flight per connection:
 

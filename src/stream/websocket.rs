@@ -84,6 +84,7 @@ pin_project! {
         flush_on_read: bool,
         close_after_flush: bool,
         ping_flush_pending: bool,
+        ready_flush_pending: bool,
         clock_epoch: tokio::time::Instant,
         heartbeat: Heartbeat,
         heartbeat_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
@@ -145,6 +146,7 @@ where
             flush_on_read: false,
             close_after_flush: false,
             ping_flush_pending: false,
+            ready_flush_pending: false,
             clock_epoch,
             heartbeat,
             heartbeat_sleep: None,
@@ -394,30 +396,6 @@ where
             .expect("heartbeat timer armed above")
             .as_mut()
             .poll(cx)
-    }
-
-    /// Send a frame, allowing read-batch coalescing when configured.
-    ///
-    /// Unlike `SinkExt::send`, this may return with bytes buffered while inbound
-    /// messages remain queued. Call `SinkExt::flush` before pausing reads or
-    /// waiting for a reply that depends on this frame. Polling for more input
-    /// after the batch, or reaching the high water mark, also flushes the buffer.
-    pub async fn send_coalesced(&mut self, item: Message) -> Result<()> {
-        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_ready(cx)).await?;
-        Pin::new(&mut *self).start_send(item)?;
-        // Batch-scoped corking: while inbound messages that were already
-        // parsed are still queued for the application, keep the encoded
-        // frames buffered. poll_next writes them all in one vectored write
-        // before it next waits on the transport, so a read batch answered
-        // with N coalesced sends costs one syscall instead of N.
-        if self.config.write_coalescing
-            && self.state == StreamState::Open
-            && !self.pending_messages.is_empty()
-            && self.write_buf.pending_bytes() < self.high_water_mark
-        {
-            return Ok(());
-        }
-        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_write_out(cx)).await
     }
 
     /// Write every pending frame to the transport and flush it.
@@ -701,9 +679,21 @@ where
 {
     type Error = Error;
 
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         if self.state != StreamState::Open {
             return Poll::Ready(Err(Error::ConnectionClosed));
+        }
+        if self.write_buf.has_data()
+            && (!self.config.write_coalescing
+                || self.write_buf.pending_bytes() >= self.high_water_mark)
+        {
+            self.ready_flush_pending = true;
+        }
+        // Continue partial writes and the transport flush even if the remaining
+        // buffered bytes have fallen below the high water mark.
+        if self.ready_flush_pending {
+            std::task::ready!(self.as_mut().poll_write_out(cx))?;
+            self.ready_flush_pending = false;
         }
         Poll::Ready(Ok(()))
     }
@@ -1579,6 +1569,7 @@ pin_project! {
         flush_on_read: bool,
         close_after_flush: bool,
         ping_flush_pending: bool,
+        ready_flush_pending: bool,
         clock_epoch: tokio::time::Instant,
         heartbeat: Heartbeat,
         heartbeat_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
@@ -1616,6 +1607,7 @@ where
             flush_on_read: false,
             close_after_flush: false,
             ping_flush_pending: false,
+            ready_flush_pending: false,
             clock_epoch,
             heartbeat,
             heartbeat_sleep: None,
@@ -1648,6 +1640,7 @@ where
             flush_on_read: false,
             close_after_flush: false,
             ping_flush_pending: false,
+            ready_flush_pending: false,
             clock_epoch,
             heartbeat,
             heartbeat_sleep: None,
@@ -1799,30 +1792,6 @@ where
             .expect("heartbeat timer armed above")
             .as_mut()
             .poll(cx)
-    }
-
-    /// Send a frame, allowing read-batch coalescing when configured.
-    ///
-    /// Unlike `SinkExt::send`, this may return with bytes buffered while inbound
-    /// messages remain queued. Call `SinkExt::flush` before pausing reads or
-    /// waiting for a reply that depends on this frame. Polling for more input
-    /// after the batch, or reaching the high water mark, also flushes the buffer.
-    pub async fn send_coalesced(&mut self, item: Message) -> Result<()> {
-        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_ready(cx)).await?;
-        Pin::new(&mut *self).start_send(item)?;
-        // Batch-scoped corking: while inbound messages that were already
-        // parsed are still queued for the application, keep the encoded
-        // frames buffered. poll_next writes them all in one vectored write
-        // before it next waits on the transport, so a read batch answered
-        // with N coalesced sends costs one syscall instead of N.
-        if self.config.write_coalescing
-            && self.state == StreamState::Open
-            && !self.pending_messages.is_empty()
-            && self.write_buf.pending_bytes() < self.high_water_mark
-        {
-            return Ok(());
-        }
-        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_write_out(cx)).await
     }
 
     /// Write every pending frame to the transport and flush it.
@@ -2079,9 +2048,21 @@ where
 {
     type Error = Error;
 
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         if self.state != StreamState::Open {
             return Poll::Ready(Err(Error::ConnectionClosed));
+        }
+        if self.write_buf.has_data()
+            && (!self.config.write_coalescing
+                || self.write_buf.pending_bytes() >= self.high_water_mark)
+        {
+            self.ready_flush_pending = true;
+        }
+        // Continue partial writes and the transport flush even if the remaining
+        // buffered bytes have fallen below the high water mark.
+        if self.ready_flush_pending {
+            std::task::ready!(self.as_mut().poll_write_out(cx))?;
+            self.ready_flush_pending = false;
         }
         Poll::Ready(Ok(()))
     }
@@ -2412,6 +2393,7 @@ impl<S> Drop for CompressedSplitWriter<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::SinkExt;
     use futures_util::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -2780,8 +2762,9 @@ mod tests {
             let task = tokio::spawn(async move {
                 for _ in 0..3 {
                     let msg = server.next().await.unwrap().unwrap();
-                    server.send_coalesced(msg).await.unwrap();
+                    server.feed(msg).await.unwrap();
                 }
+                server.flush().await.unwrap();
                 server
             });
             (client_io, task)
@@ -2796,8 +2779,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_batch_answered_with_sends_is_one_write_when_coalescing() {
-        // Three frames arrive in one read; three send_coalesced() calls answer them.
+    async fn read_batch_answered_with_feeds_is_one_write_when_coalescing() {
+        // Three frames arrive in one read; three feed() calls and a flush answer them.
         assert_eq!(echo_batch_write_count(true).await, 1);
         assert_eq!(echo_batch_write_count(false).await, 3);
     }
@@ -2817,12 +2800,12 @@ mod tests {
         let task = tokio::spawn(async move {
             for _ in 0..2 {
                 let msg = server.next().await.unwrap().unwrap();
-                server.send_coalesced(msg).await.unwrap();
+                server.feed(msg).await.unwrap();
             }
             // Wait for a third message that only arrives after the client saw
             // both echoes.
             let msg = server.next().await.unwrap().unwrap();
-            server.send_coalesced(msg).await.unwrap();
+            server.send(msg).await.unwrap();
         });
         let echoed = tokio::time::timeout(
             Duration::from_secs(2),
@@ -2862,14 +2845,11 @@ mod tests {
         let big_for_task = big.clone();
         let task = tokio::spawn(async move {
             let _ = server.next().await.unwrap().unwrap();
-            server
-                .send_coalesced(Message::Binary(big_for_task))
-                .await
-                .unwrap();
+            server.feed(Message::Binary(big_for_task)).await.unwrap();
             let _ = server.next().await.unwrap().unwrap();
-            server.send_coalesced(Message::text("small")).await.unwrap();
+            server.feed(Message::text("small")).await.unwrap();
             server
-                .send_coalesced(Message::Binary(Bytes::from_static(b"tail")))
+                .send(Message::Binary(Bytes::from_static(b"tail")))
                 .await
                 .unwrap();
         });

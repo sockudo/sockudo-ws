@@ -9,12 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Explicit `send_coalesced()` calls can coalesce outbound frames while parsed
-  inbound messages remain queued (`Config::write_coalescing`, default on).
-  A read batch of N messages answered with N coalesced sends is one vectored
-  write instead of N. Standard `SinkExt::send()` and `SinkExt::flush()` always
-  flush; callers using coalescing must flush before pausing reads or waiting
-  for a reply that depends on buffered output.
+- Standard `SinkExt::send()` and `SinkExt::flush()` always flush. Use `feed()`
+  followed by `flush()` to batch frames. Readiness drains at the high water mark,
+  or before each subsequent frame when `Config::write_coalescing` is disabled.
+  Flush after a batch before pausing reads or waiting for replies.
 - Server-side data payloads of 8 KiB or more are queued by reference behind
   their frame header and sent with vectored I/O instead of being copied into
   the write buffer (`CorkBuffer::push_segment`, `cork::ZERO_COPY_MIN`).

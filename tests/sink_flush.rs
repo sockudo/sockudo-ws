@@ -66,12 +66,12 @@ async fn compressed_send_writes_with_unread_inbound_messages() {
 }
 
 #[tokio::test]
-async fn explicit_flush_drains_a_coalesced_send() {
+async fn explicit_flush_drains_a_buffered_feed() {
     let (io, mut peer) = tokio::io::duplex(128);
     let mut ws = WebSocketStream::client(io, Config::default());
     peer.write_all(b"\x82\x01a\x82\x01b").await.unwrap();
     ws.next().await.unwrap().unwrap();
-    ws.send_coalesced(Message::text("reply")).await.unwrap();
+    ws.feed(Message::text("reply")).await.unwrap();
     assert!(ws.write_buffer_len() > 0);
     ws.flush().await.unwrap();
     assert_eq!(ws.write_buffer_len(), 0);
@@ -83,13 +83,13 @@ async fn explicit_flush_drains_a_coalesced_send() {
 
 #[cfg(feature = "permessage-deflate")]
 #[tokio::test]
-async fn compressed_explicit_flush_drains_a_coalesced_send() {
+async fn compressed_explicit_flush_drains_a_buffered_feed() {
     use sockudo_ws::{CompressedWebSocketStream, deflate::DeflateConfig};
     let (io, mut peer) = tokio::io::duplex(128);
     let mut ws = CompressedWebSocketStream::client(io, Config::default(), DeflateConfig::default());
     peer.write_all(b"\x82\x01a\x82\x01b").await.unwrap();
     ws.next().await.unwrap().unwrap();
-    ws.send_coalesced(Message::text("reply")).await.unwrap();
+    ws.feed(Message::text("reply")).await.unwrap();
     assert!(ws.write_buffer_len() > 0);
     ws.flush().await.unwrap();
     assert_eq!(ws.write_buffer_len(), 0);
@@ -98,3 +98,41 @@ async fn compressed_explicit_flush_drains_a_coalesced_send() {
     tokio::pin!(read);
     assert!(matches!(poll!(&mut read), Poll::Ready(Ok(n)) if n > 0));
 }
+
+macro_rules! high_water_case {
+    ($name:ident, $make:expr) => {
+        #[tokio::test]
+        async fn $name() {
+            let (io, mut peer) = tokio::io::duplex(64);
+            let mut ws = ($make)(io);
+            // The unmasked header plus payload exactly reaches the default 64 KiB mark.
+            ws.feed(Message::binary(vec![1; 65532])).await.unwrap();
+            let mut next = std::pin::pin!(ws.feed(Message::binary(vec![2])));
+            assert!(poll!(next.as_mut()).is_pending());
+            let mut output = vec![0; 65536];
+            let (sent, read) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(next, peer.read_exact(&mut output))
+            })
+            .await
+            .unwrap();
+            sent.unwrap();
+            read.unwrap();
+            assert_eq!(&output[..4], &[0x82, 126, 255, 252]);
+            assert!(output[4..].iter().all(|byte| *byte == 1));
+        }
+    };
+}
+high_water_case!(feed_drains_at_the_high_water_mark, |io| {
+    WebSocketStream::server(io, Config::default())
+});
+#[cfg(feature = "permessage-deflate")]
+high_water_case!(compressed_feed_drains_at_the_high_water_mark, |io| {
+    sockudo_ws::CompressedWebSocketStream::server(
+        io,
+        Config::default(),
+        sockudo_ws::DeflateConfig {
+            compression_threshold: usize::MAX,
+            ..Default::default()
+        },
+    )
+});
