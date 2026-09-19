@@ -978,6 +978,7 @@ struct SplitShared {
     /// Clock epoch shared by the reader and the writer driver
     clock_epoch: Instant,
     track_activity: bool,
+    close_timeout: Duration,
     /// Milliseconds since `clock_epoch` of the last inbound data frame (reader -> driver)
     // A standalone value, not a publication barrier for other shared memory.
     /// Milliseconds since `clock_epoch` of the last inbound data frame (reader -> driver)
@@ -995,6 +996,7 @@ impl SplitShared {
         let (terminal_tx, _) = watch::channel(closed.then_some(TerminalCause::ConnectionClosed));
         Arc::new(Self {
             clock_epoch: Instant::now(),
+            close_timeout: Duration::from_secs(config.close_timeout.into()),
             track_activity: (config.auto_ping && config.ping_interval != 0)
                 || config.idle_timeout != 0,
             last_data_ms: AtomicU64::new(0),
@@ -1360,21 +1362,34 @@ impl<S> SplitWriter<S> {
     /// Zero transport progress does not make cancellation recoverable. Retain
     /// the send future across `select!` if the connection must remain usable.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
-        if !self.shared.is_open() {
-            return Err(self.current_error());
-        }
-        let (tx, rx) = oneshot::channel();
-        self.application_tx
-            .send(ApplicationRequest::Send(msg, tx))
-            .await
-            .map_err(|_| self.current_error())?;
-        let mut guard = SplitSendGuard {
-            shared: &self.shared,
-            completed: false,
+        let is_close = msg.is_close();
+        let close_timeout = self.shared.close_timeout;
+        let send = async {
+            if !self.shared.is_open() {
+                return Err(self.current_error());
+            }
+            let (tx, rx) = oneshot::channel();
+            self.application_tx
+                .send(ApplicationRequest::Send(msg, tx))
+                .await
+                .map_err(|_| self.current_error())?;
+            let mut guard = SplitSendGuard {
+                shared: &self.shared,
+                completed: false,
+            };
+            let result = rx.await.map_err(|_| self.current_error());
+            guard.completed = true;
+            result?
         };
-        let result = rx.await.map_err(|_| self.current_error());
-        guard.completed = true;
-        result?
+        if is_close {
+            // Include time queued behind a blocked control write. Dropping an
+            // accepted send triggers SplitSendGuard and releases the transport.
+            tokio::time::timeout(close_timeout, send)
+                .await
+                .unwrap_or(Err(Error::ConnectionClosed))
+        } else {
+            send.await
+        }
     }
 
     /// Send a text message.
@@ -2883,21 +2898,34 @@ impl<S> CompressedSplitWriter<S> {
     /// Zero transport progress does not make cancellation recoverable. Retain
     /// the send future across `select!` if the connection must remain usable.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
-        if !self.shared.is_open() {
-            return Err(self.current_error());
-        }
-        let (tx, rx) = oneshot::channel();
-        self.application_tx
-            .send(ApplicationRequest::Send(msg, tx))
-            .await
-            .map_err(|_| self.current_error())?;
-        let mut guard = SplitSendGuard {
-            shared: &self.shared,
-            completed: false,
+        let is_close = msg.is_close();
+        let close_timeout = self.shared.close_timeout;
+        let send = async {
+            if !self.shared.is_open() {
+                return Err(self.current_error());
+            }
+            let (tx, rx) = oneshot::channel();
+            self.application_tx
+                .send(ApplicationRequest::Send(msg, tx))
+                .await
+                .map_err(|_| self.current_error())?;
+            let mut guard = SplitSendGuard {
+                shared: &self.shared,
+                completed: false,
+            };
+            let result = rx.await.map_err(|_| self.current_error());
+            guard.completed = true;
+            result?
         };
-        let result = rx.await.map_err(|_| self.current_error());
-        guard.completed = true;
-        result?
+        if is_close {
+            // Include time queued behind a blocked control write. Dropping an
+            // accepted send triggers SplitSendGuard and releases the transport.
+            tokio::time::timeout(close_timeout, send)
+                .await
+                .unwrap_or(Err(Error::ConnectionClosed))
+        } else {
+            send.await
+        }
     }
 
     /// Send a text message
