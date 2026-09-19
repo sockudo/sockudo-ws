@@ -2,7 +2,7 @@
 //!
 //! This module implements RFC 6455 WebSocket frame handling with:
 //! - Zero-copy parsing using buffer views
-//! - Fast-path for small messages (< 126 bytes)
+//! - Fast paths for small and medium masked or unmasked frames
 //! - SIMD-accelerated masking
 //! - Minimal allocations in the hot path
 
@@ -370,20 +370,35 @@ impl FrameParser {
     /// - Err(e) if parsing failed
     #[inline]
     pub fn parse(&mut self, buf: &mut BytesMut) -> Result<Option<Frame>> {
-        // Ultra-fast path for small unmasked frames (server->client)
+        // Ultra-fast path for small and medium unmasked frames (server->client)
         // This handles the common case without any state machine overhead
         if self.state == ParseState::Header && !self.expect_masked && buf.len() >= 2 {
             let b0 = buf[0];
             let b1 = buf[1];
             let len_byte = b1 & 0x7F;
 
-            // Check: small frame, not masked, no extended length
-            if len_byte <= 125 && (b1 & 0x80) == 0 {
-                let payload_len = len_byte as usize;
-                let total_len = 2 + payload_len;
+            // Check: small/medium frame, not masked, no 64-bit length
+            if len_byte <= 126 && (b1 & 0x80) == 0 {
+                let (payload_len, header_len) = if len_byte <= 125 {
+                    (len_byte as usize, 2)
+                } else {
+                    if buf.len() < 4 {
+                        return self.parse_slow(buf);
+                    }
+                    let len = usize::from(u16::from_be_bytes([buf[2], buf[3]]));
+                    if len < 126 {
+                        return self.parse_slow(buf);
+                    }
+                    if len > self.max_frame_size {
+                        // Preserve header-error precedence before the size check.
+                        return self.parse_slow(buf);
+                    }
+                    (len, 4)
+                };
+                let total_len = header_len + payload_len;
 
                 if buf.len() >= total_len {
-                    // We have a complete small frame - parse it inline
+                    // We have a complete unmasked frame - parse it inline
                     let fin = b0 & 0x80 != 0;
                     let rsv1 = b0 & 0x40 != 0;
                     let rsv2 = b0 & 0x20 != 0;
@@ -399,9 +414,12 @@ impl FrameParser {
                         if opcode.is_control() && !fin {
                             return Err(Error::Protocol("control frame must not be fragmented"));
                         }
+                        if opcode.is_control() && payload_len > 125 {
+                            return Err(Error::Protocol("control frame too large"));
+                        }
 
                         // Extract payload
-                        buf.advance(2);
+                        buf.advance(header_len);
                         let payload = buf.split_to(payload_len).freeze();
 
                         return Ok(Some(Frame {
@@ -422,20 +440,32 @@ impl FrameParser {
             }
         }
 
-        // Ultra-fast path for small MASKED frames (client->server)
-        // This handles the common case of small client messages efficiently
+        // Ultra-fast path for small and medium MASKED frames (client->server)
+        // This handles the common case of small and medium client messages efficiently
         if self.state == ParseState::Header && self.expect_masked && buf.len() >= 6 {
             let b0 = buf[0];
             let b1 = buf[1];
             let len_byte = b1 & 0x7F;
 
-            // Check: small frame, masked, no extended length
-            if len_byte <= 125 && (b1 & 0x80) != 0 {
-                let payload_len = len_byte as usize;
-                let total_len = 2 + 4 + payload_len; // header + mask + payload
+            // Check: small/medium frame, masked, no 64-bit length
+            if len_byte <= 126 && (b1 & 0x80) != 0 {
+                let (payload_len, header_len) = if len_byte <= 125 {
+                    (len_byte as usize, 2)
+                } else {
+                    let len = usize::from(u16::from_be_bytes([buf[2], buf[3]]));
+                    if len < 126 {
+                        return self.parse_slow(buf);
+                    }
+                    if len > self.max_frame_size {
+                        // Preserve header-error precedence before the size check.
+                        return self.parse_slow(buf);
+                    }
+                    (len, 4)
+                };
+                let total_len = header_len + 4 + payload_len; // header + mask + payload
 
                 if buf.len() >= total_len {
-                    // We have a complete small masked frame - parse it inline
+                    // We have a complete masked frame - parse it inline
                     let fin = b0 & 0x80 != 0;
                     let rsv1 = b0 & 0x40 != 0;
                     let rsv2 = b0 & 0x20 != 0;
@@ -452,11 +482,20 @@ impl FrameParser {
                             return Err(Error::Protocol("control frame must not be fragmented"));
                         }
 
+                        if opcode.is_control() && payload_len > 125 {
+                            return Err(Error::Protocol("control frame too large"));
+                        }
+
                         // Extract mask
-                        let mask = [buf[2], buf[3], buf[4], buf[5]];
+                        let mask = [
+                            buf[header_len],
+                            buf[header_len + 1],
+                            buf[header_len + 2],
+                            buf[header_len + 3],
+                        ];
 
                         // Extract and unmask payload
-                        buf.advance(6);
+                        buf.advance(header_len + 4);
                         let mut payload = buf.split_to(payload_len);
                         apply_mask(&mut payload, mask);
 
