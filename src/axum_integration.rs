@@ -868,6 +868,7 @@ mod tests {
 
     #[cfg(feature = "permessage-deflate")]
     #[tokio::test]
+    #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
     async fn axum_split_native_heartbeat_plain_and_deflate() {
         use axum::{Router, routing::get};
 

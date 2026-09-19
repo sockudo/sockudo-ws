@@ -111,7 +111,7 @@ pub use protocol::{Message, RawMessage, Role};
 #[cfg(feature = "tokio-runtime")]
 pub use pubsub::{PubSub, PubSubState, PublishResult, SubscriberId};
 #[cfg(feature = "tokio-runtime")]
-pub use stream::{SplitReader, SplitWriter, Stream, WebSocketStream};
+pub use stream::{SplitReader, SplitWriter, Stream, WebSocketStream, init_clock};
 
 #[cfg(all(feature = "permessage-deflate", feature = "tokio-runtime"))]
 pub use stream::CompressedWebSocketStream;

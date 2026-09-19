@@ -888,6 +888,28 @@ Transport features are runtime-neutral. Pair `http2` or `http3` with either `tok
 | `axum-integration` | Axum web framework support |
 | `full` | All features enabled |
 
+### Test Clock
+
+Tokio streams use quanta for heartbeat and inbound activity timestamps by default.
+Tokio still schedules wakeups; deadlines are converted to remaining durations when
+a timer is registered or reset. Compio's clock is unchanged.
+The first clock read performs quanta's one-time calibration; include this startup
+cost when measuring connection setup, separately from steady-state throughput.
+Call `sockudo_ws::init_clock()` before constructing a latency-sensitive Tokio
+runtime to pay this cost before runtime scheduling starts. Code inside a
+`#[tokio::main]` function runs after the macro has constructed the runtime, so a
+synchronous outer entry point is required when the initialization point matters.
+
+Enable this crate's `test-util` feature when using Tokio's `pause`, `advance`, or
+`start_paused`. It selects Tokio's clock for heartbeat timestamps as well as
+timers, including when sockudo-ws is a dependency of an integration test. Enabling
+only `tokio/test-util` does not switch sockudo-ws's clock.
+
+`test-util` is not included in `full`. `--all-features` enables it, so use default
+features or `full` without `test-util` when measuring quanta performance. Cargo
+unifies features across dependencies; a dev-dependency enabling `test-util` also
+selects the Tokio clock for benchmarks in that build.
+
 ## SIMD Architecture Support
 
 sockudo-ws uses SIMD acceleration for frame masking and UTF-8 validation:
