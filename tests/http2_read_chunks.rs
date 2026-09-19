@@ -6,7 +6,19 @@ use tokio::io::AsyncReadExt;
 
 #[tokio::test]
 async fn small_reads_preserve_h2_data_and_buffered_remainder() {
-    let expected = (0..4097).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    check_buffered_remainder(false).await;
+}
+
+#[tokio::test]
+async fn generic_transport_preserves_h2_data_and_buffered_remainder() {
+    check_buffered_remainder(true).await;
+}
+
+async fn check_buffered_remainder(generic_transport: bool) {
+    // Exceed the initial flow-control window so progress requires returned capacity.
+    let expected = (0..128 * 1024 + 1)
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<_>>();
     let payload = expected.clone();
     let (client_io, server_io) = tokio::io::duplex(65536);
     let server = tokio::spawn(async move {
@@ -30,7 +42,12 @@ async fn small_reads_preserve_h2_data_and_buffered_remainder() {
             true,
         )
         .unwrap();
-    let mut stream = Http2Stream::new(send, response.await.unwrap().into_body());
+    let recv = response.await.unwrap().into_body();
+    let mut stream: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if generic_transport {
+        Box::new(sockudo_ws::Stream::<sockudo_ws::Http2>::from_h2(send, recv))
+    } else {
+        Box::new(Http2Stream::new(send, recv))
+    };
     let mut actual = Vec::new();
     let mut chunk = [0; 7];
     loop {
