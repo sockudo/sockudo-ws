@@ -310,18 +310,12 @@ where
 
         // Get a slice of uninitialized memory
         let buf_len = this.read_buf.len();
-        let buf_cap = this.read_buf.capacity();
-
-        // SAFETY: We're extending into the spare capacity
-        unsafe {
-            this.read_buf.set_len(buf_cap);
-        }
-
-        let mut read_buf = ReadBuf::new(&mut this.read_buf[buf_len..]);
+        let mut read_buf = ReadBuf::uninit(this.read_buf.spare_capacity_mut());
 
         match this.inner.poll_read(cx, &mut read_buf) {
             Poll::Ready(Ok(())) => {
                 let n = read_buf.filled().len();
+                // SAFETY: ReadBuf guarantees that its filled bytes are initialized.
                 unsafe {
                     this.read_buf.set_len(buf_len + n);
                 }
@@ -331,18 +325,8 @@ where
                     Poll::Ready(Ok(n))
                 }
             }
-            Poll::Ready(Err(e)) => {
-                unsafe {
-                    this.read_buf.set_len(buf_len);
-                }
-                Poll::Ready(Err(e))
-            }
-            Poll::Pending => {
-                unsafe {
-                    this.read_buf.set_len(buf_len);
-                }
-                Poll::Pending
-            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -1806,17 +1790,12 @@ where
         }
 
         let buf_len = this.read_buf.len();
-        let buf_cap = this.read_buf.capacity();
-
-        unsafe {
-            this.read_buf.set_len(buf_cap);
-        }
-
-        let mut read_buf = ReadBuf::new(&mut this.read_buf[buf_len..]);
+        let mut read_buf = ReadBuf::uninit(this.read_buf.spare_capacity_mut());
 
         match this.inner.poll_read(cx, &mut read_buf) {
             Poll::Ready(Ok(())) => {
                 let n = read_buf.filled().len();
+                // SAFETY: ReadBuf guarantees that its filled bytes are initialized.
                 unsafe {
                     this.read_buf.set_len(buf_len + n);
                 }
@@ -1826,18 +1805,8 @@ where
                     Poll::Ready(Ok(n))
                 }
             }
-            Poll::Ready(Err(e)) => {
-                unsafe {
-                    this.read_buf.set_len(buf_len);
-                }
-                Poll::Ready(Err(e))
-            }
-            Poll::Pending => {
-                unsafe {
-                    this.read_buf.set_len(buf_len);
-                }
-                Poll::Pending
-            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
         }
     }
 
