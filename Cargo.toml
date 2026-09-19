@@ -134,9 +134,6 @@ compio = { version = "^0.18", default-features = false, features = ["net", "macr
 # Fast synchronization primitives for pub/sub
 parking_lot = "^0.12"
 
-# High-performance concurrent hash maps for pub/sub
-dashmap = "^6.1"
-
 # Axum integration
 axum = { version = "^0.8", optional = true }
 hyper = { version = "^1.0", optional = true }
