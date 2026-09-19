@@ -1357,6 +1357,8 @@ impl<S> SplitWriter<S> {
     ///
     /// Cancelling after queue acceptance closes the connection; the driver may
     /// already have advanced compression state or written a frame prefix.
+    /// Zero transport progress does not make cancellation recoverable. Retain
+    /// the send future across `select!` if the connection must remain usable.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
         if !self.shared.is_open() {
             return Err(self.current_error());
@@ -2878,6 +2880,8 @@ impl<S> CompressedSplitWriter<S> {
     ///
     /// Cancelling after queue acceptance closes the connection; the driver may
     /// already have advanced compression state or written a frame prefix.
+    /// Zero transport progress does not make cancellation recoverable. Retain
+    /// the send future across `select!` if the connection must remain usable.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
         if !self.shared.is_open() {
             return Err(self.current_error());

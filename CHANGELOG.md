@@ -31,7 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for a reply that depends on buffered output.
 - Native split writes are coordinated through a connection-scoped driver with
   bounded application/control queues. Cancelling an accepted application write
-  closes the connection before another application frame can follow it.
+  closes the connection before another application frame can follow it. This also applies before
+  transport progress; retain the send future across timeout/select boundaries
+  when the connection must remain usable.
 - Server-side uncompressed data payloads of 8 KiB or more are queued by reference
   behind their frame header. Segmented writes use vectored I/O when supported;
   contiguous small frames retain the single-buffer write path.
