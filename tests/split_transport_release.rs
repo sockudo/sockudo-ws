@@ -143,19 +143,24 @@ async fn idle_timeout_releases_transport_after_partial_write() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn queued_send_receives_the_active_writes_timeout() {
+async fn active_send_timeout_is_retained_for_later_sends() {
     let (io, _peer, gate) = connection(3);
     let config = Config::builder().auto_ping(false).idle_timeout(1).build();
     let (_reader, mut writer) = WebSocketStream::client(io, config).split();
-    assert!(poll!(std::pin::pin!(writer.send_text("active"))).is_pending());
-    gate.blocked.notified().await;
-    let mut queued = std::pin::pin!(writer.send_text("queued"));
-    assert!(poll!(queued.as_mut()).is_pending());
-    tokio::time::advance(Duration::from_millis(1001)).await;
-    tokio::task::yield_now().await;
+    {
+        let mut active = std::pin::pin!(writer.send_text("active"));
+        assert!(poll!(active.as_mut()).is_pending());
+        gate.blocked.notified().await;
+        tokio::time::advance(Duration::from_millis(1001)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            poll!(active.as_mut()),
+            Poll::Ready(Err(Error::IdleTimeout))
+        ));
+    }
     assert!(matches!(
-        poll!(queued.as_mut()),
-        Poll::Ready(Err(Error::IdleTimeout))
+        writer.send_text("later").await,
+        Err(Error::IdleTimeout)
     ));
     assert!(gate.dropped.load(Ordering::Relaxed));
     assert_eq!(gate.bytes.lock().unwrap().len(), 3);
