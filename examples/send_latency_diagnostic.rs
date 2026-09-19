@@ -319,7 +319,11 @@ fn main() {
         ));
         return;
     }
-    let smoke = args.iter().any(|arg| arg == "--test");
+    let smoke = args.is_empty() || args == ["--test"];
+    assert!(
+        smoke || args == ["--matrix"],
+        "expected --case, --matrix, or no arguments"
+    );
     for workers in [1, 4] {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(workers)
