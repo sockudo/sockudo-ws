@@ -1020,16 +1020,6 @@ pub fn encode_frame_with_rsv(
 
             // Copy and mask payload in a single pass
             let payload_dst = base.add(offset);
-            #[cfg(target_arch = "aarch64")]
-            if payload_len == 8 {
-                let mask_u32 = u32::from_ne_bytes(m);
-                let mask_u64 = ((mask_u32 as u64) << 32) | mask_u32 as u64;
-                let src_val = std::ptr::read_unaligned(payload.as_ptr() as *const u64);
-                std::ptr::write_unaligned(payload_dst as *mut u64, src_val ^ mask_u64);
-            } else {
-                encode_payload_masked_inline(payload_dst, payload.as_ptr(), payload_len, m);
-            }
-            #[cfg(not(target_arch = "aarch64"))]
             encode_payload_masked_inline(payload_dst, payload.as_ptr(), payload_len, m);
         } else {
             // Fast path: just copy payload
@@ -1054,7 +1044,7 @@ unsafe fn encode_payload_masked_inline(dst: *mut u8, src: *const u8, len: usize,
         let mut i = 0;
 
         #[cfg(target_arch = "aarch64")]
-        {
+        if len >= 16 {
             let mask_vec = vreinterpretq_u8_u32(vdupq_n_u32(mask_u32));
             while len - i >= 16 {
                 // Load only initialized source bytes; the destination is spare
