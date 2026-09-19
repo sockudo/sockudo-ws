@@ -3,7 +3,8 @@
 //! Run with: cargo bench
 
 use bytes::BytesMut;
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use std::hint::black_box;
 
 use sockudo_ws::frame::{FrameParser, OpCode, encode_frame};
 use sockudo_ws::simd::apply_mask;
