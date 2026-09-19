@@ -308,6 +308,7 @@ impl WebSocketClient<Http1> {
     /// Connect to a WebSocket server using a URI and additional HTTP headers.
     ///
     /// This is the custom-header counterpart to [`Self::connect_to_url`].
+    /// The newly created TCP socket uses [`Config::tcp_nodelay`] (default: true).
     /// Headers managed by the HTTP upgrade handshake cannot be overridden.
     /// Once writing begins, cancelling this future leaves the stream in an
     /// indeterminate handshake state and the stream should not be reused.
@@ -358,6 +359,9 @@ impl WebSocketClient<Http1> {
         // Connect to the server
         let addr = format!("{}:{}", host, port);
         let stream = TcpStream::connect(&addr).await.map_err(Error::Io)?;
+        stream
+            .set_nodelay(self.config.tcp_nodelay)
+            .map_err(Error::Io)?;
 
         // Perform handshake
         self.connect_with_headers(stream, host, path, protocol, extra_headers)

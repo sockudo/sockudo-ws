@@ -240,6 +240,7 @@ impl WebSocketServer<Http1> {
     ///
     /// This is a convenience method that accepts connections from a listener
     /// and calls the handler for each successful WebSocket upgrade.
+    /// Accepted TCP sockets use [`Config::tcp_nodelay`] (default: true).
     ///
     /// # Example
     ///
@@ -264,6 +265,9 @@ impl WebSocketServer<Http1> {
     {
         loop {
             let (stream, _addr) = listener.accept().await.map_err(Error::Io)?;
+            stream
+                .set_nodelay(self.config.tcp_nodelay)
+                .map_err(Error::Io)?;
 
             let handler = handler.clone();
             let config = self.config.clone();
