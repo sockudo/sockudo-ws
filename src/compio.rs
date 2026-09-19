@@ -1409,6 +1409,12 @@ where
         }
 
         self.protocol.encode_message(&msg, &mut self.write_buf)?;
+        if self.write_buf.len() > self.config.max_backpressure {
+            self.write_buf.clear();
+            self.heartbeat.stop();
+            self.state = CompioStreamState::Closed;
+            return Err(Error::BufferFull);
+        }
         if let Err(error) = self.flush().await {
             self.heartbeat.stop();
             self.state = CompioStreamState::Closed;
@@ -1953,6 +1959,9 @@ async fn compio_split_writer_driver<W, E>(
                     }
                     write_buf.clear();
                     let result = match encoder.encode_message(&message, &mut write_buf) {
+                        Ok(()) if write_buf.len() > config.max_backpressure => {
+                            Err(Error::BufferFull)
+                        }
                         Ok(()) => {
                             compio_cancellable_flush(&mut writer, &mut write_buf, &mut cancel_rx)
                                 .await
@@ -2349,6 +2358,12 @@ where
         }
 
         self.protocol.encode_message(&msg, &mut self.write_buf)?;
+        if self.write_buf.len() > self.config.max_backpressure {
+            self.write_buf.clear();
+            self.heartbeat.stop();
+            self.state = CompioStreamState::Closed;
+            return Err(Error::BufferFull);
+        }
         if let Err(error) = self.flush().await {
             self.heartbeat.stop();
             self.state = CompioStreamState::Closed;
