@@ -1,6 +1,6 @@
 #![cfg(feature = "compio-runtime")]
 
-use compio::io::AsyncWriteExt;
+use compio::io::{AsyncReadExt, AsyncWriteExt};
 use compio::net::{TcpListener, TcpStream};
 use sockudo_ws::{CompioWebSocketStream, Config};
 
@@ -17,6 +17,24 @@ fn config() -> Config {
     Config::builder().auto_ping(false).idle_timeout(0).build()
 }
 
+async fn read_masked_control_payload(peer: &mut TcpStream, opcode: u8) -> Vec<u8> {
+    let header = peer.read_exact(vec![0; 2]).await;
+    header.0.unwrap();
+    assert_eq!(header.1[0], 0x80 | opcode);
+    assert_ne!(header.1[1] & 0x80, 0);
+    let len = usize::from(header.1[1] & 0x7f);
+    let mask = peer.read_exact(vec![0; 4]).await;
+    mask.0.unwrap();
+    let payload = peer.read_exact(vec![0; len]).await;
+    payload.0.unwrap();
+    payload
+        .1
+        .into_iter()
+        .enumerate()
+        .map(|(index, byte)| byte ^ mask.1[index % 4])
+        .collect()
+}
+
 macro_rules! receive_cases {
     ($module:ident, $make:expr) => {
         mod $module {
@@ -30,7 +48,9 @@ macro_rules! receive_cases {
                     .0
                     .unwrap();
                 assert_eq!(stream.next().await.unwrap().unwrap().as_bytes(), b"a");
+                assert!(!stream.is_closed());
                 assert!(stream.next().await.unwrap().is_err());
+                assert!(stream.is_closed());
                 assert!(stream.next().await.is_none());
             }
 
@@ -56,6 +76,15 @@ macro_rules! receive_cases {
                     .unwrap();
                 assert_eq!(stream.next().await.unwrap().unwrap().as_bytes(), b"a");
                 assert!(stream.next().await.unwrap().unwrap().is_ping());
+                assert_eq!(
+                    compio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        read_masked_control_payload(&mut peer, 0x0a),
+                    )
+                    .await
+                    .unwrap(),
+                    b"p"
+                );
                 assert_eq!(stream.next().await.unwrap().unwrap().as_bytes(), b"b");
                 assert!(stream.next().await.unwrap().is_err());
                 assert!(stream.next().await.is_none());
@@ -100,6 +129,7 @@ async fn split_parse_error_stops_writes_before_messages_are_drained() {
 
     assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), b"a");
 
+    assert!(!reader.is_closed());
     assert!(writer.is_closed());
     assert!(matches!(
         writer.send(sockudo_ws::Message::text("late")).await,
@@ -171,7 +201,6 @@ async fn splitting_after_parse_error_does_not_reopen_writes() {
 
 #[compio::test]
 async fn split_after_parse_error_still_replies_to_an_accepted_close() {
-    use compio::io::AsyncReadExt;
     let (io, mut peer) = connection().await;
     let mut stream = CompioWebSocketStream::client(io, config());
     peer.write_all(b"\x82\x01a\x88\x02\x03\xe8\x83\x00".to_vec())

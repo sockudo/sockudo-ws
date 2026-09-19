@@ -1,11 +1,27 @@
 #![cfg(feature = "tokio-runtime")]
 
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use sockudo_ws::{Config, WebSocketStream};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn config() -> Config {
     Config::builder().auto_ping(false).idle_timeout(0).build()
+}
+
+async fn read_masked_control_payload(peer: &mut tokio::io::DuplexStream, opcode: u8) -> Vec<u8> {
+    let mut header = [0; 2];
+    peer.read_exact(&mut header).await.unwrap();
+    assert_eq!(header[0], 0x80 | opcode);
+    assert_ne!(header[1] & 0x80, 0);
+    let len = usize::from(header[1] & 0x7f);
+    let mut mask = [0; 4];
+    peer.read_exact(&mut mask).await.unwrap();
+    let mut payload = vec![0; len];
+    peer.read_exact(&mut payload).await.unwrap();
+    for (index, byte) in payload.iter_mut().enumerate() {
+        *byte ^= mask[index % 4];
+    }
+    payload
 }
 
 macro_rules! receive_cases {
@@ -18,7 +34,9 @@ macro_rules! receive_cases {
                 let (mut stream, _guard) = ($make)(io);
                 peer.write_all(b"\x82\x01a\x83\x00").await.unwrap();
                 assert_eq!(stream.next().await.unwrap().unwrap().as_bytes(), b"a");
+                assert!(!stream.is_closed());
                 assert!(stream.next().await.unwrap().is_err());
+                assert!(stream.is_closed());
                 assert!(stream.next().await.is_none());
             }
 
@@ -40,6 +58,15 @@ macro_rules! receive_cases {
                     .unwrap();
                 assert_eq!(stream.next().await.unwrap().unwrap().as_bytes(), b"a");
                 assert!(stream.next().await.unwrap().unwrap().is_ping());
+                assert_eq!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        read_masked_control_payload(&mut peer, 0x0a),
+                    )
+                    .await
+                    .unwrap(),
+                    b"p"
+                );
                 assert_eq!(stream.next().await.unwrap().unwrap().as_bytes(), b"b");
                 assert!(stream.next().await.unwrap().is_err());
                 assert!(stream.next().await.is_none());
@@ -92,6 +119,7 @@ async fn split_parse_error_stops_writes_before_messages_are_drained() {
 
     assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), b"a");
 
+    assert!(!reader.is_closed());
     assert!(writer.is_closed());
     assert!(matches!(
         writer.send(sockudo_ws::Message::text("late")).await,
@@ -100,6 +128,77 @@ async fn split_parse_error_stops_writes_before_messages_are_drained() {
     assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), b"b");
     assert!(reader.next().await.unwrap().is_err());
     assert!(reader.next().await.is_none());
+}
+
+#[tokio::test]
+async fn unified_sink_close_after_parse_error_shuts_down_transport() {
+    let (io, mut peer) = tokio::io::duplex(128);
+    let mut stream = WebSocketStream::client(io, config());
+    peer.write_all(b"\x82\x01a\x82\x01b\x83\x00").await.unwrap();
+    assert_eq!(stream.next().await.unwrap().unwrap().as_bytes(), b"a");
+
+    SinkExt::close(&mut stream).await.unwrap();
+
+    let mut received = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        peer.read_to_end(&mut received),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(received.is_empty());
+}
+
+#[cfg(feature = "permessage-deflate")]
+#[tokio::test]
+async fn compressed_sink_close_after_parse_error_shuts_down_transport() {
+    let (io, mut peer) = tokio::io::duplex(128);
+    let mut stream = sockudo_ws::CompressedWebSocketStream::client(
+        io,
+        config(),
+        sockudo_ws::DeflateConfig::default(),
+    );
+    peer.write_all(b"\x82\x01a\x82\x01b\x83\x00").await.unwrap();
+    assert_eq!(stream.next().await.unwrap().unwrap().as_bytes(), b"a");
+
+    SinkExt::close(&mut stream).await.unwrap();
+
+    let mut received = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        peer.read_to_end(&mut received),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(received.is_empty());
+}
+
+#[tokio::test]
+async fn split_parse_error_does_not_cancel_an_in_progress_write() {
+    let (io, mut peer) = tokio::io::duplex(64);
+    let (mut reader, mut writer) = WebSocketStream::client(io, config()).split();
+    let send = tokio::spawn(async move {
+        writer
+            .send(sockudo_ws::Message::binary(vec![0_u8; 1024]))
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    peer.write_all(b"\x82\x01a\x83\x00").await.unwrap();
+    assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), b"a");
+
+    let mut frame = vec![0; 1032];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        peer.read_exact(&mut frame),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(frame[0], 0x82);
+    assert!(send.await.unwrap().is_ok());
 }
 
 #[tokio::test]

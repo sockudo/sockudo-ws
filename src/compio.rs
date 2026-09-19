@@ -55,6 +55,8 @@ const MIN_READ_SPARE: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompioStreamState {
     Open,
+    /// A read error is known, but accepted messages still need to be delivered.
+    ReadErrorPending,
     CloseSent,
     Closed,
 }
@@ -70,6 +72,8 @@ enum ControlRequest {
     Pong(Bytes, Instant),
     PeerPing(Bytes, Instant),
     PeerClose,
+    /// Stop the writer after earlier automatic control responses are flushed.
+    ReadError,
     Eof,
 }
 
@@ -1315,6 +1319,7 @@ where
                 Ok(false) => {}
                 Err(error) => {
                     self.pending_parse_error = Some(error);
+                    self.state = CompioStreamState::ReadErrorPending;
                     continue;
                 }
             }
@@ -1407,7 +1412,10 @@ where
 
     /// Send a WebSocket message.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
-        if self.state == CompioStreamState::Closed || self.pending_parse_error.is_some() {
+        if matches!(
+            self.state,
+            CompioStreamState::Closed | CompioStreamState::ReadErrorPending
+        ) {
             return Err(Error::ConnectionClosed);
         }
 
@@ -1437,7 +1445,7 @@ where
 
     /// Send a close frame.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
-        if self.state != CompioStreamState::Open || self.pending_parse_error.is_some() {
+        if self.state != CompioStreamState::Open {
             return Ok(());
         }
 
@@ -1485,7 +1493,10 @@ where
                 self.pending_messages.clear();
                 self.pending_parse_error = None;
                 self.read_buf.clear();
-                if self.state == CompioStreamState::Open {
+                if matches!(
+                    self.state,
+                    CompioStreamState::Open | CompioStreamState::ReadErrorPending
+                ) {
                     self.protocol.encode_close_response(&mut self.write_buf);
                     if let Err(error) = self.flush().await {
                         self.state = CompioStreamState::Closed;
@@ -1520,15 +1531,14 @@ where
         let (application_tx, application_rx) = mpsc::channel(SPLIT_APPLICATION_CAPACITY);
         let (cancel_tx, cancel_rx) = mpsc::unbounded();
         let (terminal_tx, terminal_rx) = mpsc::unbounded();
-        let shared = CompioSplitShared::new(self.state != CompioStreamState::Open);
+        let shared = CompioSplitShared::new(!matches!(
+            self.state,
+            CompioStreamState::Open | CompioStreamState::ReadErrorPending
+        ));
         // Splitting must not reopen application writes after a known parse error.
         // A preceding accepted Close still needs its automatic response.
         if self.pending_parse_error.is_some() {
             shared.begin_closing();
-            if !self.pending_messages.iter().any(Message::is_close) {
-                shared.terminate(CompioTerminalCause::ConnectionClosed);
-                let _ = cancel_tx.unbounded_send(());
-            }
         }
 
         let reader_protocol = Protocol::new(
@@ -1680,14 +1690,9 @@ where
             if self.terminal_reported {
                 return None;
             }
-            // Stop the connection without discarding its accepted message prefix.
-            // An accepted Close takes precedence over invalid bytes after it.
-            if self.pending_parse_error.is_some()
-                && self.shared.is_open()
-                && !self.pending_messages.iter().any(Message::is_close)
-            {
-                self.shared.terminate(CompioTerminalCause::ConnectionClosed);
-                let _ = self.cancel_tx.unbounded_send(());
+            // Reject new application writes without discarding the accepted prefix.
+            if self.pending_parse_error.is_some() && self.shared.is_open() {
+                self.shared.begin_closing();
             }
             if self.pending_parse_error.is_none() && self.shared.status.get() == SPLIT_CLOSED {
                 if self.terminal_reported {
@@ -1704,14 +1709,6 @@ where
             }
 
             if let Some(msg) = self.pending_messages.pop() {
-                if self.pending_parse_error.is_some() && self.shared.status.get() == SPLIT_CLOSED {
-                    if msg.is_close() {
-                        self.pending_messages.clear();
-                        self.pending_parse_error = None;
-                        self.terminal_reported = true;
-                    }
-                    return Some(Ok(msg));
-                }
                 let request = match &msg {
                     Message::Ping(data) => ControlRequest::PeerPing(data.clone(), Instant::now()),
                     Message::Pong(data) => ControlRequest::Pong(data.clone(), Instant::now()),
@@ -1738,6 +1735,7 @@ where
             }
 
             if let Some(error) = self.pending_parse_error.take() {
+                let _ = self.control_tx.send(ControlRequest::ReadError).await;
                 self.shared.terminate(CompioTerminalCause::ConnectionClosed);
                 self.terminal_reported = true;
                 return Some(Err(error));
@@ -1758,6 +1756,7 @@ where
                     Err(error) => {
                         self.pending_messages.reverse();
                         self.pending_parse_error = Some(error);
+                        self.shared.begin_closing();
                         continue;
                     }
                 }
@@ -1795,7 +1794,7 @@ where
 
     /// Check whether the reader is closed.
     pub fn is_closed(&self) -> bool {
-        !self.shared.is_open()
+        self.shared.status.get() == SPLIT_CLOSED
     }
 }
 
@@ -1981,6 +1980,11 @@ async fn compio_split_writer_driver<W, E>(
                         )
                         .await;
                     }
+                    compio_terminate(&shared, &terminal_tx, CompioTerminalCause::ConnectionClosed);
+                    break;
+                }
+                ControlRequest::ReadError => {
+                    heartbeat.stop();
                     compio_terminate(&shared, &terminal_tx, CompioTerminalCause::ConnectionClosed);
                     break;
                 }
@@ -2312,6 +2316,7 @@ where
                 Ok(false) => {}
                 Err(error) => {
                     self.pending_parse_error = Some(error);
+                    self.state = CompioStreamState::ReadErrorPending;
                     continue;
                 }
             }
@@ -2403,7 +2408,10 @@ where
 
     /// Send a WebSocket message.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
-        if self.state == CompioStreamState::Closed || self.pending_parse_error.is_some() {
+        if matches!(
+            self.state,
+            CompioStreamState::Closed | CompioStreamState::ReadErrorPending
+        ) {
             return Err(Error::ConnectionClosed);
         }
 
@@ -2433,7 +2441,7 @@ where
 
     /// Send a close frame.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
-        if self.state != CompioStreamState::Open || self.pending_parse_error.is_some() {
+        if self.state != CompioStreamState::Open {
             return Ok(());
         }
 
@@ -2506,7 +2514,10 @@ where
                 self.pending_messages.clear();
                 self.pending_parse_error = None;
                 self.read_buf.clear();
-                if self.state == CompioStreamState::Open {
+                if matches!(
+                    self.state,
+                    CompioStreamState::Open | CompioStreamState::ReadErrorPending
+                ) {
                     self.protocol.encode_close_response(&mut self.write_buf);
                     if let Err(error) = self.flush().await {
                         self.state = CompioStreamState::Closed;
@@ -2542,15 +2553,14 @@ where
         let (application_tx, application_rx) = mpsc::channel(SPLIT_APPLICATION_CAPACITY);
         let (cancel_tx, cancel_rx) = mpsc::unbounded();
         let (terminal_tx, terminal_rx) = mpsc::unbounded();
-        let shared = CompioSplitShared::new(self.state != CompioStreamState::Open);
+        let shared = CompioSplitShared::new(!matches!(
+            self.state,
+            CompioStreamState::Open | CompioStreamState::ReadErrorPending
+        ));
         // Splitting must not reopen application writes after a known parse error.
         // A preceding accepted Close still needs its automatic response.
         if self.pending_parse_error.is_some() {
             shared.begin_closing();
-            if !self.pending_messages.iter().any(Message::is_close) {
-                shared.terminate(CompioTerminalCause::ConnectionClosed);
-                let _ = cancel_tx.unbounded_send(());
-            }
         }
         let (reader_protocol, writer_protocol) = self
             .protocol
@@ -2629,14 +2639,9 @@ where
             if self.terminal_reported {
                 return None;
             }
-            // Stop the connection without discarding its accepted message prefix.
-            // An accepted Close takes precedence over invalid bytes after it.
-            if self.pending_parse_error.is_some()
-                && self.shared.is_open()
-                && !self.pending_messages.iter().any(Message::is_close)
-            {
-                self.shared.terminate(CompioTerminalCause::ConnectionClosed);
-                let _ = self.cancel_tx.unbounded_send(());
+            // Reject new application writes without discarding the accepted prefix.
+            if self.pending_parse_error.is_some() && self.shared.is_open() {
+                self.shared.begin_closing();
             }
             if self.pending_parse_error.is_none() && self.shared.status.get() == SPLIT_CLOSED {
                 if self.terminal_reported {
@@ -2653,14 +2658,6 @@ where
             }
 
             if let Some(msg) = self.pending_messages.pop() {
-                if self.pending_parse_error.is_some() && self.shared.status.get() == SPLIT_CLOSED {
-                    if msg.is_close() {
-                        self.pending_messages.clear();
-                        self.pending_parse_error = None;
-                        self.terminal_reported = true;
-                    }
-                    return Some(Ok(msg));
-                }
                 let request = match &msg {
                     Message::Ping(data) => ControlRequest::PeerPing(data.clone(), Instant::now()),
                     Message::Pong(data) => ControlRequest::Pong(data.clone(), Instant::now()),
@@ -2687,6 +2684,7 @@ where
             }
 
             if let Some(error) = self.pending_parse_error.take() {
+                let _ = self.control_tx.send(ControlRequest::ReadError).await;
                 self.shared.terminate(CompioTerminalCause::ConnectionClosed);
                 self.terminal_reported = true;
                 return Some(Err(error));
@@ -2707,6 +2705,7 @@ where
                     Err(error) => {
                         self.pending_messages.reverse();
                         self.pending_parse_error = Some(error);
+                        self.shared.begin_closing();
                         continue;
                     }
                 }
@@ -2744,7 +2743,7 @@ where
 
     /// Check whether the reader is closed.
     pub fn is_closed(&self) -> bool {
-        !self.shared.is_open()
+        self.shared.status.get() == SPLIT_CLOSED
     }
 }
 

@@ -99,6 +99,8 @@ pin_project! {
 enum StreamState {
     /// Normal operation
     Open,
+    /// A read error is known, but accepted messages still need to be delivered.
+    ReadErrorPending,
     /// Flushing write buffer
     Flushing,
     /// Close frame sent
@@ -266,7 +268,7 @@ where
 
     /// Send a close frame
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
-        if self.state != StreamState::Open || self.pending_parse_error.is_some() {
+        if self.state != StreamState::Open {
             return Ok(());
         }
 
@@ -593,7 +595,10 @@ where
                         this.pending_messages.clear();
                         this.pending_parse_error = None;
                         this.read_buf.clear();
-                        if this.state == StreamState::Open {
+                        if matches!(
+                            this.state,
+                            StreamState::Open | StreamState::ReadErrorPending
+                        ) {
                             // Send close response
                             this.protocol
                                 .encode_close_response(this.write_buf.buffer_mut());
@@ -616,7 +621,9 @@ where
                     Ok(()) if !self.pending_messages.is_empty() => continue,
                     Ok(()) => {}
                     Err(e) => {
-                        self.as_mut().get_mut().pending_parse_error = Some(e);
+                        let this = self.as_mut().get_mut();
+                        this.pending_parse_error = Some(e);
+                        this.state = StreamState::ReadErrorPending;
                         continue;
                     }
                 }
@@ -650,7 +657,9 @@ where
                 Poll::Ready(Ok(_n)) => match self.as_mut().get_mut().process_read_buf() {
                     Ok(()) => continue,
                     Err(e) => {
-                        self.as_mut().get_mut().pending_parse_error = Some(e);
+                        let this = self.as_mut().get_mut();
+                        this.pending_parse_error = Some(e);
+                        this.state = StreamState::ReadErrorPending;
                         continue;
                     }
                 },
@@ -677,7 +686,7 @@ where
     type Error = Error;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if self.state != StreamState::Open || self.pending_parse_error.is_some() {
+        if self.state != StreamState::Open {
             return Poll::Ready(Err(Error::ConnectionClosed));
         }
         Poll::Ready(Ok(()))
@@ -686,7 +695,7 @@ where
     fn start_send(self: Pin<&mut Self>, item: Message) -> Result<()> {
         let this = self.get_mut();
 
-        if this.state != StreamState::Open || this.pending_parse_error.is_some() {
+        if this.state != StreamState::Open {
             return Err(Error::ConnectionClosed);
         }
 
@@ -900,6 +909,8 @@ enum ControlRequest {
     PeerClose,
     /// The application wrote a Close frame through the shared sink.
     LocalCloseSent,
+    /// Stop the writer after earlier automatic control responses are flushed.
+    ReadError,
     Eof,
 }
 
@@ -1117,15 +1128,14 @@ where
     pub fn split(self) -> (SplitReader<S>, SplitWriter<S>) {
         let (reader, writer) = tokio::io::split(self.inner);
         let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
-        let shared = SplitShared::new(self.state != StreamState::Open);
+        let shared = SplitShared::new(!matches!(
+            self.state,
+            StreamState::Open | StreamState::ReadErrorPending
+        ));
         // Splitting must not reopen application writes after a known parse error.
         // A preceding accepted Close still needs its automatic response.
         if self.pending_parse_error.is_some() {
             shared.begin_closing();
-            if !self.pending_messages.iter().any(Message::is_close) {
-                shared.terminate(TerminalCause::ConnectionClosed);
-                shared.cancel.cancel();
-            }
         }
         let terminal_rx = shared.terminal_tx.subscribe();
         let reader_protocol = Protocol::new(
@@ -1181,14 +1191,9 @@ where
             if self.terminal_reported {
                 return None;
             }
-            // Stop the connection without discarding its accepted message prefix.
-            // An accepted Close takes precedence over invalid bytes after it.
-            if self.pending_parse_error.is_some()
-                && self.shared.is_open()
-                && !self.pending_messages.iter().any(Message::is_close)
-            {
-                self.shared.terminate(TerminalCause::ConnectionClosed);
-                self.shared.cancel.cancel();
+            // Reject new application writes without discarding the accepted prefix.
+            if self.pending_parse_error.is_some() && self.shared.is_open() {
+                self.shared.begin_closing();
             }
             if self.pending_parse_error.is_none()
                 && let Some(result) = self.take_terminal()
@@ -1197,16 +1202,6 @@ where
             }
 
             if let Some(msg) = self.pending_messages.pop() {
-                if self.pending_parse_error.is_some()
-                    && self.shared.status.load(Ordering::Acquire) == SPLIT_CLOSED
-                {
-                    if msg.is_close() {
-                        self.pending_messages.clear();
-                        self.pending_parse_error = None;
-                        self.terminal_reported = true;
-                    }
-                    return Some(Ok(msg));
-                }
                 let request = match &msg {
                     Message::Ping(data) => {
                         ControlRequest::Ping(data.clone(), tokio::time::Instant::now())
@@ -1237,6 +1232,7 @@ where
             }
 
             if let Some(error) = self.pending_parse_error.take() {
+                let _ = self.control_tx.send(ControlRequest::ReadError).await;
                 self.shared.terminate(TerminalCause::ConnectionClosed);
                 self.terminal_reported = true;
                 return Some(Err(error));
@@ -1258,6 +1254,7 @@ where
                     Err(error) => {
                         self.pending_messages.reverse();
                         self.pending_parse_error = Some(error);
+                        self.shared.begin_closing();
                         continue;
                     }
                 }
@@ -1288,6 +1285,7 @@ where
                             Err(error) => {
                                 self.pending_messages.reverse();
                                 self.pending_parse_error = Some(error);
+                                self.shared.begin_closing();
                             }
                         },
                         Err(error) => {
@@ -1315,9 +1313,9 @@ where
         }
     }
 
-    /// Check whether the connection is closing or closed.
+    /// Check whether the reader has reached the connection's terminal state.
     pub fn is_closed(&self) -> bool {
-        !self.shared.is_open()
+        self.shared.status.load(Ordering::Acquire) == SPLIT_CLOSED
     }
 }
 
@@ -1478,6 +1476,11 @@ async fn split_writer_driver<W, E>(
                             tokio::time::Instant::now()
                                 + Duration::from_secs(config.close_timeout.into()),
                         );
+                    }
+                    ControlRequest::ReadError => {
+                        heartbeat.stop();
+                        shared.terminate(TerminalCause::ConnectionClosed);
+                        break;
                     }
                     ControlRequest::Eof => {
                         heartbeat.stop();
@@ -1717,7 +1720,7 @@ where
 
     /// Send a close frame
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
-        if self.state != StreamState::Open || self.pending_parse_error.is_some() {
+        if self.state != StreamState::Open {
             return Ok(());
         }
 
@@ -2029,7 +2032,10 @@ where
                         this.pending_messages.clear();
                         this.pending_parse_error = None;
                         this.read_buf.clear();
-                        if this.state == StreamState::Open {
+                        if matches!(
+                            this.state,
+                            StreamState::Open | StreamState::ReadErrorPending
+                        ) {
                             this.protocol
                                 .encode_close_response(this.write_buf.buffer_mut());
                         }
@@ -2070,7 +2076,9 @@ where
                 Poll::Ready(Ok(_n)) => match self.as_mut().get_mut().process_read_buf() {
                     Ok(()) => continue,
                     Err(e) => {
-                        self.as_mut().get_mut().pending_parse_error = Some(e);
+                        let this = self.as_mut().get_mut();
+                        this.pending_parse_error = Some(e);
+                        this.state = StreamState::ReadErrorPending;
                         continue;
                     }
                 },
@@ -2097,7 +2105,7 @@ where
     type Error = Error;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if self.state != StreamState::Open || self.pending_parse_error.is_some() {
+        if self.state != StreamState::Open {
             return Poll::Ready(Err(Error::ConnectionClosed));
         }
         Poll::Ready(Ok(()))
@@ -2106,7 +2114,7 @@ where
     fn start_send(self: Pin<&mut Self>, item: Message) -> Result<()> {
         let this = self.get_mut();
 
-        if this.state != StreamState::Open || this.pending_parse_error.is_some() {
+        if this.state != StreamState::Open {
             return Err(Error::ConnectionClosed);
         }
 
@@ -2252,15 +2260,14 @@ where
         let (reader, writer) = tokio::io::split(self.inner);
 
         let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
-        let shared = SplitShared::new(self.state != StreamState::Open);
+        let shared = SplitShared::new(!matches!(
+            self.state,
+            StreamState::Open | StreamState::ReadErrorPending
+        ));
         // Splitting must not reopen application writes after a known parse error.
         // A preceding accepted Close still needs its automatic response.
         if self.pending_parse_error.is_some() {
             shared.begin_closing();
-            if !self.pending_messages.iter().any(Message::is_close) {
-                shared.terminate(TerminalCause::ConnectionClosed);
-                shared.cancel.cancel();
-            }
         }
         let terminal_rx = shared.terminal_tx.subscribe();
 
@@ -2318,14 +2325,9 @@ where
             if self.terminal_reported {
                 return None;
             }
-            // Stop the connection without discarding its accepted message prefix.
-            // An accepted Close takes precedence over invalid bytes after it.
-            if self.pending_parse_error.is_some()
-                && self.shared.is_open()
-                && !self.pending_messages.iter().any(Message::is_close)
-            {
-                self.shared.terminate(TerminalCause::ConnectionClosed);
-                self.shared.cancel.cancel();
+            // Reject new application writes without discarding the accepted prefix.
+            if self.pending_parse_error.is_some() && self.shared.is_open() {
+                self.shared.begin_closing();
             }
             if self.pending_parse_error.is_none()
                 && let Some(result) = self.take_terminal()
@@ -2334,16 +2336,6 @@ where
             }
 
             if let Some(msg) = self.pending_messages.pop() {
-                if self.pending_parse_error.is_some()
-                    && self.shared.status.load(Ordering::Acquire) == SPLIT_CLOSED
-                {
-                    if msg.is_close() {
-                        self.pending_messages.clear();
-                        self.pending_parse_error = None;
-                        self.terminal_reported = true;
-                    }
-                    return Some(Ok(msg));
-                }
                 let request = match &msg {
                     Message::Ping(data) => {
                         ControlRequest::Ping(data.clone(), tokio::time::Instant::now())
@@ -2374,6 +2366,7 @@ where
             }
 
             if let Some(error) = self.pending_parse_error.take() {
+                let _ = self.control_tx.send(ControlRequest::ReadError).await;
                 self.shared.terminate(TerminalCause::ConnectionClosed);
                 self.terminal_reported = true;
                 return Some(Err(error));
@@ -2404,6 +2397,7 @@ where
                             Err(error) => {
                                 self.pending_messages.reverse();
                                 self.pending_parse_error = Some(error);
+                                self.shared.begin_closing();
                             }
                         },
                         Err(error) => {
@@ -2432,7 +2426,7 @@ where
     }
 
     pub fn is_closed(&self) -> bool {
-        !self.shared.is_open()
+        self.shared.status.load(Ordering::Acquire) == SPLIT_CLOSED
     }
 }
 
