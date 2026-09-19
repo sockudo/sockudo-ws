@@ -1569,11 +1569,19 @@ where
 {
     /// Create a new compressed WebSocket stream for server role
     pub fn server(inner: S, config: Config, deflate_config: crate::deflate::DeflateConfig) -> Self {
-        let protocol = crate::protocol::CompressedProtocol::server(
-            config.max_frame_size,
-            config.max_message_size,
-            deflate_config,
-        );
+        let protocol = if config.compression.is_shared() {
+            crate::protocol::CompressedProtocol::server_with_shared_compression(
+                config.max_frame_size,
+                config.max_message_size,
+                deflate_config,
+            )
+        } else {
+            crate::protocol::CompressedProtocol::server(
+                config.max_frame_size,
+                config.max_message_size,
+                deflate_config,
+            )
+        };
 
         let clock_epoch = tokio::time::Instant::now();
         let heartbeat = Heartbeat::new(&config, 0);
@@ -1601,11 +1609,19 @@ where
 
     /// Create a new compressed WebSocket stream for client role
     pub fn client(inner: S, config: Config, deflate_config: crate::deflate::DeflateConfig) -> Self {
-        let protocol = crate::protocol::CompressedProtocol::client(
-            config.max_frame_size,
-            config.max_message_size,
-            deflate_config,
-        );
+        let protocol = if config.compression.is_shared() {
+            crate::protocol::CompressedProtocol::client_with_shared_compression(
+                config.max_frame_size,
+                config.max_message_size,
+                deflate_config,
+            )
+        } else {
+            crate::protocol::CompressedProtocol::client(
+                config.max_frame_size,
+                config.max_message_size,
+                deflate_config,
+            )
+        };
 
         let clock_epoch = tokio::time::Instant::now();
         let heartbeat = Heartbeat::new(&config, 0);

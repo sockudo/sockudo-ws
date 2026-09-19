@@ -2168,13 +2168,22 @@ where
 
         let clock_epoch = Instant::now();
         let heartbeat = Heartbeat::new(&config, 0);
-        Self {
-            inner,
-            protocol: CompressedProtocol::server(
+        let protocol = if config.compression.is_shared() {
+            CompressedProtocol::server_with_shared_compression(
                 config.max_frame_size,
                 config.max_message_size,
                 deflate_config,
-            ),
+            )
+        } else {
+            CompressedProtocol::server(
+                config.max_frame_size,
+                config.max_message_size,
+                deflate_config,
+            )
+        };
+        Self {
+            inner,
+            protocol,
             read_buf,
             write_buf: BytesMut::with_capacity(config.write_buffer_size),
             state: CompioStreamState::Open,
@@ -2206,13 +2215,22 @@ where
 
         let clock_epoch = Instant::now();
         let heartbeat = Heartbeat::new(&config, 0);
-        Self {
-            inner,
-            protocol: CompressedProtocol::client(
+        let protocol = if config.compression.is_shared() {
+            CompressedProtocol::client_with_shared_compression(
                 config.max_frame_size,
                 config.max_message_size,
                 deflate_config,
-            ),
+            )
+        } else {
+            CompressedProtocol::client(
+                config.max_frame_size,
+                config.max_message_size,
+                deflate_config,
+            )
+        };
+        Self {
+            inner,
+            protocol,
             read_buf,
             write_buf: BytesMut::with_capacity(config.write_buffer_size),
             state: CompioStreamState::Open,
