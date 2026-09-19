@@ -136,7 +136,7 @@ async fn handle_connection(mut stream: TcpStream) -> Result<()> {
             let extensions_response: Option<String> = None;
 
             // Build and send response
-            let response = build_response(&accept_key, None, extensions_response.as_deref());
+            let response = build_response(&accept_key, None, extensions_response.as_deref())?;
             stream.write_all(&response).await?;
             stream.flush().await?;
 

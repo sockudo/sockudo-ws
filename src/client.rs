@@ -42,6 +42,8 @@ use crate::transport::Http2;
 use crate::transport::Http3;
 
 #[cfg(any(feature = "http2", feature = "http3"))]
+use crate::extended_connect::validate_extended_connect_response;
+#[cfg(any(feature = "http2", feature = "http3"))]
 use crate::multiplex::MultiplexedConnection;
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -355,6 +357,8 @@ impl WebSocketClient<Http1> {
             return Err(Error::HandshakeFailed("URL missing host"));
         }
 
+        handshake::validate_client_handshake_inputs(host, path, protocol, extra_headers)?;
+
         // Connect to the server
         let addr = format!("{}:{}", host, port);
         let stream = TcpStream::connect(&addr).await.map_err(Error::Io)?;
@@ -521,6 +525,7 @@ impl WebSocketClient<Http2> {
         if response.status() != http::StatusCode::OK {
             return Err(Error::HandshakeFailed("server rejected WebSocket upgrade"));
         }
+        validate_extended_connect_response(response.headers(), protocol)?;
 
         // Get the receive stream from the response
         let recv_stream = response.into_body();
@@ -660,18 +665,31 @@ impl WebSocketClient<Http3> {
         path: &str,
         subprotocol: Option<&str>,
         origin: Option<&str>,
-        tls_config: rustls::ClientConfig,
+        mut tls_config: rustls::ClientConfig,
     ) -> Result<WebSocketStream<Stream<Http3>>> {
         use http::{Method, Request};
+
+        crate::http3::validate_config(&self.config.http3)?;
+        if !self.config.http3.enable_connect_protocol {
+            return Err(Error::ExtendedConnectNotSupported);
+        }
+        let transport_config = crate::http3::quic_transport_config(&self.config.http3)?;
+        let endpoint_config = crate::http3::quic_endpoint_config(&self.config.http3)?;
+        // Do not let caller-provided TLS settings bypass the 0-RTT rejection above.
+        tls_config.enable_early_data = false;
 
         // Create QUIC client config
         let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
             .map_err(|_| Error::HandshakeFailed("invalid TLS config"))?;
 
-        let client_config = ClientConfig::new(Arc::new(quic_config));
+        let mut client_config = ClientConfig::new(Arc::new(quic_config));
+        client_config.transport_config(transport_config);
 
         // Create endpoint (bind to any available port)
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).map_err(Error::Io)?;
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(Error::Io)?;
+        let mut endpoint =
+            Endpoint::new(endpoint_config, None, socket, Arc::new(quinn::TokioRuntime))
+                .map_err(Error::Io)?;
         endpoint.set_default_client_config(client_config);
 
         // Connect to server via QUIC
@@ -682,7 +700,10 @@ impl WebSocketClient<Http3> {
             .map_err(Error::from)?;
 
         // Create HTTP/3 connection using h3 crate
-        let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection))
+        let mut builder = h3::client::builder();
+        builder.enable_extended_connect(self.config.http3.enable_connect_protocol);
+        let (mut driver, mut send_request) = builder
+            .build(h3_quinn::Connection::new(connection))
             .await
             .map_err(Error::from)?;
 
@@ -724,6 +745,7 @@ impl WebSocketClient<Http3> {
         // Check response status per RFC 9220
         match response.status() {
             StatusCode::OK => {
+                validate_extended_connect_response(response.headers(), subprotocol)?;
                 let h3_stream = Stream::<Http3>::from_h3_client_with_handles(
                     stream,
                     Some(endpoint),
@@ -752,14 +774,27 @@ impl WebSocketClient<Http3> {
         &self,
         server_addr: SocketAddr,
         server_name: &str,
-        tls_config: rustls::ClientConfig,
+        mut tls_config: rustls::ClientConfig,
     ) -> Result<MultiplexedConnection<Http3>> {
+        crate::http3::validate_config(&self.config.http3)?;
+        if !self.config.http3.enable_connect_protocol {
+            return Err(Error::ExtendedConnectNotSupported);
+        }
+        let transport_config = crate::http3::quic_transport_config(&self.config.http3)?;
+        let endpoint_config = crate::http3::quic_endpoint_config(&self.config.http3)?;
+        // Do not let caller-provided TLS settings bypass the 0-RTT rejection above.
+        tls_config.enable_early_data = false;
+
         let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
             .map_err(|_| Error::HandshakeFailed("invalid TLS config"))?;
 
-        let client_config = ClientConfig::new(Arc::new(quic_config));
+        let mut client_config = ClientConfig::new(Arc::new(quic_config));
+        client_config.transport_config(transport_config);
 
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).map_err(Error::Io)?;
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(Error::Io)?;
+        let mut endpoint =
+            Endpoint::new(endpoint_config, None, socket, Arc::new(quinn::TokioRuntime))
+                .map_err(Error::Io)?;
         endpoint.set_default_client_config(client_config);
 
         let connection = endpoint
@@ -769,10 +804,12 @@ impl WebSocketClient<Http3> {
             .map_err(Error::from)?;
 
         // Create HTTP/3 connection
-        let (mut driver, send_request) =
-            h3::client::new(h3_quinn::Connection::new(connection.clone()))
-                .await
-                .map_err(Error::from)?;
+        let mut builder = h3::client::builder();
+        builder.enable_extended_connect(self.config.http3.enable_connect_protocol);
+        let (mut driver, send_request) = builder
+            .build(h3_quinn::Connection::new(connection.clone()))
+            .await
+            .map_err(Error::from)?;
 
         // Spawn driver
         tokio::spawn(async move {
