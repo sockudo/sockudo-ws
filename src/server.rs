@@ -773,7 +773,7 @@ where
     let connection = incoming.await.map_err(Error::from)?;
 
     let mut builder = h3::server::builder();
-    builder.enable_extended_connect(true);
+    builder.enable_extended_connect(config.http3.enable_connect_protocol);
     let mut h3_conn: H3Connection<h3_quinn::Connection, Bytes> = builder
         .build(h3_quinn::Connection::new(connection))
         .await
@@ -826,7 +826,7 @@ where
     let connection = incoming.await.map_err(Error::from)?;
 
     let mut builder = h3::server::builder();
-    builder.enable_extended_connect(true);
+    builder.enable_extended_connect(config.http3.enable_connect_protocol);
     let mut h3_conn: H3Connection<h3_quinn::Connection, Bytes> = builder
         .build(h3_quinn::Connection::new(connection))
         .await
