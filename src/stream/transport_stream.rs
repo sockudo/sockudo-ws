@@ -123,6 +123,26 @@ impl AsyncRead for Stream<Http1> {
 }
 
 impl AsyncWrite for Stream<Http1> {
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match &mut self.inner {
+            StreamInner::Http1(stream) => Pin::new(stream.as_mut()).poll_write_vectored(cx, bufs),
+            #[cfg(any(feature = "http2", feature = "http3"))]
+            _ => unreachable!(),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match &self.inner {
+            StreamInner::Http1(stream) => stream.is_write_vectored(),
+            #[cfg(any(feature = "http2", feature = "http3"))]
+            _ => unreachable!(),
+        }
+    }
+
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
