@@ -2,9 +2,11 @@
 
 use std::time::Duration;
 
+#[cfg(feature = "permessage-deflate")]
 use bytes::BytesMut;
 use compio::io::AsyncWriteExt;
 use compio::net::{TcpListener, TcpStream};
+#[cfg(feature = "permessage-deflate")]
 use sockudo_ws::frame::{OpCode, encode_frame_with_rsv};
 use sockudo_ws::{CompioWebSocketStream, Config, Error};
 
@@ -135,4 +137,55 @@ async fn idle_timeout_bounds_ping_read_recovery() {
     let mut ws = CompioWebSocketStream::client(NonCooperativeRead, config);
     let result = compio::time::timeout(Duration::from_millis(2500), ws.next()).await;
     assert!(matches!(result, Ok(Some(Err(Error::IdleTimeout)))));
+}
+
+macro_rules! recovery_timeout_case {
+    ($name:ident, $make:expr) => {
+        #[compio::test]
+        async fn $name() {
+            let config = Config::builder()
+                .ping_interval(1)
+                .pong_timeout(1)
+                .idle_timeout(0)
+                .close_timeout(0)
+                .build();
+            let mut ws = ($make)(config);
+            let started = std::time::Instant::now();
+            let result = compio::time::timeout(Duration::from_millis(2500), ws.next()).await;
+            assert!(matches!(result, Ok(Some(Err(Error::HeartbeatTimeout)))));
+            // The recovery budget begins at Ping's due time, not when read started.
+            assert!(started.elapsed() >= Duration::from_secs(2));
+            assert!(ws.next().await.is_none());
+        }
+    };
+}
+recovery_timeout_case!(
+    pong_timeout_bounds_ping_recovery_without_idle_timeout,
+    |config| { CompioWebSocketStream::client(NonCooperativeRead, config) }
+);
+#[cfg(feature = "permessage-deflate")]
+recovery_timeout_case!(
+    compressed_pong_timeout_bounds_ping_recovery_without_idle_timeout,
+    |config| {
+        sockudo_ws::compio::CompioCompressedWebSocketStream::client(
+            NonCooperativeRead,
+            config,
+            sockudo_ws::DeflateConfig::default(),
+        )
+    }
+);
+
+#[compio::test]
+async fn disabled_pong_and_idle_timeouts_leave_recovery_unbounded() {
+    let config = Config::builder()
+        .ping_interval(1)
+        .pong_timeout(0)
+        .idle_timeout(0)
+        .build();
+    let mut ws = CompioWebSocketStream::client(NonCooperativeRead, config);
+    assert!(
+        compio::time::timeout(Duration::from_millis(1500), ws.next())
+            .await
+            .is_err()
+    );
 }

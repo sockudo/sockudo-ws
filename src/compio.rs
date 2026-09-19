@@ -7,8 +7,11 @@
 //! Custom readers used with automatic heartbeats must cooperate with Compio's
 //! cancellation token so a pending read returns its owned buffer before Ping
 //! work resumes. An existing idle or Pong deadline still terminates the
-//! connection; without one, a reader that ignores cancellation can delay Ping
-//! indefinitely. No Pong timeout starts before the Ping is actually sent.
+//! connection. Without a hard deadline, `pong_timeout` bounds buffer recovery
+//! from the Ping's scheduled due time. Expiry reports `HeartbeatTimeout` even
+//! when the blocked reader prevented Ping from being sent. Recovery is unbounded
+//! only when both idle and Pong timeouts are disabled. The peer's Pong response
+//! deadline still starts after Ping is actually flushed.
 //!
 //! HTTP/2 entry points require `compio::io::util::Splittable`. Wrap transports
 //! without that implementation (including TLS wrappers) in
@@ -250,8 +253,9 @@ where
             }
             // Continuing after Ping requires the owned buffer back. Native Compio
             // reads and our poll-based adapters cooperate with the cancellation.
-            // An existing hard idle/Pong deadline bounds recovery. Without
-            // one, prompt recovery requires the reader to honor cancellation.
+            // The caller supplies an existing hard deadline or a recovery budget
+            // starting at Ping's due time. Only disabled timeouts allow an
+            // uncooperative reader to postpone recovery indefinitely.
             let hard_timer = async {
                 let Some(at) = hard_timeout else {
                     return std::future::pending::<Deadline>().await;
@@ -1424,6 +1428,9 @@ where
     /// cooperate with Compio's current `CancelToken` so a pending read can return
     /// its owned buffer before Ping is sent. The built-in transports do this.
     /// Hard idle/Pong timeouts terminate without waiting for buffer recovery.
+    /// Without a hard deadline, `pong_timeout` bounds recovery from Ping's due
+    /// time; expiry returns `HeartbeatTimeout` even if Ping could not be sent.
+    /// Recovery is unbounded only when idle and Pong timeouts are both disabled.
     pub async fn next(&mut self) -> Option<Result<Message>> {
         loop {
             if self.state == CompioStreamState::Closed {
@@ -1455,7 +1462,17 @@ where
                     &mut self.inner,
                     &mut self.read_buf,
                     deadline,
-                    self.heartbeat.next_timeout(),
+                    self.heartbeat.next_timeout().or_else(|| {
+                        // With no hard timeout, the scheduled deadline is Ping.
+                        // Bound buffer recovery from that due time, not read start.
+                        (self.config.pong_timeout != 0).then(|| {
+                            Deadline::Pong(
+                                deadline
+                                    .at()
+                                    .saturating_add(u64::from(self.config.pong_timeout) * 1000),
+                            )
+                        })
+                    }),
                     self.clock_epoch,
                 )
                 .await
@@ -2374,6 +2391,9 @@ where
     /// cooperate with Compio's current `CancelToken` so a pending read can return
     /// its owned buffer before Ping is sent. The built-in transports do this.
     /// Hard idle/Pong timeouts terminate without waiting for buffer recovery.
+    /// Without a hard deadline, `pong_timeout` bounds recovery from Ping's due
+    /// time; expiry returns `HeartbeatTimeout` even if Ping could not be sent.
+    /// Recovery is unbounded only when idle and Pong timeouts are both disabled.
     pub async fn next(&mut self) -> Option<Result<Message>> {
         loop {
             if self.state == CompioStreamState::Closed {
@@ -2405,7 +2425,17 @@ where
                     &mut self.inner,
                     &mut self.read_buf,
                     deadline,
-                    self.heartbeat.next_timeout(),
+                    self.heartbeat.next_timeout().or_else(|| {
+                        // With no hard timeout, the scheduled deadline is Ping.
+                        // Bound buffer recovery from that due time, not read start.
+                        (self.config.pong_timeout != 0).then(|| {
+                            Deadline::Pong(
+                                deadline
+                                    .at()
+                                    .saturating_add(u64::from(self.config.pong_timeout) * 1000),
+                            )
+                        })
+                    }),
                     self.clock_epoch,
                 )
                 .await
