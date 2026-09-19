@@ -1197,6 +1197,12 @@ where
     /// processing. A terminal heartbeat/idle cause is yielded once as an error.
     /// Buffered ordinary messages bypass the writer's control queue. Cooperative
     /// yields preserve them; waiting on the control queue is not cancellation-safe.
+    ///
+    /// Accepts one message at a time. Later buffered frames, including malformed
+    /// ones, are not inspected until another call. Writes remain allowed until
+    /// an error is discovered; a connection timeout wins over unparsed bytes.
+    /// Already parsed messages and errors inherited from an unsplit stream keep
+    /// their existing delivery order.
     pub async fn next(&mut self) -> Option<Result<Message>> {
         // Buffered data no longer spends channel budget. Yield before advancing
         // the message index so cancellation preserves the next message.
@@ -1279,7 +1285,7 @@ where
                 self.has_unprocessed_read_data = false;
                 match self
                     .protocol
-                    .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)
+                    .process_next_with_activity(&mut self.read_buf, &mut self.pending_messages)
                 {
                     Ok(fragment_activity) => {
                         if fragment_activity {
@@ -1287,6 +1293,7 @@ where
                         }
                         self.pending_index = 0;
                         if !self.pending_messages.is_empty() {
+                            self.has_unprocessed_read_data = !self.read_buf.is_empty();
                             continue;
                         }
                     }
@@ -1320,18 +1327,7 @@ where
                             let _ = self.control_tx.send(ControlRequest::Eof).await;
                             self.shared.terminate(TerminalCause::ConnectionClosed);
                         }
-                        Ok(_) => match self.protocol.process_into_with_activity(&mut self.read_buf, &mut self.pending_messages) {
-                            Ok(fragment_activity) => {
-                                if fragment_activity {
-                                    self.shared.record_data_activity();
-                                }
-                                self.pending_index = 0;
-                            }
-                            Err(error) => {
-                                self.pending_index = 0;
-                                self.pending_terminal_error = Some(error);
-                            }
-                        },
+                        Ok(_) => self.has_unprocessed_read_data = true,
                         Err(error) => {
                             self.shared.terminate(TerminalCause::ConnectionClosed);
                             return Some(Err(error.into()));

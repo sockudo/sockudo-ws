@@ -285,11 +285,12 @@ async fn dropping_reader_releases_persistent_terminal_registration() {
 #[tokio::test]
 async fn split_preserves_parsed_prefix_and_error_after_terminal_publication() {
     let (io, _writes) = two_messages_before_parse_failure_input(false);
-    let (mut reader, _writer) = WebSocketStream::client(io, config()).split();
+    let mut stream = WebSocketStream::client(io, config());
     assert_eq!(
-        reader.next().await.unwrap().unwrap().as_bytes(),
+        stream.next().await.unwrap().unwrap().as_bytes(),
         &[b'a'; 128]
     );
+    let (mut reader, _writer) = stream.split();
     // An already discovered parse failure drains its successful prefix before
     // reporting that failure, even if the writer publishes a timeout meanwhile.
     reader.shared.terminate(TerminalCause::IdleTimeout);

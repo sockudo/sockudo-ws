@@ -85,20 +85,25 @@ async fn split_preserves_an_error_after_a_message_from_handshake_leftover() {
 }
 
 #[tokio::test]
-async fn split_parse_error_stops_writes_before_messages_are_drained() {
+async fn split_stops_writes_when_the_next_message_reveals_a_parse_error() {
     let (io, mut peer) = tokio::io::duplex(128);
     let (mut reader, mut writer) = WebSocketStream::client(io, config()).split();
     peer.write_all(b"\x82\x01a\x82\x01b\x83\x00").await.unwrap();
 
     assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), b"a");
 
+    assert!(!writer.is_closed());
+    writer
+        .send(sockudo_ws::Message::text("before discovery"))
+        .await
+        .unwrap();
+    assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), b"b");
+    assert!(reader.next().await.unwrap().is_err());
     assert!(writer.is_closed());
     assert!(matches!(
         writer.send(sockudo_ws::Message::text("late")).await,
         Err(sockudo_ws::Error::ConnectionClosed)
     ));
-    assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), b"b");
-    assert!(reader.next().await.unwrap().is_err());
     assert!(reader.next().await.is_none());
 }
 
