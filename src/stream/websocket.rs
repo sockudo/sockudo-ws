@@ -266,7 +266,7 @@ where
 
     /// Send a close frame
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
-        if self.state != StreamState::Open {
+        if self.state != StreamState::Open || self.pending_parse_error.is_some() {
             return Ok(());
         }
 
@@ -677,7 +677,7 @@ where
     type Error = Error;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if self.state != StreamState::Open {
+        if self.state != StreamState::Open || self.pending_parse_error.is_some() {
             return Poll::Ready(Err(Error::ConnectionClosed));
         }
         Poll::Ready(Ok(()))
@@ -686,7 +686,7 @@ where
     fn start_send(self: Pin<&mut Self>, item: Message) -> Result<()> {
         let this = self.get_mut();
 
-        if this.state != StreamState::Open {
+        if this.state != StreamState::Open || this.pending_parse_error.is_some() {
             return Err(Error::ConnectionClosed);
         }
 
@@ -1172,6 +1172,15 @@ where
             if self.terminal_reported {
                 return None;
             }
+            // Stop the connection without discarding its accepted message prefix.
+            // An accepted Close takes precedence over invalid bytes after it.
+            if self.pending_parse_error.is_some()
+                && self.shared.is_open()
+                && !self.pending_messages.iter().any(Message::is_close)
+            {
+                self.shared.terminate(TerminalCause::ConnectionClosed);
+                self.shared.cancel.cancel();
+            }
             if self.pending_parse_error.is_none()
                 && let Some(result) = self.take_terminal()
             {
@@ -1179,6 +1188,14 @@ where
             }
 
             if let Some(msg) = self.pending_messages.pop() {
+                if self.pending_parse_error.is_some() && !self.shared.is_open() {
+                    if msg.is_close() {
+                        self.pending_messages.clear();
+                        self.pending_parse_error = None;
+                        self.terminal_reported = true;
+                    }
+                    return Some(Ok(msg));
+                }
                 let request = match &msg {
                     Message::Ping(data) => {
                         ControlRequest::Ping(data.clone(), tokio::time::Instant::now())
@@ -1689,7 +1706,7 @@ where
 
     /// Send a close frame
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
-        if self.state != StreamState::Open {
+        if self.state != StreamState::Open || self.pending_parse_error.is_some() {
             return Ok(());
         }
 
@@ -2069,7 +2086,7 @@ where
     type Error = Error;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if self.state != StreamState::Open {
+        if self.state != StreamState::Open || self.pending_parse_error.is_some() {
             return Poll::Ready(Err(Error::ConnectionClosed));
         }
         Poll::Ready(Ok(()))
@@ -2078,7 +2095,7 @@ where
     fn start_send(self: Pin<&mut Self>, item: Message) -> Result<()> {
         let this = self.get_mut();
 
-        if this.state != StreamState::Open {
+        if this.state != StreamState::Open || this.pending_parse_error.is_some() {
             return Err(Error::ConnectionClosed);
         }
 
@@ -2281,6 +2298,15 @@ where
             if self.terminal_reported {
                 return None;
             }
+            // Stop the connection without discarding its accepted message prefix.
+            // An accepted Close takes precedence over invalid bytes after it.
+            if self.pending_parse_error.is_some()
+                && self.shared.is_open()
+                && !self.pending_messages.iter().any(Message::is_close)
+            {
+                self.shared.terminate(TerminalCause::ConnectionClosed);
+                self.shared.cancel.cancel();
+            }
             if self.pending_parse_error.is_none()
                 && let Some(result) = self.take_terminal()
             {
@@ -2288,6 +2314,14 @@ where
             }
 
             if let Some(msg) = self.pending_messages.pop() {
+                if self.pending_parse_error.is_some() && !self.shared.is_open() {
+                    if msg.is_close() {
+                        self.pending_messages.clear();
+                        self.pending_parse_error = None;
+                        self.terminal_reported = true;
+                    }
+                    return Some(Ok(msg));
+                }
                 let request = match &msg {
                     Message::Ping(data) => {
                         ControlRequest::Ping(data.clone(), tokio::time::Instant::now())
