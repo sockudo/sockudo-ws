@@ -476,7 +476,8 @@ impl AsyncRead for Stream<Http3> {
                 // First drain buffered data
                 if !recv_buf.is_empty() {
                     let to_copy = std::cmp::min(buf.remaining(), recv_buf.len());
-                    buf.put_slice(&recv_buf.split_to(to_copy));
+                    buf.put_slice(&recv_buf[..to_copy]);
+                    recv_buf.advance(to_copy);
                     return Poll::Ready(Ok(()));
                 }
 
