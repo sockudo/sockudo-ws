@@ -153,3 +153,46 @@ async fn disabled_server_extended_connect_rejects_a_real_request() {
     .await
     .unwrap();
 }
+
+#[cfg(feature = "compio-runtime")]
+#[compio::test]
+async fn compio_multiplexed_client_rejects_early_data_before_connecting() {
+    let (_, client_tls) = h3_support::tls_configs();
+    let result = compio::time::timeout(
+        std::time::Duration::from_secs(1),
+        sockudo_ws::compio::connect_http3_multiplexed(
+            "127.0.0.1:9".parse().unwrap(),
+            "localhost",
+            client_tls,
+            sockudo_ws::Config::builder()
+                .http3_enable_0rtt(true)
+                .build(),
+        ),
+    )
+    .await
+    .expect("configuration must be rejected before network I/O");
+    assert!(matches!(result, Err(sockudo_ws::Error::Http3(message)) if message.contains("0-RTT")));
+}
+
+#[cfg(feature = "compio-runtime")]
+#[compio::test]
+async fn compio_multiplexed_client_rejects_disabled_connect_before_connecting() {
+    let (_, client_tls) = h3_support::tls_configs();
+    let result = compio::time::timeout(
+        std::time::Duration::from_secs(1),
+        sockudo_ws::compio::connect_http3_multiplexed(
+            "127.0.0.1:9".parse().unwrap(),
+            "localhost",
+            client_tls,
+            sockudo_ws::Config::builder()
+                .http3_enable_connect_protocol(false)
+                .build(),
+        ),
+    )
+    .await
+    .expect("configuration must be rejected before network I/O");
+    assert!(matches!(
+        result,
+        Err(sockudo_ws::Error::ExtendedConnectNotSupported)
+    ));
+}
