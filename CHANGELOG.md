@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The uncompressed native split reader accepts one message per `next()` call.
+  A malformed buffered tail is discovered on a later call, so application writes
+  remain allowed until that error is discovered. Connection timeouts take
+  precedence over unparsed bytes. Unified and compressed readers retain batch
+  parsing; messages and errors parsed before splitting retain their order.
 - Encoded buffer overflow is terminal; `WouldBlock` remains retryable. The default
   outbound limit is 1 MiB, independently of inbound message limits.
 - Generic deflate configs reject unsupported 8-bit encoder windows; role-aware
