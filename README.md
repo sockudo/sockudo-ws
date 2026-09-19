@@ -894,23 +894,24 @@ sockudo-ws uses SIMD acceleration for frame masking and UTF-8 validation:
 
 | Architecture | Instructions | Masking | UTF-8 | Stable | Nightly |
 |--------------|--------------|---------|-------|--------|---------|
-| x86_64 | SSE2 | ✅ | ✅ | ✅ | ✅ |
+| x86_64 | SSE2 | ✅ | ❌ | ✅ | ✅ |
 | x86_64 | SSE4.2 | ✅ | ✅ | ✅ | ✅ |
 | x86_64 | AVX2 | ✅ | ✅ | ✅ | ✅ |
-| x86_64 | AVX-512 | ✅ | ✅ | ✅ | ✅ |
+| x86_64 | AVX-512 | ✅ | AVX2 fallback | ✅ | ✅ |
 | aarch64 | NEON | ✅ | ✅ | ✅ | ✅ |
-| arm | NEON | ✅ | ✅ | ❌ | ✅ |
-| loongarch64 | LSX | ✅ | ✅* | ❌ | ✅ |
-| loongarch64 | LASX | ✅ | ✅* | ❌ | ✅ |
-| powerpc | AltiVec | ✅ | ✅* | ❌ | ✅ |
-| powerpc64 | AltiVec | ✅ | ✅* | ❌ | ✅ |
-| s390x | z13 vectors | ✅ | ✅* | ❌ | ✅ |
+| arm | NEON | ✅ | ❌ | ❌ | ✅ |
+| loongarch64 | LSX | ✅ | ❌ | ❌ | ✅ |
+| loongarch64 | LASX | ✅ | ❌ | ❌ | ✅ |
+| powerpc | AltiVec | ✅ | ❌ | ❌ | ✅ |
+| powerpc64 | AltiVec | ✅ | ❌ | ❌ | ✅ |
+| s390x | z13 vectors | ✅ | ❌ | ❌ | ✅ |
 
-*Custom SIMD UTF-8 validation with ASCII fast-path (requires `nightly` feature).
+The UTF-8 column describes SIMD acceleration, not validation availability.
+All targets validate complete UTF-8 inputs, using a portable fallback where needed.
 
 UTF-8 validation uses:
-- [simdutf8](https://github.com/rusticstuff/simdutf8) for x86_64 (SSE4.2, AVX2, AVX-512), aarch64 (NEON), arm (NEON), wasm32
-- Custom SIMD implementations for LoongArch64, PowerPC, and s390x (with `nightly` feature)
+- [simdutf8](https://github.com/rusticstuff/simdutf8) for x86/x86_64 (SSE4.2 or AVX2), aarch64 (NEON), and SIMD-enabled wasm32
+- The dependency's standard UTF-8 validator fallback on other targets, including arm, LoongArch64, PowerPC, and s390x
 
 ## API Reference
 
