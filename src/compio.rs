@@ -1787,9 +1787,12 @@ where
         // Reuse the message Vec across reads; messages are popped from the
         // back, so keep them in reverse order.
         debug_assert!(self.pending_messages.is_empty());
-        let result = self.protocol.process_into_with_activity(&mut self.read_buf, &mut self.pending_messages);
+        let result = self
+            .protocol
+            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages);
         if matches!(result, Ok(true)) {
-            self.heartbeat.on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
+            self.heartbeat
+                .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
         }
         // Preserve accepted messages even when a later frame fails.
         self.pending_messages.reverse();
@@ -2944,9 +2947,12 @@ where
         // Reuse the message Vec across reads; messages are popped from the
         // back, so keep them in reverse order.
         debug_assert!(self.pending_messages.is_empty());
-        let result = self.protocol.process_into_with_activity(&mut self.read_buf, &mut self.pending_messages);
+        let result = self
+            .protocol
+            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages);
         if matches!(result, Ok(true)) {
-            self.heartbeat.on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
+            self.heartbeat
+                .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
         }
         // Preserve accepted messages even when a later frame fails.
         self.pending_messages.reverse();

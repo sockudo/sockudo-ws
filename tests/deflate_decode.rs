@@ -200,7 +200,8 @@ fn decompression_rejects_reserved_block_type() {
 #[test]
 fn minimum_backend_window_round_trips() {
     let payload = b"minimum backend window payload ".repeat(64);
-    let mut encoder = DeflateEncoder::new(sockudo_ws::deflate::DeflateWindowBits::Bits9, true, 6, 0);
+    let mut encoder =
+        DeflateEncoder::new(sockudo_ws::deflate::DeflateWindowBits::Bits9, true, 6, 0);
     let mut decoder = DeflateDecoder::new(sockudo_ws::deflate::DeflateWindowBits::Bits9, true);
 
     let compressed = encoder.compress(&payload).unwrap().unwrap();

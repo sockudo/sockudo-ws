@@ -6,6 +6,7 @@ use futures_util::{StreamExt, poll};
 use sockudo_ws::{Config, Error, WebSocketStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn fragments_postpone_automatic_ping_without_idle_timeout() {
     let (io, mut peer) = tokio::io::duplex(1024);
@@ -27,6 +28,7 @@ async fn fragments_postpone_automatic_ping_without_idle_timeout() {
     assert_eq!(&ping[..2], &[0x89, 0x88]);
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn incomplete_frame_bytes_do_not_refresh_idle_timeout() {
     let (io, mut peer) = tokio::io::duplex(1024);
@@ -44,6 +46,7 @@ async fn incomplete_frame_bytes_do_not_refresh_idle_timeout() {
 
 macro_rules! fragment_activity_case {
     ($name:ident, $socket:expr, $split:expr) => {
+        #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
         #[tokio::test(start_paused = true)]
         async fn $name() {
             let (io, mut peer) = tokio::io::duplex(1024);
