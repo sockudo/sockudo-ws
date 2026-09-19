@@ -92,8 +92,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Discarded queued Compio messages after an automatic control-frame write fails,
   and made HTTP/2 and HTTP/3 subprotocol matching case-sensitive.
 - Reset deflate decoders without replacing their allocation and aligned public
-  parameter parsing with server negotiation, including the supported decoder
-  mapping for `client_max_window_bits=8`.
+  parameter parsing with supported encoder limits. Role-aware server negotiation
+  can map `client_max_window_bits=8` to a supported decoder; generic configs
+  reject it because they can also construct client encoders.
 
 ### Compatibility
 
