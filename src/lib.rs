@@ -442,7 +442,9 @@ pub struct Config {
     /// ties a Pong deadline, the more specific Pong timeout wins.
     pub idle_timeout: u32,
     /// Maximum backpressure in bytes before dropping connection (default: 1MB)
-    /// If write buffer exceeds this, connection is closed
+    /// If an application frame makes the encoded write buffer exceed this limit,
+    /// the connection becomes terminal and the write returns `Error::BufferFull`.
+    /// This bounds queued encoded bytes, not peak encoding memory.
     pub max_backpressure: usize,
     /// Send native Pings after inbound inactivity (default: true).
     ///
