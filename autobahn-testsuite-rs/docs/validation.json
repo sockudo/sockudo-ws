@@ -1,0 +1,26 @@
+{
+  "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "rustc": "1.98.1",
+  "upstream_commit": "b8a5120d905e30470e4475785c48e4cedc35f6cd",
+  "complete_corpus_seconds": 69.54,
+  "results": {
+    "native-client": {
+      "cases": 517,
+      "OK": 514,
+      "INFORMATIONAL": 3,
+      "close_OK": 514,
+      "reduced": 0
+    },
+    "native-server": {
+      "cases": 517,
+      "OK": 514,
+      "INFORMATIONAL": 3,
+      "close_OK": 514,
+      "reduced": 0
+    }
+  },
+  "compression_level": 6,
+  "regular_tests": 20,
+  "linux_minimum_rust": "1.88.0"
+}

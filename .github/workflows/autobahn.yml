@@ -1,0 +1,38 @@
+name: Autobahn
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  autobahn:
+    name: WebSocket conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+            autobahn-testsuite-rs/target/
+          key: ${{ runner.os }}-autobahn-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run full Autobahn suite
+        run: make -C autobahn test
+
+      - name: Upload reports and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autobahn-reports
+          path: autobahn/reports/
+          retention-days: 14

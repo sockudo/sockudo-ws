@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Autobahn Rust · Browser tests</title>
+<style>body{font:16px system-ui;background:#111722;color:#e9eef7;max-width:900px;margin:4rem auto;padding:0 1rem}h1{font-size:2.4rem}label{display:block;margin:1.2rem 0 .4rem}input{box-sizing:border-box;width:100%;padding:.8rem;border:1px solid #536173;border-radius:.4rem;background:#1c2736;color:inherit}button{padding:.8rem 1.2rem;margin:1.4rem .6rem 1.4rem 0;background:#9ed1ff;border:0;border-radius:.4rem;font:inherit;cursor:pointer}button:disabled{opacity:.5;cursor:default}a{color:#9ed1ff}progress{width:100%;height:1.2rem}pre{max-height:24rem;overflow:auto;background:#1c2736;padding:1rem;white-space:pre-wrap}small{color:#b6c2d3}</style>
+<h1>Test this browser’s WebSocket support</h1>
+<p>Run the selected Autobahn cases and generate a conformance report.</p>
+<label for="url">Test server</label><input id="url" value="__WS_URL__">
+<label for="agent">Browser name in report</label><input id="agent">
+<button id="run">Run tests</button><button id="stop" disabled>Stop</button><a href="/reports/index.html">View report</a>
+<p id="status">Ready</p><progress id="progress" value="0" max="1"></progress><pre id="log" aria-live="polite"></pre>
+<small>Keep this tab open until the run finishes. Unsupported compression is reported separately.</small>
+<script>
+const el=id=>document.getElementById(id);el('agent').value=navigator.userAgent;
+let stopped=false,current=null;
+function endpoint(path,index){const url=new URL(el('url').value);url.pathname=path;url.search='';url.searchParams.set('agent',el('agent').value);if(index)url.searchParams.set('case',index);return url;}
+function control(path,index){return new Promise((resolve,reject)=>{const ws=new WebSocket(endpoint(path,index));current=ws;let data=null;ws.onmessage=e=>{data=JSON.parse(e.data)};ws.onclose=()=>resolve(data);ws.onerror=()=>reject(new Error('Connection failed: '+path));});}
+function runCase(index){return new Promise(resolve=>{const ws=new WebSocket(endpoint('/runCase',index));current=ws;ws.binaryType='arraybuffer';ws.onmessage=e=>{if(ws.readyState===WebSocket.OPEN)ws.send(e.data)};ws.onclose=()=>resolve();ws.onerror=()=>{};});}
+el('stop').onclick=()=>{stopped=true;if(current)current.close();};
+el('run').onclick=async()=>{stopped=false;el('run').disabled=true;el('stop').disabled=false;el('log').textContent='';try{const count=await control('/getCaseCount');if(!Number.isInteger(count))throw new Error('Invalid case count');el('progress').max=count;for(let i=1;i<=count&&!stopped;i++){el('status').textContent=`Running ${i} of ${count}`;const info=await control('/getCaseInfo',i);await runCase(i);if(stopped)break;const status=await control('/getCaseStatus',i);el('log').textContent+=`${info.id}: ${status.behavior}\n`;el('log').scrollTop=el('log').scrollHeight;el('progress').value=i;}await control('/updateReports');el('status').textContent=stopped?'Stopped. Completed cases are in the report.':'Finished. Your report is ready.';}catch(error){el('status').textContent=error.message;}finally{el('run').disabled=false;el('stop').disabled=true;current=null;}};
+</script></html>

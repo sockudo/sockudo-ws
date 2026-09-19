@@ -1,0 +1,5 @@
+/target/
+/reports/
+/upstream/
+*.pem
+__pycache__/
