@@ -1446,6 +1446,13 @@ async fn split_writer_driver<W, E>(
                 break;
             }
             _ = &mut heartbeat_sleep, if heartbeat_deadline.is_some() && shared.is_open() => {
+                // Activity may have arrived while the driver waited on this timer.
+                // Refresh it before deciding whether the old deadline expired.
+                let observed_inbound = shared.last_inbound_ms.load(Ordering::Relaxed);
+                if observed_inbound > last_synced_inbound_ms {
+                    last_synced_inbound_ms = observed_inbound;
+                    heartbeat.on_inbound(observed_inbound, None);
+                }
                 let now_ms = epoch.elapsed().as_millis() as u64;
                 match heartbeat.next_deadline() {
                     Some(Deadline::Ping(at)) if at <= now_ms => {
