@@ -3,6 +3,16 @@
 //! Compio uses completion-based I/O traits, which are intentionally different
 //! from Tokio's poll-based `AsyncRead` and `AsyncWrite`. This module exposes a
 //! native async-method API for Compio streams instead of adapting through Tokio.
+//!
+//! Custom readers used with automatic heartbeats must cooperate with Compio's
+//! cancellation token so a pending read returns its owned buffer before Ping
+//! work resumes. An existing idle or Pong deadline still terminates the
+//! connection; without one, a reader that ignores cancellation can delay Ping
+//! indefinitely. No Pong timeout starts before the Ping is actually sent.
+//!
+//! HTTP/2 entry points require `compio::io::util::Splittable`. Wrap transports
+//! without that implementation (including TLS wrappers) in
+//! `compio::io::util::Split::new(transport)` before passing them to these APIs.
 
 use std::cell::Cell;
 use std::future::Future;
@@ -258,7 +268,8 @@ where
             }
             // Continuing after Ping requires the owned buffer back. Native Compio
             // reads and our poll-based adapters cooperate with the cancellation.
-            // A hard idle/Pong deadline still bounds a non-cooperative reader.
+            // An existing hard idle/Pong deadline bounds recovery. Without
+            // one, prompt recovery requires the reader to honor cancellation.
             let hard_timer = async {
                 let Some(at) = hard_timeout else {
                     return std::future::pending::<Deadline>().await;
@@ -607,15 +618,6 @@ pub struct CompioHttp2Stream {
     recv_buf: BytesMut,
     recv_eof: bool,
     capacity_needed: usize,
-}
-
-#[cfg(feature = "http2")]
-impl Drop for CompioHttp2Stream {
-    fn drop(&mut self) {
-        // Close the send half before h2 drops the last stream references. Otherwise,
-        // h2 may reset the stream and discard DATA still queued by the handler.
-        let _ = self.send.send_data(Bytes::new(), true);
-    }
 }
 
 #[cfg(feature = "http2")]
@@ -1730,7 +1732,7 @@ where
 
     /// Send a WebSocket message.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
-        if self.state == CompioStreamState::Closed {
+        if self.state == CompioStreamState::Closed || self.pending_parse_error.is_some() {
             return Err(Error::ConnectionClosed);
         }
 
@@ -1766,7 +1768,7 @@ where
 
     /// Send a close frame.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
-        if self.state != CompioStreamState::Open {
+        if self.state != CompioStreamState::Open || self.pending_parse_error.is_some() {
             return Ok(());
         }
 
@@ -1859,6 +1861,15 @@ where
         let (cancel_tx, cancel_rx) = mpsc::unbounded();
         let (terminal_tx, terminal_rx) = mpsc::unbounded();
         let shared = CompioSplitShared::new(self.state != CompioStreamState::Open);
+        // Splitting must not reopen application writes after a known parse error.
+        // A preceding accepted Close still needs its automatic response.
+        if self.pending_parse_error.is_some() {
+            shared.begin_closing();
+            if !self.pending_messages.iter().any(Message::is_close) {
+                shared.terminate(CompioTerminalCause::ConnectionClosed);
+                let _ = cancel_tx.unbounded_send(());
+            }
+        }
 
         let writer_protocol = Protocol::new(
             self.protocol.role,
@@ -2010,6 +2021,15 @@ where
             if self.terminal_reported {
                 return None;
             }
+            // Stop the connection without discarding its accepted message prefix.
+            // An accepted Close takes precedence over invalid bytes after it.
+            if self.pending_parse_error.is_some()
+                && self.shared.is_open()
+                && !self.pending_messages.iter().any(Message::is_close)
+            {
+                self.shared.terminate(CompioTerminalCause::ConnectionClosed);
+                let _ = self.cancel_tx.unbounded_send(());
+            }
             if self.pending_parse_error.is_none() && self.shared.status.get() == SPLIT_CLOSED {
                 if self.terminal_reported {
                     return None;
@@ -2025,6 +2045,14 @@ where
             }
 
             if let Some(msg) = self.pending_messages.pop() {
+                if self.pending_parse_error.is_some() && self.shared.status.get() == SPLIT_CLOSED {
+                    if msg.is_close() {
+                        self.pending_messages.clear();
+                        self.pending_parse_error = None;
+                        self.terminal_reported = true;
+                    }
+                    return Some(Ok(msg));
+                }
                 let request = match &msg {
                     Message::Ping(data) => ControlRequest::PeerPing(data.clone(), Instant::now()),
                     Message::Pong(data) => ControlRequest::Pong(data.clone(), Instant::now()),
@@ -2865,7 +2893,7 @@ where
 
     /// Send a WebSocket message.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
-        if self.state == CompioStreamState::Closed {
+        if self.state == CompioStreamState::Closed || self.pending_parse_error.is_some() {
             return Err(Error::ConnectionClosed);
         }
 
@@ -2901,7 +2929,7 @@ where
 
     /// Send a close frame.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
-        if self.state != CompioStreamState::Open {
+        if self.state != CompioStreamState::Open || self.pending_parse_error.is_some() {
             return Ok(());
         }
 
@@ -3016,6 +3044,15 @@ where
         let (cancel_tx, cancel_rx) = mpsc::unbounded();
         let (terminal_tx, terminal_rx) = mpsc::unbounded();
         let shared = CompioSplitShared::new(self.state != CompioStreamState::Open);
+        // Splitting must not reopen application writes after a known parse error.
+        // A preceding accepted Close still needs its automatic response.
+        if self.pending_parse_error.is_some() {
+            shared.begin_closing();
+            if !self.pending_messages.iter().any(Message::is_close) {
+                shared.terminate(CompioTerminalCause::ConnectionClosed);
+                let _ = cancel_tx.unbounded_send(());
+            }
+        }
         let (reader_protocol, writer_protocol) = self
             .protocol
             .split(self.config.max_frame_size, self.config.max_message_size);
@@ -3093,6 +3130,15 @@ where
             if self.terminal_reported {
                 return None;
             }
+            // Stop the connection without discarding its accepted message prefix.
+            // An accepted Close takes precedence over invalid bytes after it.
+            if self.pending_parse_error.is_some()
+                && self.shared.is_open()
+                && !self.pending_messages.iter().any(Message::is_close)
+            {
+                self.shared.terminate(CompioTerminalCause::ConnectionClosed);
+                let _ = self.cancel_tx.unbounded_send(());
+            }
             if self.pending_parse_error.is_none() && self.shared.status.get() == SPLIT_CLOSED {
                 if self.terminal_reported {
                     return None;
@@ -3108,6 +3154,14 @@ where
             }
 
             if let Some(msg) = self.pending_messages.pop() {
+                if self.pending_parse_error.is_some() && self.shared.status.get() == SPLIT_CLOSED {
+                    if msg.is_close() {
+                        self.pending_messages.clear();
+                        self.pending_parse_error = None;
+                        self.terminal_reported = true;
+                    }
+                    return Some(Ok(msg));
+                }
                 let request = match &msg {
                     Message::Ping(data) => ControlRequest::PeerPing(data.clone(), Instant::now()),
                     Message::Pong(data) => ControlRequest::Pong(data.clone(), Instant::now()),
@@ -3436,6 +3490,8 @@ mod tests {
                 let msg = ws.next().await.unwrap().unwrap();
                 assert!(matches!(&msg, Message::Text(text) if text == "h2"));
                 ws.send(msg).await.unwrap();
+                ws.close(1000, "").await.unwrap();
+                ws.get_mut().shutdown().await.unwrap();
             })
             .await
             .unwrap();
@@ -3471,6 +3527,8 @@ mod tests {
                 assert!(matches!(req.path.as_str(), "/one" | "/two"));
                 let msg = ws.next().await.unwrap().unwrap();
                 ws.send(msg).await.unwrap();
+                ws.close(1000, "").await.unwrap();
+                ws.get_mut().shutdown().await.unwrap();
             })
             .await
             .unwrap();

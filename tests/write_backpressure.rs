@@ -89,3 +89,9 @@ async fn oversized_compressed_split_frame_is_rejected() {
     ));
     assert!(writer.is_closed());
 }
+
+#[test]
+fn encoded_buffer_limit_is_a_terminal_error() {
+    assert!(Error::BufferFull.is_fatal());
+    assert!(!Error::BufferFull.is_recoverable());
+}

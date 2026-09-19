@@ -472,3 +472,22 @@ fn oversized_complete_and_partial_headers_are_rejected() {
         ));
     }
 }
+
+#[test]
+fn request_ignores_empty_elements_in_nonempty_lists() {
+    let request = String::from_utf8(request_with("websocket", "Upgrade")).unwrap();
+    let request = request.replace(
+        "\r\n\r\n",
+        "\r\nSec-WebSocket-Protocol: chat,, superchat,\r\nSec-WebSocket-Extensions: , permessage-deflate,,\r\n\r\n",
+    );
+
+    assert!(parse_request(request.as_bytes()).unwrap().is_some());
+}
+
+#[test]
+fn request_rejects_a_required_list_with_only_empty_elements() {
+    let request = String::from_utf8(request_with("websocket", "Upgrade")).unwrap();
+    let request = request.replace("\r\n\r\n", "\r\nSec-WebSocket-Protocol: , ,\r\n\r\n");
+
+    assert!(parse_request(request.as_bytes()).is_err());
+}
