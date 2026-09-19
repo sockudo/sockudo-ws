@@ -829,6 +829,7 @@ mod tokio_http2_tests {
                     let msg = ws.next().await.unwrap().unwrap();
                     assert!(matches!(&msg, Message::Text(text) if text == "h2"));
                     ws.send(msg).await.unwrap();
+                    SinkExt::close(&mut ws).await.unwrap();
                 })
                 .await
                 .unwrap();
@@ -859,6 +860,7 @@ mod tokio_http2_tests {
                     assert!(matches!(req.path.as_str(), "/one" | "/two"));
                     let msg = ws.next().await.unwrap().unwrap();
                     ws.send(msg).await.unwrap();
+                    SinkExt::close(&mut ws).await.unwrap();
                 })
                 .await
                 .unwrap();
