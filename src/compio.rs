@@ -3234,3 +3234,7 @@ mod tests {
         server.await.unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "compio/deadline_tests.rs"]
+mod deadline_tests;
