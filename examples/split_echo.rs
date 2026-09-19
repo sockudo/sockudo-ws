@@ -95,7 +95,7 @@ async fn do_handshake(mut stream: TcpStream) -> Result<TcpStream> {
 
         if let Some((req, _)) = parse_request(&buf)? {
             let accept_key = generate_accept_key(req.key);
-            let response = build_response(&accept_key, None, None);
+            let response = build_response(&accept_key, None, None)?;
             stream.write_all(&response).await?;
             stream.flush().await?;
             break;

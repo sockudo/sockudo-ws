@@ -38,7 +38,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
-use axum::http::{Method, Response, StatusCode, header};
+use axum::http::{Method, Response, StatusCode, Version, header};
 use axum::response::IntoResponse;
 use futures_core::Stream;
 use futures_sink::Sink;
@@ -49,7 +49,11 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::Config;
 use crate::error::{CloseReason, Error, Result};
-use crate::handshake::generate_accept_key;
+use crate::handshake::{
+    contains_header_token, generate_accept_key, is_valid_extension_list, is_valid_host,
+    is_valid_protocol_list, is_valid_websocket_key, is_zero_content_length, select_subprotocol,
+    validate_supported_protocols,
+};
 use crate::protocol::{Message, Role};
 use crate::stream::WebSocketStream;
 use crate::{SplitReader, SplitWriter};
@@ -65,6 +69,7 @@ use crate::stream::{CompressedSplitReader, CompressedSplitWriter, CompressedWebS
 /// a method to upgrade the connection.
 pub struct WebSocketUpgrade {
     key: String,
+    offered_protocols: Option<String>,
     protocol: Option<String>,
     extensions: Option<String>,
     config: Config,
@@ -94,6 +99,19 @@ impl WebSocketUpgrade {
     pub fn write_buffer_size(mut self, size: usize) -> Self {
         self.config.write_buffer_size = size;
         self
+    }
+
+    /// Select a client-offered subprotocol using server preference order.
+    pub fn protocols<I, P>(mut self, protocols: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<String>,
+    {
+        let protocols = protocols.into_iter().map(Into::into).collect::<Vec<_>>();
+        validate_supported_protocols(&protocols)?;
+        self.protocol =
+            select_subprotocol(self.offered_protocols.as_deref(), &protocols).map(str::to_owned);
+        Ok(self)
     }
 
     /// Upgrade the connection and call the provided handler
@@ -190,6 +208,31 @@ where
         if parts.method != Method::GET {
             return Err(WebSocketUpgradeRejection::MethodNotGet);
         }
+        if parts.version != Version::HTTP_11 {
+            return Err(WebSocketUpgradeRejection::HttpVersionNot11);
+        }
+
+        let mut hosts = parts.headers.get_all(header::HOST).iter();
+        let host = hosts
+            .next()
+            .ok_or(WebSocketUpgradeRejection::MissingHostHeader)?
+            .to_str()
+            .map_err(|_| WebSocketUpgradeRejection::InvalidHostHeader)?;
+        if hosts.next().is_some() || !is_valid_host(host) {
+            return Err(WebSocketUpgradeRejection::InvalidHostHeader);
+        }
+
+        if parts.headers.contains_key(header::TRANSFER_ENCODING) {
+            return Err(WebSocketUpgradeRejection::TransferEncodingNotAllowed);
+        }
+        for content_length in parts.headers.get_all(header::CONTENT_LENGTH) {
+            let content_length = content_length
+                .to_str()
+                .map_err(|_| WebSocketUpgradeRejection::InvalidContentLength)?;
+            if !is_zero_content_length(content_length) {
+                return Err(WebSocketUpgradeRejection::InvalidContentLength);
+            }
+        }
 
         // Check Upgrade header
         let upgrade = parts
@@ -198,7 +241,7 @@ where
             .and_then(|v| v.to_str().ok())
             .ok_or(WebSocketUpgradeRejection::MissingUpgradeHeader)?;
 
-        if !upgrade.to_ascii_lowercase().contains("websocket") {
+        if !contains_header_token(upgrade, "websocket") {
             return Err(WebSocketUpgradeRejection::InvalidUpgradeHeader);
         }
 
@@ -209,7 +252,7 @@ where
             .and_then(|v| v.to_str().ok())
             .ok_or(WebSocketUpgradeRejection::MissingConnectionHeader)?;
 
-        if !connection.to_ascii_lowercase().contains("upgrade") {
+        if !contains_header_token(connection, "upgrade") {
             return Err(WebSocketUpgradeRejection::InvalidConnectionHeader);
         }
 
@@ -218,8 +261,11 @@ where
             .headers
             .get("sec-websocket-key")
             .and_then(|v| v.to_str().ok())
-            .ok_or(WebSocketUpgradeRejection::MissingSecWebSocketKey)?
-            .to_string();
+            .ok_or(WebSocketUpgradeRejection::MissingSecWebSocketKey)?;
+        if !is_valid_websocket_key(key) {
+            return Err(WebSocketUpgradeRejection::InvalidSecWebSocketKey);
+        }
+        let key = key.to_string();
 
         // Check Sec-WebSocket-Version
         let version = parts
@@ -233,18 +279,32 @@ where
         }
 
         // Optional: Sec-WebSocket-Protocol
-        let protocol = parts
-            .headers
-            .get("sec-websocket-protocol")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.split(',').next().unwrap_or("").trim().to_string());
+        let offered_protocols = combined_header_values(
+            &parts.headers,
+            "sec-websocket-protocol",
+            WebSocketUpgradeRejection::InvalidSecWebSocketProtocol,
+        )?;
+        if offered_protocols
+            .as_deref()
+            .is_some_and(|protocols| !is_valid_protocol_list(protocols))
+        {
+            return Err(WebSocketUpgradeRejection::InvalidSecWebSocketProtocol);
+        }
+
+        let protocol = None;
 
         // Optional: Sec-WebSocket-Extensions
-        let extensions = parts
-            .headers
-            .get("sec-websocket-extensions")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+        let extensions = combined_header_values(
+            &parts.headers,
+            "sec-websocket-extensions",
+            WebSocketUpgradeRejection::InvalidSecWebSocketExtensions,
+        )?;
+        if extensions
+            .as_deref()
+            .is_some_and(|extensions| !is_valid_extension_list(extensions))
+        {
+            return Err(WebSocketUpgradeRejection::InvalidSecWebSocketExtensions);
+        }
 
         // Extract OnUpgrade from extensions (placed there by Axum/Hyper)
         let on_upgrade = parts
@@ -254,6 +314,7 @@ where
 
         Ok(WebSocketUpgrade {
             key,
+            offered_protocols,
             protocol,
             extensions,
             config: Config::default(),
@@ -262,15 +323,42 @@ where
     }
 }
 
+fn combined_header_values(
+    headers: &axum::http::HeaderMap,
+    name: &'static str,
+    invalid: WebSocketUpgradeRejection,
+) -> std::result::Result<Option<String>, WebSocketUpgradeRejection> {
+    let mut combined = None::<String>;
+    for value in headers.get_all(name) {
+        let value = value.to_str().map_err(|_| invalid)?;
+        match &mut combined {
+            Some(combined) => {
+                combined.push_str(", ");
+                combined.push_str(value);
+            }
+            None => combined = Some(value.to_string()),
+        }
+    }
+    Ok(combined)
+}
+
 /// Rejection type for WebSocket upgrade
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum WebSocketUpgradeRejection {
     MethodNotGet,
+    HttpVersionNot11,
+    MissingHostHeader,
+    InvalidHostHeader,
     MissingUpgradeHeader,
     InvalidUpgradeHeader,
     MissingConnectionHeader,
     InvalidConnectionHeader,
     MissingSecWebSocketKey,
+    InvalidSecWebSocketKey,
+    InvalidSecWebSocketProtocol,
+    InvalidSecWebSocketExtensions,
+    InvalidContentLength,
+    TransferEncodingNotAllowed,
     MissingSecWebSocketVersion,
     UnsupportedVersion,
     MissingUpgrade,
@@ -280,11 +368,25 @@ impl IntoResponse for WebSocketUpgradeRejection {
     fn into_response(self) -> Response<Body> {
         let (status, message) = match self {
             Self::MethodNotGet => (StatusCode::METHOD_NOT_ALLOWED, "Method must be GET"),
+            Self::HttpVersionNot11 => (StatusCode::BAD_REQUEST, "HTTP version must be 1.1"),
+            Self::MissingHostHeader => (StatusCode::BAD_REQUEST, "Missing Host header"),
+            Self::InvalidHostHeader => (StatusCode::BAD_REQUEST, "Invalid Host header"),
             Self::MissingUpgradeHeader => (StatusCode::BAD_REQUEST, "Missing Upgrade header"),
             Self::InvalidUpgradeHeader => (StatusCode::BAD_REQUEST, "Invalid Upgrade header"),
             Self::MissingConnectionHeader => (StatusCode::BAD_REQUEST, "Missing Connection header"),
             Self::InvalidConnectionHeader => (StatusCode::BAD_REQUEST, "Invalid Connection header"),
             Self::MissingSecWebSocketKey => (StatusCode::BAD_REQUEST, "Missing Sec-WebSocket-Key"),
+            Self::InvalidSecWebSocketKey => (StatusCode::BAD_REQUEST, "Invalid Sec-WebSocket-Key"),
+            Self::InvalidSecWebSocketProtocol => {
+                (StatusCode::BAD_REQUEST, "Invalid Sec-WebSocket-Protocol")
+            }
+            Self::InvalidSecWebSocketExtensions => {
+                (StatusCode::BAD_REQUEST, "Invalid Sec-WebSocket-Extensions")
+            }
+            Self::InvalidContentLength => (StatusCode::BAD_REQUEST, "Invalid Content-Length"),
+            Self::TransferEncodingNotAllowed => {
+                (StatusCode::BAD_REQUEST, "Transfer-Encoding is not allowed")
+            }
             Self::MissingSecWebSocketVersion => {
                 (StatusCode::BAD_REQUEST, "Missing Sec-WebSocket-Version")
             }
@@ -686,12 +788,198 @@ impl Sink<Message> for WebSocket {
 mod tests {
     use super::*;
 
+    async fn extractor_rejection(request: axum::http::Request<()>) -> WebSocketUpgradeRejection {
+        let (mut parts, _) = request.into_parts();
+        match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+            Ok(_) => panic!("request should have been rejected"),
+            Err(rejection) => rejection,
+        }
+    }
+
+    fn upgrade_request() -> axum::http::request::Builder {
+        axum::http::Request::builder()
+            .method(Method::GET)
+            .version(Version::HTTP_11)
+            .header(header::HOST, "example.com")
+            .header(header::UPGRADE, "websocket")
+            .header(header::CONNECTION, "Upgrade")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-version", "13")
+    }
+
     #[test]
     fn test_accept_key() {
         // RFC 6455 test vector
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
         let accept = generate_accept_key(key);
         assert_eq!(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    }
+
+    #[tokio::test]
+    async fn extractor_requires_http_11_host_exact_tokens_and_valid_key() {
+        let request = upgrade_request()
+            .version(Version::HTTP_10)
+            .body(())
+            .unwrap();
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::HttpVersionNot11
+        ));
+
+        let request = axum::http::Request::builder()
+            .method(Method::GET)
+            .version(Version::HTTP_11)
+            .header(header::UPGRADE, "websocket")
+            .header(header::CONNECTION, "Upgrade")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-version", "13")
+            .body(())
+            .unwrap();
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::MissingHostHeader
+        ));
+
+        let mut request = upgrade_request().body(()).unwrap();
+        request
+            .headers_mut()
+            .insert(header::HOST, "bad host".parse().unwrap());
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::InvalidHostHeader
+        ));
+
+        let mut request = upgrade_request().body(()).unwrap();
+        request
+            .headers_mut()
+            .insert(header::UPGRADE, "notwebsocket".parse().unwrap());
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::InvalidUpgradeHeader
+        ));
+
+        let mut request = upgrade_request().body(()).unwrap();
+        request
+            .headers_mut()
+            .insert(header::CONNECTION, "x-upgrade".parse().unwrap());
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::InvalidConnectionHeader
+        ));
+
+        let mut request = upgrade_request().body(()).unwrap();
+        request
+            .headers_mut()
+            .insert("sec-websocket-key", "YWJjZA==".parse().unwrap());
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::InvalidSecWebSocketKey
+        ));
+
+        let mut request = upgrade_request().body(()).unwrap();
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            "chat, invalid protocol".parse().unwrap(),
+        );
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::InvalidSecWebSocketProtocol
+        ));
+    }
+
+    #[tokio::test]
+    async fn extractor_validates_upgrade_body_framing_and_duplicate_host() {
+        let mut request = upgrade_request().body(()).unwrap();
+        request
+            .headers_mut()
+            .append(header::CONTENT_LENGTH, "0".parse().unwrap());
+        request
+            .headers_mut()
+            .append(header::CONTENT_LENGTH, "0, 0".parse().unwrap());
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::MissingUpgrade
+        ));
+
+        let request = upgrade_request()
+            .header(header::CONTENT_LENGTH, "1")
+            .body(())
+            .unwrap();
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::InvalidContentLength
+        ));
+
+        let request = upgrade_request()
+            .header(header::TRANSFER_ENCODING, "chunked")
+            .body(())
+            .unwrap();
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::TransferEncodingNotAllowed
+        ));
+
+        let request = upgrade_request()
+            .header(header::HOST, "other.example.com")
+            .body(())
+            .unwrap();
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::InvalidHostHeader
+        ));
+    }
+
+    #[test]
+    fn extractor_combines_repeatable_websocket_headers() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append("sec-websocket-protocol", "chat".parse().unwrap());
+        headers.append("sec-websocket-protocol", "superchat".parse().unwrap());
+
+        let combined = combined_header_values(
+            &headers,
+            "sec-websocket-protocol",
+            WebSocketUpgradeRejection::InvalidSecWebSocketProtocol,
+        )
+        .unwrap();
+        assert_eq!(combined.as_deref(), Some("chat, superchat"));
+    }
+
+    async fn subprotocol_handler(upgrade: WebSocketUpgrade) -> impl IntoResponse {
+        upgrade
+            .protocols(["superchat", "chat"])
+            .unwrap()
+            .on_upgrade(|_| async {})
+    }
+
+    #[tokio::test]
+    async fn axum_negotiates_subprotocol_in_server_preference_order() {
+        use axum::{Router, routing::get};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let app = Router::new().route("/protocol", get(subprotocol_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut request = format!("ws://{address}/protocol")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("sec-websocket-protocol", "chat, superchat".parse().unwrap());
+        let (_websocket, response) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.headers().get("sec-websocket-protocol").unwrap(),
+            "superchat"
+        );
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]

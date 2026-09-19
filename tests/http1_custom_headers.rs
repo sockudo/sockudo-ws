@@ -69,6 +69,9 @@ fn http1_request_rejects_reserved_handshake_headers() {
         "Sec-WebSocket-Version",
         "Sec-WebSocket-Protocol",
         "Sec-WebSocket-Extensions",
+        "Content-Length",
+        "Transfer-Encoding",
+        "Expect",
     ] {
         let headers = vec![(name.to_string(), "value".to_string())];
         let error = build_request_with_headers(
@@ -263,6 +266,26 @@ async fn http1_client_rejects_invalid_headers_before_writing() {
     ));
     let mut received = [0u8; 1];
     assert_eq!(server_io.read(&mut received).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn http1_url_client_validates_handshake_fields_before_connecting() {
+    let client = WebSocketClient::<Http1>::new(Config::default());
+    let headers = vec![("Expect".to_string(), "100-continue".to_string())];
+
+    for result in [
+        client
+            .connect_to_url("ws://127.0.0.1:9/ws\r\ninjected", None)
+            .await,
+        client
+            .connect_to_url("ws://127.0.0.1:9/ws", Some("invalid protocol"))
+            .await,
+        client
+            .connect_to_url_with_headers("ws://127.0.0.1:9/ws", None, Some(&headers))
+            .await,
+    ] {
+        assert!(matches!(result, Err(Error::InvalidHttp(_))));
+    }
 }
 
 #[tokio::test]
