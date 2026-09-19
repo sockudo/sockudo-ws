@@ -348,6 +348,12 @@ impl FrameParser {
         })
     }
 
+    /// Update the reader limit without losing a partially received frame.
+    #[cfg(feature = "permessage-deflate")]
+    pub(crate) fn set_max_frame_size(&mut self, max_frame_size: usize) {
+        self.max_frame_size = max_frame_size;
+    }
+
     /// Enable or disable RSV1 (compression) support
     pub fn set_compression(&mut self, enabled: bool) {
         self.allow_rsv1 = enabled;
@@ -779,6 +785,11 @@ impl FrameParser {
 
                 ParseState::Payload => {
                     let header = self.header.as_ref().unwrap();
+                    // Splitting a compressed protocol can lower the frame limit
+                    // after this header has already been accepted.
+                    if header.payload_len > self.max_frame_size as u64 {
+                        return Err(Error::FrameTooLarge);
+                    }
                     let payload_len = header.payload_len as usize;
 
                     if DEBUG {
