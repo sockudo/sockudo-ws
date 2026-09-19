@@ -230,7 +230,8 @@ impl AsyncRead for Stream<Http2> {
         // First, try to satisfy from the internal buffer
         if !inner.recv_buf.is_empty() {
             let to_copy = std::cmp::min(buf.remaining(), inner.recv_buf.len());
-            buf.put_slice(&inner.recv_buf.split_to(to_copy));
+            buf.put_slice(&inner.recv_buf[..to_copy]);
+            inner.recv_buf.advance(to_copy);
             return Poll::Ready(Ok(()));
         }
 
@@ -248,7 +249,8 @@ impl AsyncRead for Stream<Http2> {
 
                 // Copy what we can to the output buffer
                 let to_copy = std::cmp::min(buf.remaining(), data.len());
-                buf.put_slice(&data.split_to(to_copy));
+                buf.put_slice(&data[..to_copy]);
+                data.advance(to_copy);
 
                 // Buffer any remainder
                 if data.has_remaining() {
