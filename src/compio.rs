@@ -1314,6 +1314,18 @@ where
                 return Some(Err(error));
             }
 
+            // Buffered bytes have not been accepted yet, so an expired deadline
+            // must win before parsing can turn them into application messages.
+            if let Some(deadline) = self.heartbeat.next_deadline() {
+                let now = self.clock_epoch.elapsed().as_millis() as u64;
+                if deadline.at() <= now {
+                    if let Some(error) = self.handle_expired_deadline(now).await {
+                        return Some(Err(error));
+                    }
+                    continue;
+                }
+            }
+
             match self.process_read_buf() {
                 Ok(true) => continue,
                 Ok(false) => {}
@@ -1333,58 +1345,10 @@ where
                     Ok(result) => Some(result),
                     Err(_) => {
                         let now = self.clock_epoch.elapsed().as_millis() as u64;
-                        match self.heartbeat.next_deadline() {
-                            Some(Deadline::Ping(at)) if at <= now => {
-                                if let Some(payload) = self.heartbeat.ping_due(now) {
-                                    if let Err(error) = self.protocol.encode_message(
-                                        &Message::Ping(payload),
-                                        &mut self.write_buf,
-                                    ) {
-                                        return Some(Err(error));
-                                    }
-                                    if let Err(error) = self.flush().await {
-                                        return Some(Err(error));
-                                    }
-                                    self.heartbeat.ping_flushed(
-                                        self.clock_epoch.elapsed().as_millis() as u64,
-                                    );
-                                }
-                                None
-                            }
-                            Some(Deadline::Pong(at)) if at <= now => {
-                                self.heartbeat.stop();
-                                self.state = CompioStreamState::CloseSent;
-                                let close = Message::Close(Some(CloseReason::new(
-                                    self.config.pong_timeout_close_code,
-                                    bounded_close_reason(&self.config.pong_timeout_close_reason),
-                                )));
-                                let _ = self.protocol.encode_message(&close, &mut self.write_buf);
-                                let _ = ::compio::time::timeout(
-                                    Duration::from_secs(self.config.close_timeout.into()),
-                                    self.flush(),
-                                )
-                                .await;
-                                self.state = CompioStreamState::Closed;
-                                return Some(Err(Error::HeartbeatTimeout));
-                            }
-                            Some(Deadline::Idle(at)) if at <= now => {
-                                self.heartbeat.stop();
-                                self.state = CompioStreamState::CloseSent;
-                                let close = Message::Close(Some(CloseReason::new(
-                                    CloseReason::GOING_AWAY,
-                                    "Connection idle timeout",
-                                )));
-                                let _ = self.protocol.encode_message(&close, &mut self.write_buf);
-                                let _ = ::compio::time::timeout(
-                                    Duration::from_secs(self.config.close_timeout.into()),
-                                    self.flush(),
-                                )
-                                .await;
-                                self.state = CompioStreamState::Closed;
-                                return Some(Err(Error::IdleTimeout));
-                            }
-                            _ => None,
+                        if let Some(error) = self.handle_expired_deadline(now).await {
+                            return Some(Err(error));
                         }
+                        None
                     }
                 }
             } else {
@@ -1407,6 +1371,60 @@ where
                     return Some(Err(e.into()));
                 }
             }
+        }
+    }
+
+    async fn handle_expired_deadline(&mut self, now: u64) -> Option<Error> {
+        match self.heartbeat.next_deadline() {
+            Some(Deadline::Ping(at)) if at <= now => {
+                if let Some(payload) = self.heartbeat.ping_due(now) {
+                    if let Err(error) = self
+                        .protocol
+                        .encode_message(&Message::Ping(payload), &mut self.write_buf)
+                    {
+                        return Some(error);
+                    }
+                    if let Err(error) = self.flush().await {
+                        return Some(error);
+                    }
+                    self.heartbeat
+                        .ping_flushed(self.clock_epoch.elapsed().as_millis() as u64);
+                }
+                None
+            }
+            Some(Deadline::Pong(at)) if at <= now => {
+                self.heartbeat.stop();
+                self.state = CompioStreamState::CloseSent;
+                let close = Message::Close(Some(CloseReason::new(
+                    self.config.pong_timeout_close_code,
+                    bounded_close_reason(&self.config.pong_timeout_close_reason),
+                )));
+                let _ = self.protocol.encode_message(&close, &mut self.write_buf);
+                let _ = ::compio::time::timeout(
+                    Duration::from_secs(self.config.close_timeout.into()),
+                    self.flush(),
+                )
+                .await;
+                self.state = CompioStreamState::Closed;
+                Some(Error::HeartbeatTimeout)
+            }
+            Some(Deadline::Idle(at)) if at <= now => {
+                self.heartbeat.stop();
+                self.state = CompioStreamState::CloseSent;
+                let close = Message::Close(Some(CloseReason::new(
+                    CloseReason::GOING_AWAY,
+                    "Connection idle timeout",
+                )));
+                let _ = self.protocol.encode_message(&close, &mut self.write_buf);
+                let _ = ::compio::time::timeout(
+                    Duration::from_secs(self.config.close_timeout.into()),
+                    self.flush(),
+                )
+                .await;
+                self.state = CompioStreamState::Closed;
+                Some(Error::IdleTimeout)
+            }
+            _ => None,
         }
     }
 
@@ -2311,6 +2329,18 @@ where
                 return Some(Err(error));
             }
 
+            // Buffered bytes have not been accepted yet, so an expired deadline
+            // must win before parsing can turn them into application messages.
+            if let Some(deadline) = self.heartbeat.next_deadline() {
+                let now = self.clock_epoch.elapsed().as_millis() as u64;
+                if deadline.at() <= now {
+                    if let Some(error) = self.handle_expired_deadline(now).await {
+                        return Some(Err(error));
+                    }
+                    continue;
+                }
+            }
+
             match self.process_read_buf() {
                 Ok(true) => continue,
                 Ok(false) => {}
@@ -2330,58 +2360,10 @@ where
                     Ok(result) => Some(result),
                     Err(_) => {
                         let now = self.clock_epoch.elapsed().as_millis() as u64;
-                        match self.heartbeat.next_deadline() {
-                            Some(Deadline::Ping(at)) if at <= now => {
-                                if let Some(payload) = self.heartbeat.ping_due(now) {
-                                    if let Err(error) = self.protocol.encode_message(
-                                        &Message::Ping(payload),
-                                        &mut self.write_buf,
-                                    ) {
-                                        return Some(Err(error));
-                                    }
-                                    if let Err(error) = self.flush().await {
-                                        return Some(Err(error));
-                                    }
-                                    self.heartbeat.ping_flushed(
-                                        self.clock_epoch.elapsed().as_millis() as u64,
-                                    );
-                                }
-                                None
-                            }
-                            Some(Deadline::Pong(at)) if at <= now => {
-                                self.heartbeat.stop();
-                                self.state = CompioStreamState::CloseSent;
-                                let close = Message::Close(Some(CloseReason::new(
-                                    self.config.pong_timeout_close_code,
-                                    bounded_close_reason(&self.config.pong_timeout_close_reason),
-                                )));
-                                let _ = self.protocol.encode_message(&close, &mut self.write_buf);
-                                let _ = ::compio::time::timeout(
-                                    Duration::from_secs(self.config.close_timeout.into()),
-                                    self.flush(),
-                                )
-                                .await;
-                                self.state = CompioStreamState::Closed;
-                                return Some(Err(Error::HeartbeatTimeout));
-                            }
-                            Some(Deadline::Idle(at)) if at <= now => {
-                                self.heartbeat.stop();
-                                self.state = CompioStreamState::CloseSent;
-                                let close = Message::Close(Some(CloseReason::new(
-                                    CloseReason::GOING_AWAY,
-                                    "Connection idle timeout",
-                                )));
-                                let _ = self.protocol.encode_message(&close, &mut self.write_buf);
-                                let _ = ::compio::time::timeout(
-                                    Duration::from_secs(self.config.close_timeout.into()),
-                                    self.flush(),
-                                )
-                                .await;
-                                self.state = CompioStreamState::Closed;
-                                return Some(Err(Error::IdleTimeout));
-                            }
-                            _ => None,
+                        if let Some(error) = self.handle_expired_deadline(now).await {
+                            return Some(Err(error));
                         }
+                        None
                     }
                 }
             } else {
@@ -2403,6 +2385,60 @@ where
                     return Some(Err(e.into()));
                 }
             }
+        }
+    }
+
+    async fn handle_expired_deadline(&mut self, now: u64) -> Option<Error> {
+        match self.heartbeat.next_deadline() {
+            Some(Deadline::Ping(at)) if at <= now => {
+                if let Some(payload) = self.heartbeat.ping_due(now) {
+                    if let Err(error) = self
+                        .protocol
+                        .encode_message(&Message::Ping(payload), &mut self.write_buf)
+                    {
+                        return Some(error);
+                    }
+                    if let Err(error) = self.flush().await {
+                        return Some(error);
+                    }
+                    self.heartbeat
+                        .ping_flushed(self.clock_epoch.elapsed().as_millis() as u64);
+                }
+                None
+            }
+            Some(Deadline::Pong(at)) if at <= now => {
+                self.heartbeat.stop();
+                self.state = CompioStreamState::CloseSent;
+                let close = Message::Close(Some(CloseReason::new(
+                    self.config.pong_timeout_close_code,
+                    bounded_close_reason(&self.config.pong_timeout_close_reason),
+                )));
+                let _ = self.protocol.encode_message(&close, &mut self.write_buf);
+                let _ = ::compio::time::timeout(
+                    Duration::from_secs(self.config.close_timeout.into()),
+                    self.flush(),
+                )
+                .await;
+                self.state = CompioStreamState::Closed;
+                Some(Error::HeartbeatTimeout)
+            }
+            Some(Deadline::Idle(at)) if at <= now => {
+                self.heartbeat.stop();
+                self.state = CompioStreamState::CloseSent;
+                let close = Message::Close(Some(CloseReason::new(
+                    CloseReason::GOING_AWAY,
+                    "Connection idle timeout",
+                )));
+                let _ = self.protocol.encode_message(&close, &mut self.write_buf);
+                let _ = ::compio::time::timeout(
+                    Duration::from_secs(self.config.close_timeout.into()),
+                    self.flush(),
+                )
+                .await;
+                self.state = CompioStreamState::Closed;
+                Some(Error::IdleTimeout)
+            }
+            _ => None,
         }
     }
 

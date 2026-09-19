@@ -2,7 +2,7 @@
 
 use compio::io::{AsyncReadExt, AsyncWriteExt};
 use compio::net::{TcpListener, TcpStream};
-use sockudo_ws::{CompioWebSocketStream, Config};
+use sockudo_ws::{CompioWebSocketStream, Config, Error};
 
 async fn connection() -> (TcpStream, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -176,6 +176,36 @@ async fn compressed_unified_parse_error_stops_writes_before_messages_are_drained
     assert!(matches!(result, Err(sockudo_ws::Error::ConnectionClosed)));
     assert_eq!(stream.next().await.unwrap().unwrap().as_bytes(), b"b");
     assert!(stream.next().await.unwrap().is_err());
+}
+
+#[compio::test]
+async fn unified_idle_timeout_precedes_unparsed_leftover() {
+    let (io, _peer) = connection().await;
+    let config = Config::builder().auto_ping(false).idle_timeout(1).build();
+    let mut stream = CompioWebSocketStream::client_with_leftover(
+        io,
+        config,
+        Some(bytes::Bytes::from_static(b"\x82\x01a")),
+    );
+    compio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+    assert!(matches!(stream.next().await, Some(Err(Error::IdleTimeout))));
+}
+
+#[cfg(feature = "permessage-deflate")]
+#[compio::test]
+async fn compressed_unified_idle_timeout_precedes_unparsed_leftover() {
+    let (io, _peer) = connection().await;
+    let config = Config::builder().auto_ping(false).idle_timeout(1).build();
+    let mut stream = sockudo_ws::compio::CompioCompressedWebSocketStream::client_with_leftover(
+        io,
+        config,
+        sockudo_ws::DeflateConfig::default(),
+        Some(bytes::Bytes::from_static(b"\x82\x01a")),
+    );
+    compio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+    assert!(matches!(stream.next().await, Some(Err(Error::IdleTimeout))));
 }
 
 #[compio::test]
