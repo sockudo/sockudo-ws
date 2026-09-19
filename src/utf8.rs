@@ -636,7 +636,8 @@ fn complete_prefix_len(chunk: &[u8]) -> usize {
 /// This function is used for streaming UTF-8 validation where data may be
 /// split across fragment boundaries in the middle of a multi-byte character.
 pub fn validate_utf8_incomplete(data: &[u8]) -> (bool, usize) {
-    if data.is_empty() {
+    // Complete fragments can use the whole-message accelerated validator.
+    if validate_utf8(data) {
         return (true, 0);
     }
 
