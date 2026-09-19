@@ -590,7 +590,7 @@ where
 }
 
 #[cfg(any(feature = "http2", feature = "http3"))]
-fn copy_into_compio_buf<B>(dst: &mut B, src: &mut BytesMut) -> usize
+fn copy_into_compio_buf<B>(dst: &mut B, src: &mut Bytes) -> usize
 where
     B: IoBufMut,
 {
@@ -625,7 +625,7 @@ type CompioH3SendRequest = h3::client::SendRequest<::compio::quic::h3::OpenStrea
 pub struct CompioHttp2Stream {
     send: h2::SendStream<Bytes>,
     recv: h2::RecvStream,
-    recv_buf: BytesMut,
+    recv_buf: Bytes,
     recv_eof: bool,
     capacity_needed: usize,
 }
@@ -637,7 +637,7 @@ impl CompioHttp2Stream {
         Self {
             send,
             recv,
-            recv_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
+            recv_buf: Bytes::new(),
             recv_eof: false,
             capacity_needed: 0,
         }
@@ -672,17 +672,11 @@ impl AsyncRead for CompioHttp2Stream {
         };
 
         match result {
-            Some(Ok(mut data)) => {
+            Some(Ok(data)) => {
                 let len = data.len();
                 let _ = self.recv.flow_control().release_capacity(len);
 
-                self.recv_buf.reserve(data.len());
-                while data.has_remaining() {
-                    let chunk = data.chunk();
-                    self.recv_buf.extend_from_slice(chunk);
-                    let len = chunk.len();
-                    data.advance(len);
-                }
+                self.recv_buf = data;
 
                 let len = copy_into_compio_buf(&mut buf, &mut self.recv_buf);
                 BufResult(Ok(len), buf)
@@ -973,7 +967,7 @@ where
 #[cfg(feature = "http3")]
 pub struct CompioHttp3ClientStream {
     stream: CompioH3ClientRequestStream,
-    recv_buf: BytesMut,
+    recv_buf: Bytes,
     _endpoint: Option<::compio::quic::Endpoint>,
     _send_request: Option<CompioH3SendRequest>,
 }
@@ -988,7 +982,7 @@ impl CompioHttp3ClientStream {
     ) -> Self {
         Self {
             stream,
-            recv_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
+            recv_buf: Bytes::new(),
             _endpoint: endpoint,
             _send_request: send_request,
         }
@@ -1004,12 +998,7 @@ impl AsyncRead for CompioHttp3ClientStream {
             };
             match result {
                 Ok(Some(mut data)) => {
-                    while data.has_remaining() {
-                        let chunk = data.chunk();
-                        self.recv_buf.extend_from_slice(chunk);
-                        let len = chunk.len();
-                        data.advance(len);
-                    }
+                    self.recv_buf = data.copy_to_bytes(data.remaining());
                 }
                 Ok(None) => return BufResult(Ok(0), buf),
                 Err(e) => return BufResult(Err(io::Error::other(e)), buf),
@@ -1050,7 +1039,7 @@ impl AsyncWrite for CompioHttp3ClientStream {
 #[cfg(feature = "http3")]
 pub struct CompioHttp3ServerStream {
     stream: CompioH3ServerRequestStream,
-    recv_buf: BytesMut,
+    recv_buf: Bytes,
 }
 
 #[cfg(feature = "http3")]
@@ -1059,7 +1048,7 @@ impl CompioHttp3ServerStream {
     pub fn new(stream: CompioH3ServerRequestStream) -> Self {
         Self {
             stream,
-            recv_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
+            recv_buf: Bytes::new(),
         }
     }
 }
@@ -1073,12 +1062,7 @@ impl AsyncRead for CompioHttp3ServerStream {
             };
             match result {
                 Ok(Some(mut data)) => {
-                    while data.has_remaining() {
-                        let chunk = data.chunk();
-                        self.recv_buf.extend_from_slice(chunk);
-                        let len = chunk.len();
-                        data.advance(len);
-                    }
+                    self.recv_buf = data.copy_to_bytes(data.remaining());
                 }
                 Ok(None) => return BufResult(Ok(0), buf),
                 Err(e) => return BufResult(Err(io::Error::other(e)), buf),

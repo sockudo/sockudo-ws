@@ -27,8 +27,10 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+#[cfg(feature = "http3")]
+use bytes::BytesMut;
 #[cfg(any(feature = "http2", feature = "http3"))]
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::transport::{Http1, Transport};
@@ -168,7 +170,7 @@ impl fmt::Debug for Stream<Http1> {
 struct Http2StreamInner {
     send: h2::SendStream<Bytes>,
     recv: h2::RecvStream,
-    recv_buf: BytesMut,
+    recv_buf: Bytes,
     recv_eof: bool,
     capacity_needed: usize,
 }
@@ -192,7 +194,7 @@ impl Stream<Http2> {
             inner: StreamInner::Http2(Http2StreamInner {
                 send,
                 recv,
-                recv_buf: BytesMut::with_capacity(64 * 1024),
+                recv_buf: Bytes::new(),
                 recv_eof: false,
                 capacity_needed: 0,
             }),
@@ -255,9 +257,7 @@ impl AsyncRead for Stream<Http2> {
                 data.advance(to_copy);
 
                 // Buffer any remainder
-                if data.has_remaining() {
-                    inner.recv_buf.extend_from_slice(data.chunk());
-                }
+                inner.recv_buf = data;
 
                 Poll::Ready(Ok(()))
             }
