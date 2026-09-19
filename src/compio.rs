@@ -1437,7 +1437,7 @@ where
 
     /// Send a close frame.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
-        if self.state != CompioStreamState::Open {
+        if self.state != CompioStreamState::Open || self.pending_parse_error.is_some() {
             return Ok(());
         }
 
@@ -1671,6 +1671,15 @@ where
             if self.terminal_reported {
                 return None;
             }
+            // Stop the connection without discarding its accepted message prefix.
+            // An accepted Close takes precedence over invalid bytes after it.
+            if self.pending_parse_error.is_some()
+                && self.shared.is_open()
+                && !self.pending_messages.iter().any(Message::is_close)
+            {
+                self.shared.terminate(CompioTerminalCause::ConnectionClosed);
+                let _ = self.cancel_tx.unbounded_send(());
+            }
             if self.pending_parse_error.is_none() && self.shared.status.get() == SPLIT_CLOSED {
                 if self.terminal_reported {
                     return None;
@@ -1686,6 +1695,14 @@ where
             }
 
             if let Some(msg) = self.pending_messages.pop() {
+                if self.pending_parse_error.is_some() && !self.shared.is_open() {
+                    if msg.is_close() {
+                        self.pending_messages.clear();
+                        self.pending_parse_error = None;
+                        self.terminal_reported = true;
+                    }
+                    return Some(Ok(msg));
+                }
                 let request = match &msg {
                     Message::Ping(data) => ControlRequest::PeerPing(data.clone(), Instant::now()),
                     Message::Pong(data) => ControlRequest::Pong(data.clone(), Instant::now()),
@@ -2407,7 +2424,7 @@ where
 
     /// Send a close frame.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
-        if self.state != CompioStreamState::Open {
+        if self.state != CompioStreamState::Open || self.pending_parse_error.is_some() {
             return Ok(());
         }
 
@@ -2594,6 +2611,15 @@ where
             if self.terminal_reported {
                 return None;
             }
+            // Stop the connection without discarding its accepted message prefix.
+            // An accepted Close takes precedence over invalid bytes after it.
+            if self.pending_parse_error.is_some()
+                && self.shared.is_open()
+                && !self.pending_messages.iter().any(Message::is_close)
+            {
+                self.shared.terminate(CompioTerminalCause::ConnectionClosed);
+                let _ = self.cancel_tx.unbounded_send(());
+            }
             if self.pending_parse_error.is_none() && self.shared.status.get() == SPLIT_CLOSED {
                 if self.terminal_reported {
                     return None;
@@ -2609,6 +2635,14 @@ where
             }
 
             if let Some(msg) = self.pending_messages.pop() {
+                if self.pending_parse_error.is_some() && !self.shared.is_open() {
+                    if msg.is_close() {
+                        self.pending_messages.clear();
+                        self.pending_parse_error = None;
+                        self.terminal_reported = true;
+                    }
+                    return Some(Ok(msg));
+                }
                 let request = match &msg {
                     Message::Ping(data) => ControlRequest::PeerPing(data.clone(), Instant::now()),
                     Message::Pong(data) => ControlRequest::Pong(data.clone(), Instant::now()),

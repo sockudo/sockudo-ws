@@ -88,3 +88,23 @@ receive_cases!(compressed_split, |io| {
     )
     .split()
 });
+
+#[compio::test]
+async fn split_parse_error_stops_writes_before_messages_are_drained() {
+    let (io, mut peer) = connection().await;
+    let (mut reader, mut writer) = CompioWebSocketStream::client(io, config()).split();
+    peer.write_all(b"\x82\x01a\x82\x01b\x83\x00".to_vec())
+        .await
+        .0
+        .unwrap();
+
+    assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), b"a");
+
+    assert!(writer.is_closed());
+    assert!(matches!(
+        writer.send(sockudo_ws::Message::text("late")).await,
+        Err(sockudo_ws::Error::ConnectionClosed)
+    ));
+    assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), b"b");
+    assert!(reader.next().await.unwrap().is_err());
+}
