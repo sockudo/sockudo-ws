@@ -390,7 +390,8 @@ impl FrameParser {
                         return self.parse_slow(buf);
                     }
                     if len > self.max_frame_size {
-                        return Err(Error::FrameTooLarge);
+                        // Preserve header-error precedence before the size check.
+                        return self.parse_slow(buf);
                     }
                     (len, 4)
                 };
@@ -456,7 +457,8 @@ impl FrameParser {
                         return self.parse_slow(buf);
                     }
                     if len > self.max_frame_size {
-                        return Err(Error::FrameTooLarge);
+                        // Preserve header-error precedence before the size check.
+                        return self.parse_slow(buf);
                     }
                     (len, 4)
                 };
