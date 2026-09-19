@@ -26,6 +26,58 @@ pub fn generate_mask() -> [u8; 4] {
     generate_mask_inner()
 }
 
+/// Generate the 16 random bytes used by a WebSocket handshake key.
+///
+/// Uses the same backend priority as [`generate_mask`]: getrandom, rand_rng,
+/// then fastrand. Selecting a cryptographic backend must also apply to the
+/// public handshake nonce; the default fastrand backend is non-cryptographic.
+#[inline]
+pub(crate) fn generate_key_bytes() -> [u8; 16] {
+    generate_key_bytes_inner()
+}
+
+#[cfg(all(
+    feature = "fastrand",
+    not(feature = "getrandom"),
+    not(feature = "rand_rng")
+))]
+#[inline]
+fn generate_key_bytes_inner() -> [u8; 16] {
+    thread_local! {
+        // Public handshake nonces must not consume the frame-mask RNG stream.
+        static NONCE_RNG: std::cell::RefCell<fastrand::Rng> =
+            std::cell::RefCell::new(fastrand::Rng::new());
+    }
+    let mut bytes = [0u8; 16];
+    NONCE_RNG.with(|rng| rng.borrow_mut().fill(&mut bytes));
+    bytes
+}
+
+#[cfg(all(feature = "rand_rng", not(feature = "getrandom")))]
+#[inline]
+fn generate_key_bytes_inner() -> [u8; 16] {
+    use rand::Rng;
+    rand::rng().random()
+}
+
+#[cfg(feature = "getrandom")]
+#[inline]
+fn generate_key_bytes_inner() -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).expect("getrandom failed");
+    bytes
+}
+
+#[cfg(not(any(feature = "fastrand", feature = "getrandom", feature = "rand_rng")))]
+#[inline]
+fn generate_key_bytes_inner() -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    for chunk in bytes.chunks_exact_mut(4) {
+        chunk.copy_from_slice(&generate_mask_inner());
+    }
+    bytes
+}
+
 #[cfg(feature = "getrandom")]
 #[inline]
 fn generate_mask_inner() -> [u8; 4] {
