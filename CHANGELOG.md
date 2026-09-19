@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Encoded pending-output limits are now enforced and BufferFull is terminal rather than retryable. The default outbound limit is 1 MiB, independently of the inbound message limit.
+
 - Outbound frames are coalesced across `send()` calls while inbound messages
   that were already parsed are still queued for the application
   (`Config::write_coalescing`, default on). A read batch of N messages
