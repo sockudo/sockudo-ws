@@ -444,22 +444,22 @@ impl DeflateDecoder {
 
     /// Inflate `input`, whose first `payload_len` bytes are message payload.
     ///
-    /// Returns whether a final DEFLATE block ended exactly at the payload end;
-    /// the synthetic trailer must then not be fed to the fresh stream.
+    /// When a final DEFLATE block ends exactly at the payload end, the synthetic
+    /// trailer must not be fed to the fresh stream.
     fn inflate_input(
         &mut self,
         mut input: &[u8],
         payload_len: usize,
         output: &mut Vec<u8>,
         max_size: usize,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let input_len = input.len();
         while !input.is_empty() {
             let (status, consumed) = self.inflate_chunk(input, output, max_size)?;
             input = &input[consumed..];
             if status != Status::StreamEnd {
                 if input.is_empty() {
-                    return Ok(false);
+                    return Ok(());
                 }
                 return Err(Error::Compression("incomplete deflate payload".into()));
             }
@@ -467,10 +467,10 @@ impl DeflateDecoder {
             // stream still references the window decoded so far.
             self.decompress.reset(!self.no_context_takeover)?;
             if input_len - input.len() == payload_len {
-                return Ok(true);
+                return Ok(());
             }
         }
-        Ok(false)
+        Ok(())
     }
 
     /// Inflate one input chunk, growing `output` while the decoder fills it.
