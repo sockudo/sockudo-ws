@@ -319,8 +319,9 @@ impl DeflateDecoder {
         input.extend_from_slice(data);
         input.extend_from_slice(&DEFLATE_TRAILER);
 
-        // Start with reasonable output buffer (at least 1KB or 4x input)
-        let initial_cap = std::cmp::max(1024, data.len() * 4);
+        // Start with reasonable output buffer (at least 1KB or 4x input), but
+        // never expose writable output beyond the configured message limit.
+        let initial_cap = std::cmp::max(1024, data.len().saturating_mul(4)).min(max_size);
         let mut output = BytesMut::with_capacity(initial_cap);
         let mut total_in: usize = 0;
         let mut iterations = 0u32;
@@ -334,55 +335,79 @@ impl DeflateDecoder {
                 ));
             }
 
-            // Check size limit
-            if output.len() > max_size {
-                return Err(Error::MessageTooLarge);
-            }
-
-            // Ensure we have space in output buffer
-            let available = output.capacity() - output.len();
-            if available == 0 {
-                if output.capacity() >= max_size {
-                    return Err(Error::MessageTooLarge);
-                }
-                // At least double or add 4KB, whichever is larger
-                let additional = std::cmp::max(output.capacity(), 4096);
-                output.reserve(additional);
-            }
-
             let before_out = self.decompress.total_out();
             let before_in = self.decompress.total_in();
+            let at_limit = output.len() == max_size;
+            let offered;
+            let status;
 
-            // Get writable slice using spare_capacity_mut to avoid UB with uninitialized memory.
-            let out_start = output.len();
-            let spare = output.spare_capacity_mut();
+            if at_limit {
+                // Let inflate consume a trailer or report stream completion.
+                // Any byte produced into this probe exceeds the logical limit.
+                let mut probe = [std::mem::MaybeUninit::uninit()];
+                offered = probe.len();
+                status = self
+                    .decompress
+                    .decompress_uninit(&input[total_in..], &mut probe, FlushDecompress::Sync)
+                    .map_err(|e| Error::Compression(format!("inflate error: {}", e)))?;
+            } else {
+                if output.len() == output.capacity() {
+                    // At least double or add 4KB, whichever is larger. The
+                    // allocator may reserve more, so the writable slice below
+                    // is still capped explicitly.
+                    let remaining = max_size - output.len();
+                    let additional = std::cmp::max(output.capacity(), 4096).min(remaining);
+                    output.reserve(additional);
+                }
 
-            let status = self
-                .decompress
-                .decompress_uninit(&input[total_in..], spare, FlushDecompress::Sync)
-                .map_err(|e| Error::Compression(format!("inflate error: {}", e)))?;
+                let out_start = output.len();
+                let remaining = max_size - out_start;
+                let spare = output.spare_capacity_mut();
+                let writable = spare.len().min(remaining);
+                let spare = &mut spare[..writable];
+                offered = spare.len();
+                status = self
+                    .decompress
+                    .decompress_uninit(&input[total_in..], spare, FlushDecompress::Sync)
+                    .map_err(|e| Error::Compression(format!("inflate error: {}", e)))?;
+
+                let produced = (self.decompress.total_out() - before_out) as usize;
+                // SAFETY: decompress_uninit() wrote exactly `produced` bytes to the spare capacity.
+                // We're only extending the length by the number of bytes that were initialized.
+                unsafe {
+                    output.set_len(out_start + produced);
+                }
+            }
 
             let consumed = (self.decompress.total_in() - before_in) as usize;
             let produced = (self.decompress.total_out() - before_out) as usize;
-
             total_in += consumed;
 
-            // SAFETY: decompress_uninit() wrote exactly `produced` bytes to the spare capacity.
-            // We're only extending the length by the number of bytes that were initialized.
-            unsafe {
-                output.set_len(out_start + produced);
+            if at_limit && produced != 0 {
+                return Err(Error::MessageTooLarge);
             }
 
-            match status {
-                Status::Ok => {
-                    if total_in >= input.len() {
-                        break;
-                    }
+            if status == Status::StreamEnd {
+                if total_in < data.len() {
+                    return Err(Error::Compression(
+                        "data follows the final DEFLATE block".into(),
+                    ));
                 }
-                Status::StreamEnd => break,
-                Status::BufError => {
-                    // Need more output space - will be handled at top of loop
+                break;
+            }
+
+            if consumed == 0 && produced == 0 {
+                if total_in < input.len() {
+                    return Err(Error::Compression("incomplete deflate payload".into()));
                 }
+                break;
+            }
+
+            // A full output slice can hide pending output after all input was
+            // consumed. Continue once more with fresh capacity (or the limit
+            // probe) until inflate stops filling the offered slice.
+            if total_in >= input.len() && produced < offered {
+                break;
             }
         }
 
