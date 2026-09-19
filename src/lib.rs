@@ -461,17 +461,13 @@ pub struct Config {
     /// Maximum time spent flushing a timeout/handshake Close and shutting down
     /// the transport (default: 5 seconds, 0 = immediate best effort).
     pub close_timeout: u32,
-    /// Coalesce outbound frames while inbound messages are still queued
-    /// (default: true).
+    /// Enable batching across `SinkExt::feed` calls (default: true).
     ///
-    /// When the stream has already parsed more inbound messages than the
-    /// application has consumed, `poll_flush` keeps the encoded frames in the
-    /// write buffer instead of issuing a write per `send()`. Everything is
-    /// written in one vectored write before the stream next waits for the
-    /// transport, or as soon as the buffer reaches the high water mark. This
-    /// turns a read batch of N messages answered with N `send()` calls into
-    /// one syscall instead of N. Disable for strict "returned means written"
-    /// semantics on every `send()`.
+    /// Pending frames drain at the high water mark before another message is
+    /// accepted. Disabling batching drains any pending frame before accepting
+    /// another one. `SinkExt::send` and `SinkExt::flush` always flush regardless
+    /// of this setting. After feeding a batch, flush before waiting for replies
+    /// or pausing reads; the read path also flushes before waiting for input.
     pub write_coalescing: bool,
     /// Per-message deflate configuration (requires `permessage-deflate` feature)
     #[cfg(feature = "permessage-deflate")]
@@ -648,8 +644,7 @@ impl ConfigBuilder {
         self
     }
 
-    /// Enable or disable coalescing of outbound frames across `send()` calls
-    /// while inbound messages are still queued (see
+    /// Enable or disable batching across `SinkExt::feed` calls (see
     /// [`Config::write_coalescing`]).
     pub fn write_coalescing(mut self, enabled: bool) -> Self {
         self.config.write_coalescing = enabled;

@@ -45,7 +45,7 @@ pin_project! {
     /// # Example
     ///
     /// ```ignore
-    /// use futures_util::{SinkExt, StreamExt};
+    /// use futures_util::StreamExt;
     /// use sockudo_ws::WebSocketStream;
     ///
     /// async fn handle(mut ws: WebSocketStream<TcpStream>) {
@@ -84,6 +84,7 @@ pin_project! {
         flush_on_read: bool,
         close_after_flush: bool,
         ping_flush_pending: bool,
+        ready_flush_pending: bool,
         clock_epoch: tokio::time::Instant,
         heartbeat: Heartbeat,
         heartbeat_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
@@ -145,6 +146,7 @@ where
             flush_on_read: false,
             close_after_flush: false,
             ping_flush_pending: false,
+            ready_flush_pending: false,
             clock_epoch,
             heartbeat,
             heartbeat_sleep: None,
@@ -677,9 +679,21 @@ where
 {
     type Error = Error;
 
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         if self.state != StreamState::Open {
             return Poll::Ready(Err(Error::ConnectionClosed));
+        }
+        if self.write_buf.has_data()
+            && (!self.config.write_coalescing
+                || self.write_buf.pending_bytes() >= self.high_water_mark)
+        {
+            self.ready_flush_pending = true;
+        }
+        // Continue partial writes and the transport flush even if the remaining
+        // buffered bytes have fallen below the high water mark.
+        if self.ready_flush_pending {
+            std::task::ready!(self.as_mut().poll_write_out(cx))?;
+            self.ready_flush_pending = false;
         }
         Poll::Ready(Ok(()))
     }
@@ -731,22 +745,7 @@ where
         Ok(())
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        {
-            let this = self.as_mut().get_mut();
-            // Batch-scoped corking: while inbound messages that were already
-            // parsed are still queued for the application, keep the encoded
-            // frames buffered. poll_next writes them all in one vectored write
-            // before it next waits on the transport, so a read batch answered
-            // with N sends costs one syscall instead of N.
-            if this.config.write_coalescing
-                && this.state == StreamState::Open
-                && !this.pending_messages.is_empty()
-                && this.write_buf.pending_bytes() < this.high_water_mark
-            {
-                return Poll::Ready(Ok(()));
-            }
-        }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.poll_write_out(cx)
     }
 
@@ -1570,6 +1569,7 @@ pin_project! {
         flush_on_read: bool,
         close_after_flush: bool,
         ping_flush_pending: bool,
+        ready_flush_pending: bool,
         clock_epoch: tokio::time::Instant,
         heartbeat: Heartbeat,
         heartbeat_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
@@ -1607,6 +1607,7 @@ where
             flush_on_read: false,
             close_after_flush: false,
             ping_flush_pending: false,
+            ready_flush_pending: false,
             clock_epoch,
             heartbeat,
             heartbeat_sleep: None,
@@ -1639,6 +1640,7 @@ where
             flush_on_read: false,
             close_after_flush: false,
             ping_flush_pending: false,
+            ready_flush_pending: false,
             clock_epoch,
             heartbeat,
             heartbeat_sleep: None,
@@ -2046,9 +2048,21 @@ where
 {
     type Error = Error;
 
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         if self.state != StreamState::Open {
             return Poll::Ready(Err(Error::ConnectionClosed));
+        }
+        if self.write_buf.has_data()
+            && (!self.config.write_coalescing
+                || self.write_buf.pending_bytes() >= self.high_water_mark)
+        {
+            self.ready_flush_pending = true;
+        }
+        // Continue partial writes and the transport flush even if the remaining
+        // buffered bytes have fallen below the high water mark.
+        if self.ready_flush_pending {
+            std::task::ready!(self.as_mut().poll_write_out(cx))?;
+            self.ready_flush_pending = false;
         }
         Poll::Ready(Ok(()))
     }
@@ -2071,22 +2085,7 @@ where
         Ok(())
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        {
-            let this = self.as_mut().get_mut();
-            // Batch-scoped corking: while inbound messages that were already
-            // parsed are still queued for the application, keep the encoded
-            // frames buffered. poll_next writes them all in one vectored write
-            // before it next waits on the transport, so a read batch answered
-            // with N sends costs one syscall instead of N.
-            if this.config.write_coalescing
-                && this.state == StreamState::Open
-                && !this.pending_messages.is_empty()
-                && this.write_buf.pending_bytes() < this.high_water_mark
-            {
-                return Poll::Ready(Ok(()));
-            }
-        }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         self.poll_write_out(cx)
     }
 
@@ -2394,7 +2393,8 @@ impl<S> Drop for CompressedSplitWriter<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::SinkExt;
+    use futures_util::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn read_masked_control_payload(
@@ -2762,8 +2762,9 @@ mod tests {
             let task = tokio::spawn(async move {
                 for _ in 0..3 {
                     let msg = server.next().await.unwrap().unwrap();
-                    server.send(msg).await.unwrap();
+                    server.feed(msg).await.unwrap();
                 }
+                server.flush().await.unwrap();
                 server
             });
             (client_io, task)
@@ -2778,8 +2779,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_batch_answered_with_sends_is_one_write_when_coalescing() {
-        // Three frames arrive in one read; three send() calls answer them.
+    async fn read_batch_answered_with_feeds_is_one_write_when_coalescing() {
+        // Three frames arrive in one read; three feed() calls and a flush answer them.
         assert_eq!(echo_batch_write_count(true).await, 1);
         assert_eq!(echo_batch_write_count(false).await, 3);
     }
@@ -2799,7 +2800,7 @@ mod tests {
         let task = tokio::spawn(async move {
             for _ in 0..2 {
                 let msg = server.next().await.unwrap().unwrap();
-                server.send(msg).await.unwrap();
+                server.feed(msg).await.unwrap();
             }
             // Wait for a third message that only arrives after the client saw
             // both echoes.
@@ -2844,9 +2845,9 @@ mod tests {
         let big_for_task = big.clone();
         let task = tokio::spawn(async move {
             let _ = server.next().await.unwrap().unwrap();
-            server.send(Message::Binary(big_for_task)).await.unwrap();
+            server.feed(Message::Binary(big_for_task)).await.unwrap();
             let _ = server.next().await.unwrap().unwrap();
-            server.send(Message::text("small")).await.unwrap();
+            server.feed(Message::text("small")).await.unwrap();
             server
                 .send(Message::Binary(Bytes::from_static(b"tail")))
                 .await
