@@ -900,6 +900,9 @@ impl CompressedProtocol {
     /// Handle a parsed frame with decompression support
     fn handle_frame(&mut self, frame: Frame) -> Result<Option<Message>> {
         let is_compressed = frame.header.rsv1;
+        if is_compressed && !matches!(frame.header.opcode, OpCode::Text | OpCode::Binary) {
+            return Err(Error::Protocol("RSV1 on control or continuation frame"));
+        }
 
         match frame.header.opcode {
             OpCode::Continuation => self.handle_continuation(frame),
@@ -1207,6 +1210,9 @@ impl CompressedReaderProtocol {
     /// Handle a parsed frame with decompression support
     fn handle_frame(&mut self, frame: Frame) -> Result<Option<Message>> {
         let is_compressed = frame.header.rsv1;
+        if is_compressed && !matches!(frame.header.opcode, OpCode::Text | OpCode::Binary) {
+            return Err(Error::Protocol("RSV1 on control or continuation frame"));
+        }
 
         match frame.header.opcode {
             OpCode::Continuation => self.handle_continuation(frame),
