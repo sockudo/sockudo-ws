@@ -556,8 +556,10 @@ impl Protocol {
             return Err(Error::MessageTooLarge);
         }
 
-        // Validate only new bytes; re-seed from the complete validated prefix
-        // when raw processing or a split code point preceded this frame.
+        // Text fragments scan only newly arrived or previously unvalidated bytes,
+        // keeping typed message validation linear in the total payload size.
+        // Re-seed from the unvalidated suffix when raw processing or a split
+        // code point preceded this frame.
         if opcode == OpCode::Text {
             if prevalidated == 0 {
                 self.utf8.reset();
@@ -660,6 +662,8 @@ impl Protocol {
 
         match opcode {
             OpCode::Text => {
+                // Payload bytes were validated incrementally; only an unfinished
+                // trailing code point can invalidate the completed message.
                 if !self.utf8.finish() {
                     return Err(Error::InvalidUtf8);
                 }
