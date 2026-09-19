@@ -1311,6 +1311,40 @@ impl<S> Drop for SplitWriter<S> {
     }
 }
 
+/// Control writes stay in the driver's select loop while waiting for the sink
+/// or transport, so neither phase suppresses heartbeats or peer control work.
+enum SplitControlFrame {
+    Ping(Bytes),
+    Pong(Bytes),
+    Close,
+}
+
+async fn write_split_control<W, E>(
+    sink: SharedSink<W, E>,
+    frame: SplitControlFrame,
+    cancel: CancellationToken,
+) -> (SplitControlFrame, Result<()>)
+where
+    W: AsyncWrite + Unpin,
+    E: SplitEncoder,
+{
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(Error::ConnectionClosed),
+        result = async {
+            let mut guard = sink.lock().await;
+            guard.write_frame(&cancel, |encoder, buf| {
+                match &frame {
+                    SplitControlFrame::Ping(payload) => encoder.encode_message(&Message::Ping(payload.clone()), buf),
+                    SplitControlFrame::Pong(payload) => { encoder.encode_pong(payload, buf); Ok(()) }
+                    SplitControlFrame::Close => { encoder.encode_close_response(buf); Ok(()) }
+                }
+            }).await
+        } => result,
+    };
+    (frame, result)
+}
+
 async fn split_writer_driver<W, E>(
     sink: SharedSink<W, E>,
     config: Config,
@@ -1324,6 +1358,12 @@ async fn split_writer_driver<W, E>(
     let mut heartbeat = Heartbeat::new(&config, 0);
     let mut closing_deadline = None;
     let mut local_close_sent = false;
+    let mut peer_close = false;
+    let mut pending_pong = None;
+    let mut ping_payload = None;
+    let mut early_pong_ms = None;
+    let pending_write = None;
+    tokio::pin!(pending_write);
 
     // One timer for the whole connection: re-armed lazily when it fires or when
     // the deadline moves earlier, never per message.
@@ -1339,7 +1379,42 @@ async fn split_writer_driver<W, E>(
             heartbeat.on_inbound(observed_inbound, None);
         }
 
-        let heartbeat_deadline = heartbeat.next_deadline();
+        if pending_write.is_none() {
+            if peer_close {
+                if local_close_sent {
+                    // Include acquiring the sink in the shutdown bound, too.
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(config.close_timeout.into()),
+                        async {
+                            let mut guard = sink.lock().await;
+                            guard.writer.flush().await?;
+                            guard.writer.shutdown().await
+                        },
+                    )
+                    .await;
+                    shared.terminate(TerminalCause::ConnectionClosed);
+                    shared.cancel.cancel();
+                    break;
+                }
+                pending_write.set(Some(write_split_control(
+                    sink.clone(),
+                    SplitControlFrame::Close,
+                    shared.cancel.clone(),
+                )));
+            } else if let Some(payload) = pending_pong.take() {
+                pending_write.set(Some(write_split_control(
+                    sink.clone(),
+                    SplitControlFrame::Pong(payload),
+                    shared.cancel.clone(),
+                )));
+            }
+        }
+
+        let heartbeat_deadline = if pending_write.is_some() {
+            heartbeat.next_timeout()
+        } else {
+            heartbeat.next_deadline()
+        };
         if let Some(deadline) = heartbeat_deadline {
             let at = deadline.at();
             let rearm = match heartbeat_armed_ms {
@@ -1368,109 +1443,93 @@ async fn split_writer_driver<W, E>(
             request = control_rx.recv() => {
                 let Some(request) = request else {
                     shared.terminate(TerminalCause::ConnectionClosed);
+                    shared.cancel.cancel();
                     break;
                 };
                 match request {
                     ControlRequest::Ping(payload, received_at) => {
-                        let received_ms =
-                            received_at.saturating_duration_since(epoch).as_millis() as u64;
-                        heartbeat.on_inbound(received_ms, None);
-                        let written = sink
-                            .lock()
-                            .await
-                            .write_frame(&shared.cancel, |encoder, buf| {
-                                encoder.encode_pong(&payload, buf);
-                                Ok(())
-                            })
-                            .await;
-                        if written.is_err() {
-                            shared.terminate(TerminalCause::ConnectionClosed);
-                            break;
-                        }
+                        heartbeat.on_inbound(received_at.saturating_duration_since(epoch).as_millis() as u64, None);
+                        // RFC 6455 allows replying only to the latest Ping when
+                        // earlier replies are still pending. Keep this bounded.
+                        pending_pong = Some(payload);
                     }
                     ControlRequest::Pong(payload, received_at) => {
-                        let received_ms =
-                            received_at.saturating_duration_since(epoch).as_millis() as u64;
+                        let received_ms = received_at.saturating_duration_since(epoch).as_millis() as u64;
+                        if ping_payload.as_ref() == Some(&payload) {
+                            // The peer may see the Ping before our transport's flush
+                            // finishes. Apply its acknowledgement after ping_flushed.
+                            early_pong_ms = Some(received_ms);
+                        }
                         heartbeat.on_inbound(received_ms, Some(&payload));
                     }
                     ControlRequest::PeerClose => {
                         heartbeat.stop();
-                        let mut guard = sink.lock().await;
-                        if !local_close_sent {
-                            let _ = guard
-                                .write_frame(&shared.cancel, |encoder, buf| {
-                                    encoder.encode_close_response(buf);
-                                    Ok(())
-                                })
-                                .await;
-                        }
-                        let _ = bounded_shutdown(&mut guard.writer, config.close_timeout).await;
-                        drop(guard);
-                        shared.terminate(TerminalCause::ConnectionClosed);
-                        break;
+                        peer_close = true;
+                        closing_deadline.get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(config.close_timeout.into()));
                     }
                     ControlRequest::LocalCloseSent => {
                         heartbeat.stop();
                         local_close_sent = true;
-                        closing_deadline = Some(
-                            tokio::time::Instant::now()
-                                + Duration::from_secs(config.close_timeout.into()),
-                        );
+                        closing_deadline.get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(config.close_timeout.into()));
                     }
                     ControlRequest::Eof => {
                         heartbeat.stop();
                         shared.terminate(TerminalCause::ConnectionClosed);
+                        shared.cancel.cancel();
                         break;
                     }
                 }
             }
             _ = tokio::time::sleep(close_delay), if closing_deadline.is_some() => {
-                let _ = bounded_shutdown(&mut sink.lock().await.writer, config.close_timeout).await;
+                // A writer may own a partial frame. Do not wait for its lock or
+                // append a Close frame to that unfinished payload.
                 shared.terminate(TerminalCause::ConnectionClosed);
+                shared.cancel.cancel();
                 break;
             }
             _ = &mut heartbeat_sleep, if heartbeat_deadline.is_some() && shared.is_open() => {
+                // Activity can arrive while this select is parked on the timer.
+                let observed_inbound = shared.last_inbound_ms.load(Ordering::Relaxed);
+                if observed_inbound > last_synced_inbound_ms {
+                    last_synced_inbound_ms = observed_inbound;
+                    heartbeat.on_inbound(observed_inbound, None);
+                }
                 let now_ms = epoch.elapsed().as_millis() as u64;
-                match heartbeat.next_deadline() {
-                    Some(Deadline::Ping(at)) if at <= now_ms => {
+                match if pending_write.is_some() { heartbeat.next_timeout() } else { heartbeat.next_deadline() } {
+                    Some(Deadline::Ping(at)) if at <= now_ms && pending_write.is_none() => {
                         if let Some(payload) = heartbeat.ping_due(now_ms) {
-                            let written = sink
-                                .lock()
-                                .await
-                                .write_frame(&shared.cancel, |encoder, buf| {
-                                    encoder.encode_message(&Message::Ping(payload), buf)
-                                })
-                                .await;
-                            if written.is_err() {
-                                shared.terminate(TerminalCause::ConnectionClosed);
-                                break;
-                            }
-                            heartbeat.ping_flushed(epoch.elapsed().as_millis() as u64);
+                            ping_payload = Some(payload.clone());
+                            pending_write.set(Some(write_split_control(sink.clone(), SplitControlFrame::Ping(payload), shared.cancel.clone())));
                         }
                     }
                     Some(Deadline::Pong(at)) if at <= now_ms => {
-                        timeout_close(
-                            &sink,
-                            &config,
-                            config.pong_timeout_close_code,
-                            &config.pong_timeout_close_reason,
-                            &shared.cancel,
-                        ).await;
-                        shared.terminate(TerminalCause::HeartbeatTimeout);
+                        timeout_close(&sink, &config, config.pong_timeout_close_code, &config.pong_timeout_close_reason, &shared, TerminalCause::HeartbeatTimeout).await;
                         break;
                     }
                     Some(Deadline::Idle(at)) if at <= now_ms => {
-                        timeout_close(
-                            &sink,
-                            &config,
-                            CloseReason::GOING_AWAY,
-                            "Connection idle timeout",
-                            &shared.cancel,
-                        ).await;
-                        shared.terminate(TerminalCause::IdleTimeout);
+                        timeout_close(&sink, &config, CloseReason::GOING_AWAY, "Connection idle timeout", &shared, TerminalCause::IdleTimeout).await;
                         break;
                     }
                     _ => {}
+                }
+            }
+            (frame, result) = async { pending_write.as_mut().as_pin_mut().unwrap().await }, if pending_write.is_some() => {
+                pending_write.set(None);
+                if result.is_err() {
+                    shared.terminate(TerminalCause::ConnectionClosed);
+                    shared.cancel.cancel();
+                    break;
+                }
+                match frame {
+                    SplitControlFrame::Ping(payload) => {
+                        heartbeat.ping_flushed(epoch.elapsed().as_millis() as u64);
+                        if let Some(received_ms) = early_pong_ms.take() {
+                            heartbeat.on_inbound(received_ms, Some(&payload));
+                        }
+                        ping_payload = None;
+                    },
+                    SplitControlFrame::Close => local_close_sent = true,
+                    SplitControlFrame::Pong(_) => {}
                 }
             }
         }
@@ -1513,19 +1572,27 @@ async fn timeout_close<W, E>(
     config: &Config,
     code: u16,
     reason: &str,
-    cancel: &CancellationToken,
+    shared: &SplitShared,
+    cause: TerminalCause,
 ) where
     W: AsyncWrite + Unpin,
     E: SplitEncoder,
 {
-    let mut guard = sink.lock().await;
-    let close = Message::Close(Some(CloseReason::new(code, bounded_close_reason(reason))));
-    let _ = tokio::time::timeout(
-        Duration::from_secs(config.close_timeout.into()),
-        guard.write_frame(cancel, |encoder, buf| encoder.encode_message(&close, buf)),
-    )
-    .await;
-    let _ = bounded_shutdown(&mut guard.writer, config.close_timeout).await;
+    // Publish the timeout before waking a blocked sender, preserving its cause.
+    shared.terminate(cause);
+    if let Ok(mut guard) = sink.try_lock() {
+        let close = Message::Close(Some(CloseReason::new(code, bounded_close_reason(reason))));
+        let _ = tokio::time::timeout(
+            Duration::from_secs(config.close_timeout.into()),
+            guard.write_frame(&shared.cancel, |encoder, buf| {
+                encoder.encode_message(&close, buf)
+            }),
+        )
+        .await;
+        let _ = bounded_shutdown(&mut guard.writer, config.close_timeout).await;
+    }
+    // A held sink may contain a partial frame. Cancel it without appending Close.
+    shared.cancel.cancel();
 }
 
 // ============================================================================
