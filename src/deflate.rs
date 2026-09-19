@@ -202,10 +202,13 @@ impl DeflateEncoder {
             return Ok(None);
         }
 
-        // Reset context if required
-        if self.no_context_takeover {
-            self.compress.reset();
-        }
+        // Full flush forgets history at the message boundary instead of resetting
+        // before each no-context-takeover message.
+        let flush = if self.no_context_takeover {
+            FlushCompress::Full
+        } else {
+            FlushCompress::Sync
+        };
 
         // Estimate output size (compressed data is often smaller, but we need headroom)
         let max_output = data.len() + 64;
@@ -237,6 +240,7 @@ impl DeflateEncoder {
             // We get the spare capacity, compress into it, then only set_len for bytes actually written.
             let out_start = output.len();
             let spare = output.spare_capacity_mut();
+            let spare_len = spare.len();
 
             // SAFETY: We're creating a &mut [u8] from MaybeUninit<u8> slice.
             // flate2's compress() will write to this buffer and tell us how many bytes were written.
@@ -247,7 +251,7 @@ impl DeflateEncoder {
 
             let status = self
                 .compress
-                .compress(input, spare_slice, FlushCompress::Sync)
+                .compress(input, spare_slice, flush)
                 .map_err(|e| Error::Compression(format!("deflate error: {}", e)))?;
 
             let consumed = (self.compress.total_in() - before_in) as usize;
@@ -263,7 +267,9 @@ impl DeflateEncoder {
 
             match status {
                 Status::Ok | Status::BufError => {
-                    if total_in >= data.len() {
+                    // Consuming the input does not finish a flush when output is full.
+                    // Continue with the same flush mode until pending output is drained.
+                    if total_in == data.len() && produced < spare_len {
                         break;
                     }
                 }
