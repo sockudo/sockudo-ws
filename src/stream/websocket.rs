@@ -1559,6 +1559,7 @@ pin_project! {
         inner: S,
         protocol: crate::protocol::CompressedProtocol,
         read_buf: BytesMut,
+        has_unprocessed_read_data: bool,
         write_buf: CorkBuffer,
         state: StreamState,
         config: Config,
@@ -1585,18 +1586,34 @@ where
 {
     /// Create a new compressed WebSocket stream for server role
     pub fn server(inner: S, config: Config, deflate_config: crate::deflate::DeflateConfig) -> Self {
+        Self::server_with_leftover(inner, config, deflate_config, None)
+    }
+
+    /// Create a server-side compressed stream with post-handshake leftover bytes.
+    pub fn server_with_leftover(
+        inner: S,
+        config: Config,
+        deflate_config: crate::deflate::DeflateConfig,
+        leftover: Option<Bytes>,
+    ) -> Self {
         let protocol = crate::protocol::CompressedProtocol::server(
             config.max_frame_size,
             config.max_message_size,
             deflate_config,
         );
 
+        let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);
+        if let Some(leftover) = leftover {
+            read_buf.extend_from_slice(&leftover);
+        }
+        let has_unprocessed_read_data = !read_buf.is_empty();
         let clock_epoch = tokio::time::Instant::now();
         let heartbeat = Heartbeat::new(&config, 0);
         Self {
             inner,
             protocol,
-            read_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
+            read_buf,
+            has_unprocessed_read_data,
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
             state: StreamState::Open,
             config,
@@ -1617,18 +1634,34 @@ where
 
     /// Create a new compressed WebSocket stream for client role
     pub fn client(inner: S, config: Config, deflate_config: crate::deflate::DeflateConfig) -> Self {
+        Self::client_with_leftover(inner, config, deflate_config, None)
+    }
+
+    /// Create a client-side compressed stream with post-handshake leftover bytes.
+    pub fn client_with_leftover(
+        inner: S,
+        config: Config,
+        deflate_config: crate::deflate::DeflateConfig,
+        leftover: Option<Bytes>,
+    ) -> Self {
         let protocol = crate::protocol::CompressedProtocol::client(
             config.max_frame_size,
             config.max_message_size,
             deflate_config,
         );
 
+        let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);
+        if let Some(leftover) = leftover {
+            read_buf.extend_from_slice(&leftover);
+        }
+        let has_unprocessed_read_data = !read_buf.is_empty();
         let clock_epoch = tokio::time::Instant::now();
         let heartbeat = Heartbeat::new(&config, 0);
         Self {
             inner,
             protocol,
-            read_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
+            read_buf,
+            has_unprocessed_read_data,
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
             state: StreamState::Open,
             config,
@@ -2008,6 +2041,22 @@ where
                 }
             }
 
+            // Process handshake leftover once before waiting for transport data.
+            if self.has_unprocessed_read_data {
+                self.as_mut().get_mut().has_unprocessed_read_data = false;
+                match self.as_mut().get_mut().process_read_buf() {
+                    Ok(()) if !self.pending_messages.is_empty() => continue,
+                    Ok(()) => {}
+                    Err(e) => {
+                        let this = self.as_mut().get_mut();
+                        this.state = StreamState::Closed;
+                        this.heartbeat.stop();
+                        this.heartbeat_sleep = None;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                }
+            }
+
             match self.as_mut().poll_read_more(cx) {
                 Poll::Ready(Ok(0)) => {
                     self.as_mut().get_mut().state = StreamState::Closed;
@@ -2132,6 +2181,7 @@ pub struct CompressedSplitReader<S> {
     protocol: crate::protocol::CompressedReaderProtocol,
     /// Read buffer
     read_buf: BytesMut,
+    has_unprocessed_read_data: bool,
     /// Pending messages from last decode
     pending_messages: Vec<Message>,
     control_tx: mpsc::Sender<ControlRequest>,
@@ -2225,6 +2275,7 @@ where
                 reader,
                 protocol: reader_protocol,
                 read_buf: self.read_buf,
+                has_unprocessed_read_data: self.has_unprocessed_read_data,
                 pending_messages: self.pending_messages,
                 control_tx: control_tx.clone(),
                 terminal_rx,
@@ -2281,6 +2332,26 @@ where
                     continue;
                 }
                 return Some(Ok(msg));
+            }
+
+            if self.has_unprocessed_read_data {
+                self.has_unprocessed_read_data = false;
+                debug_assert!(self.pending_messages.is_empty());
+                match self
+                    .protocol
+                    .process_into(&mut self.read_buf, &mut self.pending_messages)
+                {
+                    Ok(()) => {
+                        self.pending_messages.reverse();
+                        if !self.pending_messages.is_empty() {
+                            continue;
+                        }
+                    }
+                    Err(error) => {
+                        self.shared.terminate(TerminalCause::ConnectionClosed);
+                        return Some(Err(error));
+                    }
+                }
             }
 
             if self.read_buf.capacity() - self.read_buf.len() < 4096 {
