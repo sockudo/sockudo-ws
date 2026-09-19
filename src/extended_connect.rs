@@ -42,6 +42,7 @@ pub const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 /// - `scheme`: The `:scheme` pseudo-header ("https" for HTTP/3, "http" or "https" for HTTP/2)
 /// - `protocol`: The `:protocol` pseudo-header (should be "websocket")
 /// - `subprotocols`: The `sec-websocket-protocol` header (comma-separated list)
+/// - `selected_subprotocol`: The subprotocol selected by the server
 /// - `extensions`: The `sec-websocket-extensions` header
 /// - `origin`: The `origin` header (for CORS validation)
 /// - `version`: The `sec-websocket-version` header (should be "13")
@@ -57,6 +58,8 @@ pub struct ExtendedConnectRequest {
     pub protocol: Option<String>,
     /// The `sec-websocket-protocol` header (optional subprotocol negotiation)
     pub subprotocols: Option<String>,
+    /// The subprotocol selected by the server, if any.
+    pub selected_subprotocol: Option<String>,
     /// The `sec-websocket-extensions` header (optional extensions)
     pub extensions: Option<String>,
     /// The `origin` header (optional, for CORS)
@@ -68,8 +71,8 @@ pub struct ExtendedConnectRequest {
 impl ExtendedConnectRequest {
     /// Parse an HTTP request into an Extended CONNECT request
     ///
-    /// Returns `Some` if this is a valid Extended CONNECT request,
-    /// `None` if the request is not a CONNECT method.
+    /// Returns `Some` if this is a valid Extended CONNECT request, or `None` if
+    /// the method is not CONNECT or a repeatable WebSocket header is not UTF-8.
     ///
     /// # Example
     ///
@@ -103,8 +106,8 @@ impl ExtendedConnectRequest {
         // Try to get :protocol from headers or extensions
         let protocol = get_header_string(headers, ":protocol");
 
-        let subprotocols = get_header_string(headers, "sec-websocket-protocol");
-        let extensions = get_header_string(headers, "sec-websocket-extensions");
+        let subprotocols = get_comma_separated_header(headers, "sec-websocket-protocol").ok()?;
+        let extensions = get_comma_separated_header(headers, "sec-websocket-extensions").ok()?;
         let origin = get_header_string(headers, "origin");
         let version = get_header_string(headers, "sec-websocket-version");
 
@@ -114,6 +117,7 @@ impl ExtendedConnectRequest {
             scheme,
             protocol,
             subprotocols,
+            selected_subprotocol: None,
             extensions,
             origin,
             version,
@@ -143,6 +147,7 @@ impl ExtendedConnectRequest {
             scheme: "https".to_string(),
             protocol: Some("websocket".to_string()),
             subprotocols: subprotocol.map(String::from),
+            selected_subprotocol: None,
             extensions: None,
             origin: None,
             version: Some("13".to_string()),
@@ -170,7 +175,7 @@ impl ExtendedConnectRequest {
     pub fn has_subprotocol(&self, proto: &str) -> bool {
         self.subprotocols
             .as_ref()
-            .is_some_and(|p| p.split(',').any(|s| s.trim().eq_ignore_ascii_case(proto)))
+            .is_some_and(|p| p.split(',').any(|s| s.trim() == proto))
     }
 
     /// Get the list of requested subprotocols
@@ -228,6 +233,20 @@ impl ExtendedConnectRequest {
         // sec-websocket-version should be 13 if present
         if let Some(ref version) = self.version
             && version != "13"
+        {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        if self
+            .subprotocols
+            .as_deref()
+            .is_some_and(|value| !crate::handshake::is_valid_protocol_list(value))
+        {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        if self
+            .extensions
+            .as_deref()
+            .is_some_and(|value| !crate::handshake::is_valid_extension_list(value))
         {
             return Err(StatusCode::BAD_REQUEST);
         }
@@ -399,6 +418,34 @@ pub fn build_extended_connect_response(
     builder.body(()).expect("valid response")
 }
 
+pub(crate) fn validate_extended_connect_response(
+    headers: &HeaderMap,
+    offered_protocol: Option<&str>,
+) -> crate::error::Result<()> {
+    let mut protocols = headers.get_all("sec-websocket-protocol").iter();
+    let selected_protocol = protocols
+        .next()
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| crate::error::Error::HandshakeFailed("invalid subprotocol response"))
+        })
+        .transpose()?;
+    if protocols.next().is_some() {
+        return Err(crate::error::Error::HandshakeFailed(
+            "duplicate Sec-WebSocket-Protocol",
+        ));
+    }
+    crate::handshake::validate_selected_protocol(offered_protocol, selected_protocol)?;
+
+    if headers.contains_key("sec-websocket-extensions") {
+        return Err(crate::error::Error::HandshakeFailed(
+            "server returned an unoffered extension",
+        ));
+    }
+    Ok(())
+}
+
 /// Build an HTTP error response for rejecting Extended CONNECT
 ///
 /// # Arguments
@@ -429,6 +476,25 @@ fn get_header_string(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(String::from)
 }
 
+fn get_comma_separated_header(headers: &HeaderMap, name: &str) -> Result<Option<String>, ()> {
+    let mut values = headers.get_all(name).iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    let mut combined = match first.to_str() {
+        Ok(value) => value.to_string(),
+        Err(_) => return Err(()),
+    };
+    for value in values {
+        let Ok(value) = value.to_str() else {
+            return Err(());
+        };
+        combined.push_str(", ");
+        combined.push_str(value);
+    }
+    Ok(Some(combined))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +516,28 @@ mod tests {
     }
 
     #[test]
+    fn response_protocol_and_extensions_must_be_single_and_offered() {
+        let response = build_extended_connect_response(Some("superchat"), None);
+        assert!(
+            validate_extended_connect_response(response.headers(), Some("chat, superchat")).is_ok()
+        );
+
+        let response = build_extended_connect_response(Some("other"), None);
+        assert!(
+            validate_extended_connect_response(response.headers(), Some("chat, superchat"))
+                .is_err()
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.append("sec-websocket-protocol", "chat".parse().unwrap());
+        headers.append("sec-websocket-protocol", "superchat".parse().unwrap());
+        assert!(validate_extended_connect_response(&headers, Some("chat, superchat")).is_err());
+
+        let response = build_extended_connect_response(None, Some("permessage-deflate"));
+        assert!(validate_extended_connect_response(response.headers(), None).is_err());
+    }
+
+    #[test]
     fn test_extended_connect_request_new() {
         let req = ExtendedConnectRequest::new("wss://example.com/ws", Some("graphql-ws")).unwrap();
         assert_eq!(req.path, "/ws");
@@ -457,6 +545,51 @@ mod tests {
         assert_eq!(req.scheme, "https");
         assert!(req.is_websocket());
         assert!(req.has_subprotocol("graphql-ws"));
+    }
+
+    #[test]
+    fn extended_connect_combines_repeatable_websocket_headers() {
+        let mut request = Request::builder()
+            .method(Method::CONNECT)
+            .uri("https://example.com/ws")
+            .header("sec-websocket-version", "13")
+            .body(())
+            .unwrap();
+        request
+            .headers_mut()
+            .append("sec-websocket-protocol", "chat".parse().unwrap());
+        request
+            .headers_mut()
+            .append("sec-websocket-protocol", "superchat".parse().unwrap());
+        request
+            .headers_mut()
+            .append("sec-websocket-extensions", "extension-one".parse().unwrap());
+        request
+            .headers_mut()
+            .append("sec-websocket-extensions", "extension-two".parse().unwrap());
+
+        let request = ExtendedConnectRequest::from_request(&request).unwrap();
+        assert_eq!(request.subprotocols.as_deref(), Some("chat, superchat"));
+        assert_eq!(
+            request.extensions.as_deref(),
+            Some("extension-one, extension-two")
+        );
+    }
+
+    #[test]
+    fn extended_connect_rejects_invalid_header_values() {
+        let mut request = Request::builder()
+            .method(Method::CONNECT)
+            .uri("https://example.com/ws")
+            .header("sec-websocket-version", "13")
+            .body(())
+            .unwrap();
+        request.headers_mut().insert(
+            "sec-websocket-extensions",
+            http::HeaderValue::from_bytes(b"\x80").unwrap(),
+        );
+
+        assert!(ExtendedConnectRequest::from_request(&request).is_none());
     }
 
     #[test]
@@ -481,7 +614,7 @@ mod tests {
         let protos = req.subprotocol_list();
         assert_eq!(protos, vec!["graphql-ws", "json", "binary"]);
         assert!(req.has_subprotocol("json"));
-        assert!(req.has_subprotocol("GRAPHQL-WS")); // case insensitive
+        assert!(!req.has_subprotocol("GRAPHQL-WS"));
         assert!(!req.has_subprotocol("xml"));
     }
 

@@ -26,18 +26,65 @@ pub fn generate_mask() -> [u8; 4] {
     generate_mask_inner()
 }
 
+/// Generate the 16 random bytes used by a WebSocket handshake key.
+///
+/// Uses the same backend priority as [`generate_mask`]: getrandom, rand_rng,
+/// then fastrand. Selecting a cryptographic backend must also apply to the
+/// public handshake nonce; the default fastrand backend is non-cryptographic.
+#[inline]
+pub(crate) fn generate_key_bytes() -> [u8; 16] {
+    generate_key_bytes_inner()
+}
+
+#[cfg(all(
+    feature = "fastrand",
+    not(feature = "getrandom"),
+    not(feature = "rand_rng")
+))]
+#[inline]
+fn generate_key_bytes_inner() -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    fastrand::fill(&mut bytes);
+    bytes
+}
+
+#[cfg(all(feature = "rand_rng", not(feature = "getrandom")))]
+#[inline]
+fn generate_key_bytes_inner() -> [u8; 16] {
+    use rand::RngExt;
+    rand::rng().random()
+}
+
+#[cfg(feature = "getrandom")]
+#[inline]
+fn generate_key_bytes_inner() -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("getrandom failed");
+    bytes
+}
+
+#[cfg(not(any(feature = "fastrand", feature = "getrandom", feature = "rand_rng")))]
+#[inline]
+fn generate_key_bytes_inner() -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    for chunk in bytes.chunks_exact_mut(4) {
+        chunk.copy_from_slice(&generate_mask_inner());
+    }
+    bytes
+}
+
 #[cfg(feature = "getrandom")]
 #[inline]
 fn generate_mask_inner() -> [u8; 4] {
     let mut buf = [0u8; 4];
-    getrandom::getrandom(&mut buf).expect("getrandom failed");
+    getrandom::fill(&mut buf).expect("getrandom failed");
     buf
 }
 
 #[cfg(all(feature = "rand_rng", not(feature = "getrandom")))]
 #[inline]
 fn generate_mask_inner() -> [u8; 4] {
-    use rand::Rng;
+    use rand::RngExt;
     rand::rng().random()
 }
 

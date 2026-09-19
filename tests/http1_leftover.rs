@@ -92,7 +92,8 @@ async fn http1_split_client_replays_frame_read_with_upgrade_response() {
 #[tokio::test]
 async fn http1_server_replays_frame_read_with_upgrade_request() {
     let (mut client_io, server_io) = tokio::io::duplex(4096);
-    let request = build_request("example.com", "/ws", "dGhlIHNhbXBsZSBub25jZQ==", None, None);
+    let request =
+        build_request("example.com", "/ws", "dGhlIHNhbXBsZSBub25jZQ==", None, None).unwrap();
     let masked_text_frame = b"\x81\x85\x01\x02\x03\x04\x69\x67\x6f\x68\x6e";
     client_io.write_all(&request).await.unwrap();
     client_io.write_all(masked_text_frame).await.unwrap();
@@ -107,5 +108,67 @@ async fn http1_server_replays_frame_read_with_upgrade_request() {
     assert!(matches!(
         websocket.next().await,
         Some(Ok(Message::Text(payload))) if payload == "hello"
+    ));
+}
+
+#[cfg(feature = "permessage-deflate")]
+#[tokio::test]
+async fn http1_compressed_split_server_replays_frame_read_with_upgrade_request() {
+    use sockudo_ws::CompressedWebSocketStream;
+    use sockudo_ws::deflate::DeflateConfig;
+    use sockudo_ws::handshake::{HandshakeSelection, server_handshake_with};
+    use sockudo_ws::protocol::CompressedProtocol;
+
+    let (mut client_io, mut server_io) = tokio::io::duplex(4096);
+    let deflate_config = DeflateConfig {
+        server_no_context_takeover: true,
+        client_no_context_takeover: true,
+        ..DeflateConfig::default()
+    };
+    let extension = deflate_config.to_response_header();
+    let request = build_request(
+        "example.com",
+        "/ws",
+        "dGhlIHNhbXBsZSBub25jZQ==",
+        None,
+        Some(&extension),
+    )
+    .unwrap();
+    let mut frame = bytes::BytesMut::new();
+    CompressedProtocol::client(4096, 4096, deflate_config.clone())
+        .encode_message(&Message::text("compressed hello"), &mut frame)
+        .unwrap();
+
+    let mut request_and_frame = request.to_vec();
+    request_and_frame.extend_from_slice(&frame);
+    client_io.write_all(&request_and_frame).await.unwrap();
+
+    let response_extension = extension.clone();
+    let handshake = server_handshake_with(&mut server_io, |_| {
+        Ok(HandshakeSelection {
+            protocol: None,
+            extensions: Some(response_extension),
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(handshake.leftover.as_deref(), Some(frame.as_ref()));
+    assert_eq!(handshake.extensions.as_deref(), Some(extension.as_str()));
+
+    let websocket = CompressedWebSocketStream::server_with_leftover(
+        server_io,
+        Config::default(),
+        deflate_config,
+        handshake.leftover,
+    );
+    let (mut reader, _writer) = websocket.split();
+    let message = timeout(Duration::from_secs(1), reader.next())
+        .await
+        .expect("compressed split reader did not process handshake leftover")
+        .expect("compressed split reader closed before returning handshake leftover")
+        .unwrap();
+    assert!(matches!(
+        message,
+        Message::Text(payload) if payload == "compressed hello"
     ));
 }

@@ -1,8 +1,8 @@
 //! io_uring support for Linux high-performance I/O
 //!
-//! This module provides io_uring-backed transport for WebSocket connections,
-//! offering superior performance on Linux systems through reduced syscall
-//! overhead and true asynchronous I/O.
+//! This module provides an io_uring-backed TCP transport for WebSocket
+//! connections. `UringStream` bridges tokio-uring's owned completion buffers
+//! to Tokio's borrowed poll-based I/O traits.
 //!
 //! # Architecture: io_uring as Transport Layer
 //!
@@ -20,8 +20,7 @@
 //! │              Optional: TLS (rustls/openssl)              │
 //! ├─────────────────────────────────────────────────────────┤
 //! │    TCP (epoll)   │   TCP (io_uring)   │   UDP (QUIC)    │
-//! │    TcpStream     │   UringStream      │   quinn uses    │
-//! │                  │                    │   io_uring too  │
+//! │    TcpStream     │   UringStream      │     quinn       │
 //! └─────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -52,8 +51,8 @@
 //!
 //! # Combining io_uring with HTTP/3
 //!
-//! The `quinn` crate (used for QUIC/HTTP/3) already uses io_uring internally
-//! when available on Linux. No extra configuration needed!
+//! HTTP/3 uses Quinn's UDP transport independently of this module. Enabling
+//! sockudo-ws's `io-uring` feature does not change the HTTP/3 transport.
 //!
 //! # Direct io_uring + HTTP/1.1 WebSocket
 //!
@@ -81,17 +80,15 @@
 //!
 //! # Requirements
 //!
-//! - Linux kernel 5.1+ (basic io_uring)
-//! - Linux kernel 5.6+ (full feature support including IORING_FEAT_FAST_POLL)
+//! - Linux kernel 5.10+ (required by tokio-uring 0.5)
 //! - The `io-uring` feature must be enabled
-//! - Must use `#[tokio_uring::main]` instead of `#[tokio::main]`
+//! - Must run inside `tokio_uring::start` or a tokio-uring runtime builder
 //!
-//! # Performance Benefits
+//! # I/O model
 //!
-//! - Reduced syscall overhead (batched submissions)
-//! - True async I/O (no epoll wakeup overhead)
-//! - Registered buffers for zero-copy I/O
-//! - SQPOLL mode for minimal latency (at CPU cost)
+//! The poll-based bridge uses reusable 64 KiB read and write buffers. For APIs
+//! that can transfer owned buffers directly, `UringStream` also exposes native
+//! completion-based read and write methods that avoid the bridge's copies.
 
 mod buffer;
 mod stream;
@@ -101,14 +98,12 @@ pub use stream::{UringStream, UringStreamAdapter};
 
 /// Check if io_uring is available on this system
 ///
-/// Returns `true` if:
-/// - Running on Linux
-/// - The kernel version supports io_uring (5.1+)
-/// - The io_uring syscalls are available
+/// Returns `true` when the target operating system is Linux. This function
+/// does not probe the running kernel or attempt to create an io_uring runtime.
 ///
 /// Note: This is a compile-time check for the platform. Runtime availability
-/// depends on kernel configuration and may vary. The `tokio-uring` crate
-/// handles runtime checks internally and will fall back or error appropriately.
+/// depends on kernel configuration, security policy, and tokio-uring's kernel
+/// requirements. Runtime creation reports those failures.
 ///
 /// # Example
 ///
@@ -130,8 +125,7 @@ pub fn is_available() -> bool {
         // the kernel version. For a more robust check, tokio-uring will
         // fail at runtime if io_uring is not available.
         //
-        // Minimum kernel version for io_uring: 5.1
-        // Recommended for full features: 5.6+
+        // tokio-uring 0.5 requires Linux 5.10 or later.
         //
         // We return true here as a compile-time indication that io_uring
         // *could* be available. Actual availability is determined at runtime
@@ -149,7 +143,7 @@ pub fn is_available() -> bool {
 /// Check if the current kernel likely supports io_uring with full features
 ///
 /// This performs a runtime check of the kernel version to determine if
-/// io_uring with all features (including FAST_POLL) is likely available.
+/// the minimum version required by tokio-uring 0.5 is likely available.
 ///
 /// Returns `Some((major, minor, patch))` with the kernel version if on Linux,
 /// or `None` if not on Linux or if the version cannot be determined.
@@ -190,11 +184,10 @@ pub fn kernel_version() -> Option<(u32, u32, u32)> {
 
 /// Check if the kernel version supports io_uring with recommended features
 ///
-/// Returns true if kernel is 5.6 or higher, which includes IORING_FEAT_FAST_POLL
-/// for better performance.
+/// Returns true if the kernel is 5.10 or higher.
 #[cfg(target_os = "linux")]
 pub fn has_recommended_kernel() -> bool {
-    kernel_version().is_some_and(|(major, minor, _)| major > 5 || (major == 5 && minor >= 6))
+    kernel_version().is_some_and(|(major, minor, _)| major > 5 || (major == 5 && minor >= 10))
 }
 
 #[cfg(not(target_os = "linux"))]
