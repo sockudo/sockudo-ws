@@ -263,7 +263,7 @@ where
 
     /// Send a close frame
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
-        if self.state != StreamState::Open {
+        if self.state != StreamState::Open || self.pending_parse_error.is_some() {
             return Ok(());
         }
 
@@ -708,7 +708,7 @@ where
     type Error = Error;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if self.state != StreamState::Open {
+        if self.state != StreamState::Open || self.pending_parse_error.is_some() {
             return Poll::Ready(Err(Error::ConnectionClosed));
         }
         Poll::Ready(Ok(()))
@@ -717,7 +717,7 @@ where
     fn start_send(self: Pin<&mut Self>, item: Message) -> Result<()> {
         let this = self.get_mut();
 
-        if this.state != StreamState::Open {
+        if this.state != StreamState::Open || this.pending_parse_error.is_some() {
             return Err(Error::ConnectionClosed);
         }
 
@@ -915,6 +915,8 @@ enum ControlRequest {
     Ping(Bytes, super::clock::Instant),
     Pong(Bytes, super::clock::Instant),
     PeerClose,
+    /// Start one closing budget before the application writes its Close frame.
+    LocalCloseStarted(tokio::time::Instant),
     /// The application wrote a Close frame through the shared sink.
     LocalCloseSent,
     Eof,
@@ -1056,19 +1058,32 @@ where
         if !self.shared.is_open() {
             return Err(self.current_error());
         }
+        let is_close = msg.is_close();
+        if is_close {
+            let permit = self
+                .control_tx
+                .reserve()
+                .await
+                .map_err(|_| self.current_error())?;
+            if !self.shared.begin_closing() {
+                return Err(self.current_error());
+            }
+            // Publish before waiting for the sink: a blocked control write must
+            // use the same closing budget as the application Close behind it.
+            permit.send(ControlRequest::LocalCloseStarted(
+                tokio::time::Instant::now(),
+            ));
+        }
         let mut sink = self.sink.lock().await;
         // Re-check under the lock: the control driver may have closed meanwhile.
-        if !self.shared.is_open() {
+        let status = self.shared.status.load(Ordering::Acquire);
+        if status != SPLIT_OPEN && !(is_close && status == SPLIT_CLOSING) {
             return Err(self.current_error());
         }
         let mut cancellation = SplitSendGuard {
             shared: &self.shared,
             completed: false,
         };
-        let is_close = msg.is_close();
-        if is_close {
-            self.shared.begin_closing();
-        }
         let limit = sink.max_backpressure;
         let result = sink
             .write_frame(&self.shared.cancel, |encoder, buf| {
@@ -1175,6 +1190,15 @@ where
         let transport = reader.clone();
         let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
         let shared = SplitShared::new(self.state != StreamState::Open);
+        // Splitting must not reopen application writes after a known parse error.
+        // A preceding accepted Close still needs its automatic response.
+        if self.pending_parse_error.is_some() {
+            shared.begin_closing();
+            if !self.pending_messages.iter().any(Message::is_close) {
+                shared.terminate(TerminalCause::ConnectionClosed);
+                shared.cancel.cancel();
+            }
+        }
         let terminal_rx = shared.terminal_tx.subscribe();
         let writer_protocol = Protocol::new(
             self.protocol.role,
@@ -1236,6 +1260,15 @@ where
             if self.terminal_reported {
                 return None;
             }
+            // Stop the connection without discarding its accepted message prefix.
+            // An accepted Close takes precedence over invalid bytes after it.
+            if self.pending_parse_error.is_some()
+                && self.shared.is_open()
+                && !self.pending_messages.iter().any(Message::is_close)
+            {
+                self.shared.terminate(TerminalCause::ConnectionClosed);
+                self.shared.cancel.cancel();
+            }
             if self.pending_parse_error.is_none()
                 && let Some(result) = self.take_terminal()
             {
@@ -1243,6 +1276,16 @@ where
             }
 
             if let Some(msg) = self.pending_messages.pop() {
+                if self.pending_parse_error.is_some()
+                    && self.shared.status.load(Ordering::Acquire) == SPLIT_CLOSED
+                {
+                    if msg.is_close() {
+                        self.pending_messages.clear();
+                        self.pending_parse_error = None;
+                        self.terminal_reported = true;
+                    }
+                    return Some(Ok(msg));
+                }
                 let request = match &msg {
                     Message::Ping(data) => {
                         ControlRequest::Ping(data.clone(), super::clock::Instant::now())
@@ -1388,6 +1431,10 @@ where
     ///
     /// Cancelling after acquiring the write sink closes the connection: a
     /// partially written frame cannot safely be followed by another frame.
+    /// This also applies when the transport has not accepted any bytes yet,
+    /// or a Close was written but its driver notification is still pending.
+    /// Use a retained send future when racing it with other work; dropping it
+    /// through `timeout` or `select!` abandons the connection at this boundary.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
         self.core.send(msg).await
     }
@@ -1562,6 +1609,10 @@ async fn split_writer_driver<S, E>(
                         heartbeat.stop();
                         peer_close = true;
                         closing_deadline.get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(config.close_timeout.into()));
+                    }
+                    ControlRequest::LocalCloseStarted(started) => {
+                        heartbeat.stop();
+                        closing_deadline.get_or_insert(started + Duration::from_secs(config.close_timeout.into()));
                     }
                     ControlRequest::LocalCloseSent => {
                         heartbeat.stop();
@@ -1852,7 +1903,7 @@ where
 
     /// Send a close frame
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
-        if self.state != StreamState::Open {
+        if self.state != StreamState::Open || self.pending_parse_error.is_some() {
             return Ok(());
         }
 
@@ -2282,7 +2333,7 @@ where
     type Error = Error;
 
     fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if self.state != StreamState::Open {
+        if self.state != StreamState::Open || self.pending_parse_error.is_some() {
             return Poll::Ready(Err(Error::ConnectionClosed));
         }
         Poll::Ready(Ok(()))
@@ -2291,7 +2342,7 @@ where
     fn start_send(self: Pin<&mut Self>, item: Message) -> Result<()> {
         let this = self.get_mut();
 
-        if this.state != StreamState::Open {
+        if this.state != StreamState::Open || this.pending_parse_error.is_some() {
             return Err(Error::ConnectionClosed);
         }
 
@@ -2425,6 +2476,15 @@ where
 
         let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
         let shared = SplitShared::new(self.state != StreamState::Open);
+        // Splitting must not reopen application writes after a known parse error.
+        // A preceding accepted Close still needs its automatic response.
+        if self.pending_parse_error.is_some() {
+            shared.begin_closing();
+            if !self.pending_messages.iter().any(Message::is_close) {
+                shared.terminate(TerminalCause::ConnectionClosed);
+                shared.cancel.cancel();
+            }
+        }
         let terminal_rx = shared.terminal_tx.subscribe();
 
         // Split the protocol into reader and writer halves
@@ -2485,6 +2545,15 @@ where
             if self.terminal_reported {
                 return None;
             }
+            // Stop the connection without discarding its accepted message prefix.
+            // An accepted Close takes precedence over invalid bytes after it.
+            if self.pending_parse_error.is_some()
+                && self.shared.is_open()
+                && !self.pending_messages.iter().any(Message::is_close)
+            {
+                self.shared.terminate(TerminalCause::ConnectionClosed);
+                self.shared.cancel.cancel();
+            }
             if self.pending_parse_error.is_none()
                 && let Some(result) = self.take_terminal()
             {
@@ -2492,6 +2561,16 @@ where
             }
 
             if let Some(msg) = self.pending_messages.pop() {
+                if self.pending_parse_error.is_some()
+                    && self.shared.status.load(Ordering::Acquire) == SPLIT_CLOSED
+                {
+                    if msg.is_close() {
+                        self.pending_messages.clear();
+                        self.pending_parse_error = None;
+                        self.terminal_reported = true;
+                    }
+                    return Some(Ok(msg));
+                }
                 let request = match &msg {
                     Message::Ping(data) => {
                         ControlRequest::Ping(data.clone(), super::clock::Instant::now())
@@ -2634,6 +2713,8 @@ where
     ///
     /// Cancelling after acquiring the write sink closes the connection, since
     /// the frame or compression state may already have advanced.
+    /// Zero transport progress does not make cancellation recoverable. Retain
+    /// the send future across `select!` if the connection must remain usable.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
         self.core.send(msg).await
     }

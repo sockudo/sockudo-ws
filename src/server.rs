@@ -294,14 +294,16 @@ impl WebSocketServer<Http1> {
     {
         loop {
             let (stream, _addr) = listener.accept().await.map_err(Error::Io)?;
-            stream
-                .set_nodelay(self.config.tcp_nodelay)
-                .map_err(Error::Io)?;
-
             let handler = handler.clone();
             let server = self.clone();
 
             tokio::spawn(async move {
+                // Socket setup can fail when this peer disconnects. Keep that
+                // failure local to the connection rather than stopping accept.
+                if let Err(error) = stream.set_nodelay(server.config.tcp_nodelay) {
+                    eprintln!("WebSocket socket setup error: {error}");
+                    return;
+                }
                 match server.accept(stream).await {
                     Ok((ws, handshake)) => {
                         handler(ws, handshake).await;

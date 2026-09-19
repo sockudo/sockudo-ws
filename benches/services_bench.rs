@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use rand::{RngCore, SeedableRng};
+use rand::{Rng, SeedableRng};
 use sockudo_ws::Message;
 use sockudo_ws::SharedCompressorPool;
 use sockudo_ws::deflate::{DeflateConfig, DeflateDecoder, DeflateEncoder};
