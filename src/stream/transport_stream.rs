@@ -172,15 +172,6 @@ struct Http2StreamInner {
 }
 
 #[cfg(feature = "http2")]
-impl Drop for Http2StreamInner {
-    fn drop(&mut self) {
-        // Close the send half before h2 drops the last stream references. Otherwise,
-        // h2 may reset the stream and discard DATA still queued by the handler.
-        let _ = self.send.send_data(Bytes::new(), true);
-    }
-}
-
-#[cfg(feature = "http2")]
 impl Stream<Http2> {
     /// Create a new HTTP/2 stream from h2 send and receive streams
     ///

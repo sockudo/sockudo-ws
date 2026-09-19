@@ -432,15 +432,6 @@ pub struct CompioHttp2Stream {
 }
 
 #[cfg(feature = "http2")]
-impl Drop for CompioHttp2Stream {
-    fn drop(&mut self) {
-        // Close the send half before h2 drops the last stream references. Otherwise,
-        // h2 may reset the stream and discard DATA still queued by the handler.
-        let _ = self.send.send_data(Bytes::new(), true);
-    }
-}
-
-#[cfg(feature = "http2")]
 impl CompioHttp2Stream {
     /// Create a stream from h2 send and receive halves after Extended CONNECT.
     pub fn new(send: h2::SendStream<Bytes>, recv: h2::RecvStream) -> Self {
