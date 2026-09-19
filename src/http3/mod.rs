@@ -3,6 +3,14 @@
 //! This module provides WebSocket bootstrapping over HTTP/3 using QUIC,
 //! implementing the Extended CONNECT Protocol defined in RFC 9220.
 //!
+//! # Interoperability limitation
+//!
+//! The pinned h3 0.0.8 release cannot represent `:protocol=websocket`. The
+//! built-in endpoints currently use a `webtransport` protocol label and require
+//! the peer to accept that same nonstandard convention. They do not interoperate
+//! with a strict RFC 9220 endpoint. Correcting the label also requires updating
+//! h3 consistently across the QUIC and runtime integrations.
+//!
 //! # RFC 9220 Compliance
 //!
 //! This implementation follows RFC 9220 "Bootstrapping WebSockets with HTTP/3":
@@ -26,14 +34,13 @@
 //! ├─────────────────────────────────────────┤
 //! │              QUIC Transport              │
 //! │    (multiplexed streams over UDP)        │
-//! │    Uses io_uring on Linux automatically  │
+//! │       Runtime-provided UDP socket        │
 //! └─────────────────────────────────────────┘
 //! ```
 //!
 //! # Benefits of HTTP/3 WebSocket
 //!
 //! - **No head-of-line blocking**: Each WebSocket stream is independent
-//! - **Faster connection setup**: 0-RTT support for returning clients
 //! - **Better mobile performance**: Handles network changes gracefully
 //! - **Multiplexing**: Multiple WebSocket connections over one QUIC connection
 //! - **Built-in encryption**: TLS 1.3 is mandatory in QUIC
@@ -98,11 +105,11 @@
 //! }
 //! ```
 //!
-//! # io_uring Integration
+//! # Runtime integration
 //!
-//! The `quinn` crate (QUIC implementation) automatically uses io_uring
-//! on Linux when available, providing optimal performance without
-//! any extra configuration.
+//! This implementation uses Quinn's Tokio runtime integration. The
+//! sockudo-ws `io-uring` feature only provides a TCP adapter and does not
+//! change the HTTP/3 UDP transport.
 
 #[cfg(feature = "tokio-runtime")]
 pub mod stream;

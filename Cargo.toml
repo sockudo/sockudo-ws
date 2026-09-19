@@ -91,7 +91,6 @@ rand_rng = ["dep:rand"]
 # HTTP/2 WebSocket support (RFC 8441)
 http2 = [
     "dep:h2",
-    "dep:http",
     "dep:tokio",
     "tokio/io-util",
     "dep:tokio-util",
@@ -104,7 +103,6 @@ http3 = [
     "dep:quinn",
     "dep:h3",
     "dep:h3-quinn",
-    "dep:http",
     "dep:rustls",
     "compio?/h3",
     "compio?/rustls",
@@ -196,7 +194,7 @@ rustls-platform-verifier = { version = "^0.6", optional = true }
 
 # HTTP/2 support (RFC 8441)
 h2 = { version = "^0.4", optional = true }
-http = { version = "^1.0", optional = true }
+http = "^1.0"
 
 # HTTP/3 support (RFC 9220)
 quinn = { version = "^0.11", optional = true }

@@ -106,7 +106,7 @@ pub mod io_uring;
 // Core re-exports
 pub use error::{Error, Result};
 pub use frame::{Frame, OpCode};
-pub use handshake::HandshakeResult;
+pub use handshake::{HandshakeResult, HandshakeSelection};
 pub use protocol::{Message, RawMessage, Role};
 #[cfg(feature = "tokio-runtime")]
 pub use pubsub::{PubSub, PubSubState, PublishResult, SubscriberId};
@@ -206,6 +206,9 @@ impl Default for Http2Config {
 }
 
 /// HTTP/3 configuration (RFC 9220)
+///
+/// The built-in endpoints do not currently apply these fields. Configure an
+/// external QUIC endpoint directly when transport settings are required.
 #[cfg(feature = "http3")]
 #[derive(Debug, Clone)]
 pub struct Http3Config {
