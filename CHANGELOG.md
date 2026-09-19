@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added custom HTTP headers to Tokio and Compio HTTP/1.1 client handshakes, with validation that
+  prevents malformed fields and conflicts with handshake-managed headers.
+- Added Tokio compressed-stream constructors that accept post-handshake bytes,
+  plus request-aware Tokio and Compio `server_handshake_with` callbacks for
+  selecting subprotocol and extension responses.
+- Added server-preference subprotocol policies to Tokio HTTP/1.1, HTTP/2, and
+  HTTP/3 servers, Compio transports, and Axum upgrades.
+- Added reproducible service benchmarks for shared-compressor contention and
+  Pub/Sub publishing during membership churn.
+- Added `DeflateWindowBits`, which represents the 9–15-bit window sizes supported
+  by the configured compression backend.
+
 ### Changed
 
 - Explicit `send_coalesced()` calls can coalesce outbound frames while parsed
@@ -15,23 +29,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write instead of N. Standard `SinkExt::send()` and `SinkExt::flush()` always
   flush; callers using coalescing must flush before pausing reads or waiting
   for a reply that depends on buffered output.
-- Server-side data payloads of 8 KiB or more are queued by reference behind
-  their frame header and sent with vectored I/O instead of being copied into
-  the write buffer (`CorkBuffer::push_segment`, `cork::ZERO_COPY_MIN`).
-- `CorkBuffer` is now an ordered list of `Bytes` segments plus an open tail
-  buffer; `write_bytes` keeps output order and `write` no longer spills into a
-  separate overflow queue.
-- `SplitWriter` / `CompressedSplitWriter` write directly to the transport
-  through a sink shared with the connection's control driver, instead of a
-  channel plus a oneshot completion per `send()`. Automatic Pong/Ping/Close
-  frames interleave at frame boundaries. `SplitWriter::send` now requires
-  `S: AsyncWrite + Unpin` (which `split()` already required).
-- Frame masking uses an auto-vectorised 64-byte block loop on aarch64 and
-  other non-x86 targets (aligned above 2 KiB): 1 KiB 53 -> 84 GB/s,
-  16 KiB 67 -> 127 GB/s, 64 B 12 -> 19 GB/s on an Apple M5 Pro.
-- Compio streams and split readers reuse the message Vec across reads, pop
-  messages instead of cloning them, and publish inbound activity through a
-  shared cell instead of a channel message per data frame.
+- Native split writes are coordinated through a connection-scoped driver with
+  bounded application/control queues. Cancelling an accepted application write
+  closes the connection before another application frame can follow it.
+- Server-side uncompressed data payloads of 8 KiB or more are queued by reference
+  behind their frame header. Segmented writes use vectored I/O when supported;
+  contiguous small frames retain the single-buffer write path.
+- `CorkBuffer` preserves write order with frozen `Bytes` segments followed by an
+  open tail buffer. Large payloads count toward the stream backpressure limit.
+- Generic frame masking uses portable 64-byte blocks; architecture-specific
+  kernels remain selected on supported targets.
+
+- Tokio streams now use `quanta` for heartbeat and activity timestamps by
+  default. The `test-util` feature selects Tokio time for deterministic virtual-
+  time tests; `full` excludes `test-util`, while `--all-features` includes it.
+- Custom `Compression::Shared` contexts now use role-specific pools for
+  asymmetric window settings. The default remains a process-wide four-slot
+  synchronous encoder pool, with decoders kept per connection.
+- Pub/Sub membership indexes are updated under one state lock. Publish operations
+  snapshot recipients under a read lock and send after unlocking; removal after
+  the snapshot does not revoke an already-selected delivery.
+- Deflate configuration now uses `DeflateWindowBits`, so codec, context, pool,
+  and compressed-stream constructors remain infallible with valid window sizes.
+- HTTP/1.1 request/response builders now return `Result` after validating fields.
+  Default server handshakes no longer echo a client's subprotocol list without
+  an application selection policy.
+- HTTP/1.1 parsing now uses standard URI and authority types, accepts only
+  `http`/`https` absolute-form targets, and accepts repeated Content-Length
+  fields only when every comma-separated value is zero.
+
+### Fixed
+
+- Preserved WebSocket frame bytes read together with HTTP/1.1 upgrade requests
+  or responses in the high-level Tokio APIs, and enabled direct Tokio
+  compressed-stream callers to replay those bytes.
+- Preserved Compio read buffers when a heartbeat deadline cancels an in-flight
+  read, including partial headers and payloads.
+- Accepted legal final DEFLATE blocks across consecutive messages while retaining
+  only the negotiated takeover dictionary, and rejected invalid bytes following
+  a final block.
+- Rejected unsupported 8-bit deflate windows instead of allowing the backend to
+  panic; incompatible remote offers are declined.
+- Preserved parser, fragmentation, compression, and pending terminal-error state
+  when plain or compressed Tokio/Compio streams are split after reading begins.
+- Applied client permessage-deflate constraints during Axum negotiation so the
+  response header and codec use the same negotiated configuration.
+- Tightened HTTP/1.1 upgrade validation for HTTP version, Host, WebSocket keys,
+  exact header tokens, subprotocols, extensions, and reserved framing headers;
+  combined repeatable protocol/extension fields and accepted absolute request
+  targets.
+- Validated selected subprotocols and extension responses on HTTP/1.1, HTTP/2,
+  and HTTP/3 clients, and stopped HTTP/2 servers from echoing a complete client
+  offer as one selection.
+- Bounded decompression output allocation by the configured message limit and
+  stopped retaining a full compressed-input copy between messages.
+- Made delivery independent of read chunking when valid messages precede a
+  terminal frame error: complete messages are yielded before the error once.
+- Discarded queued Compio messages after an automatic control-frame write fails,
+  and made HTTP/2 and HTTP/3 subprotocol matching case-sensitive.
+- Reset deflate decoders without replacing their allocation and aligned public
+  parameter parsing with server negotiation, including the supported decoder
+  mapping for `client_max_window_bits=8`.
+
+### Compatibility
+
+- `DeflateConfig` window fields, `Compression::window_bits()`, and the deflate
+  window constants now use `DeflateWindowBits`; `DeflateEncoder::new` and
+  `DeflateDecoder::new` accept that type. `MIN_WINDOW_BITS` is now 9 and
+  `Compression::Window256B` was removed because the configured backend does
+  not support an 8-bit encoder window.
+- HTTP request/response builders now return `Result`, and `HandshakeRequest`
+  path, protocol, and extension fields use `Cow<str>` so repeated fields and
+  absolute request targets can be normalized. These changes affect source
+  compatibility.
+- Restored Compio `server_handshake_with_extensions` as a deprecated wrapper;
+  request-aware code should use `server_handshake_with`.
 
 ## [2.1.0] - 2026-09-19
 

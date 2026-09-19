@@ -76,13 +76,13 @@ sockudo-ws matches or exceeds uWebSockets performance while providing a safe, er
 - **Zero-Copy Parsing**: Direct buffer access without intermediate allocations
 - **Write Batching (Corking)**: Minimizes syscalls via vectored I/O
 - **permessage-deflate**: Full compression support with shared/dedicated compressors
-- **Lock-Free Split Streams**: True concurrent read/write using OS-level stream splitting (zero mutex contention)
+- **Split Streams**: Concurrent read/write tasks with a connection-scoped writer driver
 - **Runtime-Separated APIs**: Tokio support via `tokio-runtime`, native Compio support via `compio-runtime`
 - **Pub/Sub System**: High-performance topic-based messaging with sender exclusion
 - **HTTP/2 WebSocket**: RFC 8441 Extended CONNECT protocol support
 - **HTTP/3 WebSocket**: RFC 9220 WebSocket over QUIC support
-- **io_uring**: Linux high-performance async I/O (combinable with HTTP/2 and HTTP/3)
-- **Autobahn Compliant**: Passes all 517 Autobahn test suite cases
+- **io_uring**: Buffered Tokio I/O compatibility over tokio-uring TCP streams
+- **Autobahn Testing**: Includes a protocol echo server and test-suite configuration; conformance results must be checked for the revision under test
 - **Fuzz Tested**: Comprehensive fuzzing with libFuzzer
 
 ## Installation
@@ -134,7 +134,7 @@ sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", features = ["all-t
 # Everything
 sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", features = ["full"] }
 
-# With mimalloc allocator (recommended for production)
+# With mimalloc allocator
 sockudo-ws = { git = "https://github.com/sockudo/sockudo-ws", features = ["mimalloc"] }
 ```
 
@@ -177,9 +177,9 @@ async fn handle(stream: TcpStream) {
 }
 ```
 
-### Lock-Free Split Streams (Concurrent Read/Write)
+### Split Streams (Concurrent Read/Write)
 
-sockudo-ws uses **tokio::io::split()** for true concurrent I/O with **zero mutex contention**:
+Tokio split handles share a private transport holder. A mutex protects each synchronous I/O poll, and the writer driver can release the transport on timeout even while both handles remain alive:
 
 ```rust
 use sockudo_ws::{Config, Message, WebSocketStream};
@@ -189,10 +189,10 @@ async fn handle(stream: TcpStream) {
     let ws = WebSocketStream::server(stream, Config::default());
     
     // Split into independent read/write halves
-    // Reader and writer can operate 100% concurrently!
+    // Reader and writer run in separate tasks; transport polls are synchronized.
     let (mut reader, mut writer) = ws.split();
 
-    // Writer task - NEVER blocks reader
+    // Writer task - ordinary reads can progress while a send awaits I/O
     let (tx, mut rx) = mpsc::channel::<Message>(32);
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -200,7 +200,7 @@ async fn handle(stream: TcpStream) {
         }
     });
 
-    // Reader loop - NEVER blocks writer
+    // Reader loop - decoding runs independently of the writer driver
     while let Some(msg) = reader.next().await {
         match msg.unwrap() {
             Message::Text(text) => {
@@ -213,11 +213,11 @@ async fn handle(stream: TcpStream) {
 }
 ```
 
-**Why This is Fast:**
-- ✅ **Zero mutex contention** - reader and writer operate independently
-- ✅ **OS-level splitting** - leverages tokio's optimized `ReadHalf` and `WriteHalf`
-- ✅ **True concurrency** - can read and write simultaneously without blocking
-- ✅ **Control frame coordination** - Ping/Pong/Close handled via lightweight mpsc channel
+**How Split I/O Works:**
+- Reader and writer tasks maintain separate protocol state
+- A mutex serializes transport polls; no lock is held across an await
+- Pending writes still process heartbeat activity and enforce Idle/Pong expiry
+- Ping/Pong/Close coordination uses a bounded control channel
 
 ### HTTP/1.1 Custom Headers
 
@@ -252,6 +252,77 @@ async fn connect() -> sockudo_ws::Result<()> {
 
 Compio applications can use `sockudo_ws::compio::connect_async_with_headers` with the same header
 representation and validation rules.
+
+`SinkExt::send` and `SinkExt::flush` always flush pending output. The explicit
+`send_coalesced` method can defer writes while already-parsed inbound messages
+remain queued and `Config::write_coalescing` is enabled. Flush before pausing
+reads or awaiting a reply that depends on the buffered output.
+
+### Server Subprotocol and Extension Selection
+
+High-level servers select subprotocols from an explicit server-preference list.
+The default is to select no subprotocol, which is valid when the application
+does not implement any of the protocols offered by the client.
+Clients that require an offered protocol will reject such a response, so those
+endpoints must configure a matching policy.
+
+```rust
+use sockudo_ws::{Config, Http1, WebSocketServer};
+
+let server = WebSocketServer::<Http1>::new(Config::default())
+    .protocols(["superchat", "chat"])?;
+```
+
+The same `.protocols(...)` builder applies to Tokio HTTP/2 and HTTP/3 servers
+and Axum's `WebSocketUpgrade`. Compio provides
+`accept_async_with_protocols`, `serve_http2_with_protocols`, and
+`CompioHttp3Server::protocols`. All of them choose the first server-supported
+protocol that exactly matches a client offer.
+
+Direct Tokio and Compio HTTP/1.1 handshakes can inspect the validated request
+before selecting a response:
+
+```rust
+use sockudo_ws::handshake::{HandshakeSelection, server_handshake_with};
+
+let handshake = server_handshake_with(&mut stream, |request| {
+    let protocol = request.protocol.as_deref().and_then(|offered| {
+        offered
+            .split(',')
+            .map(str::trim)
+            .find(|protocol| *protocol == "superchat")
+            .map(str::to_owned)
+    });
+    Ok(HandshakeSelection {
+        protocol,
+        extensions: None,
+    })
+})
+.await?;
+```
+
+The handshake rejects a selected protocol or extension name that the client
+did not offer. Extension-specific parameter negotiation remains the callback's
+responsibility.
+
+HTTP/1.1 handshakes may read the first WebSocket frame together with the final
+HTTP headers. The high-level Tokio and Compio HTTP/1.1 client/server APIs replay
+those bytes automatically. Direct handshake callers must preserve
+`HandshakeResult::leftover` and pass it to `from_raw_with_leftover` or the
+compressed `server_with_leftover`/`client_with_leftover` constructor. When the
+callback negotiates compression, the same negotiated configuration must be
+used by the compressed codec.
+
+The high-level Tokio `WebSocketServer::<Http1>::accept`/`accept_raw` methods and
+Compio `accept_async` helpers do not negotiate extensions and always return a
+plain stream. Applications that enable permessage-deflate over HTTP/1.1 must use
+the request-aware handshake and a compressed stream constructor directly.
+
+Repeated `Sec-WebSocket-Protocol` and `Sec-WebSocket-Extensions` request fields
+are combined before validation. HTTP/1.1 server parsing also accepts absolute
+`http`/`https` request targets, accepts repeated or comma-separated
+`Content-Length` values when every value is zero, and rejects nonzero
+Content-Length and all Transfer-Encoding fields.
 
 ### Native Compio Runtime
 
@@ -436,13 +507,16 @@ if let Some(id) = pubsub.get_subscriber_by_socket_id(&socket_id) {
 
 #### Pub/Sub Features
 
-- **64 Sharded Topics**: Reduced lock contention for high concurrency
+- **Consistent Membership**: One state lock keeps subscriber, socket ID, and topic indexes atomic
 - **Lock-Free Subscriber IDs**: Atomic allocation for fast subscriber creation
 - **Zero-Copy Messages**: Uses `Bytes` for efficient message sharing
-- **Cache-Line Alignment**: Prevents false sharing in concurrent access
 - **Pusher-Style String IDs**: Optional string-based subscriber identifiers
 - **Sender Exclusion**: `publish_excluding()` prevents echo to the sender
 - **Automatic Cleanup**: Empty topics are removed automatically
+
+Publishing snapshots recipient senders while holding the state read lock, then
+sends after releasing it. A concurrent unsubscribe or removal ordered after the
+snapshot does not revoke delivery already selected by that publish operation.
 
 #### Pub/Sub Statistics
 
@@ -609,7 +683,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## io_uring Support (Linux)
 
-io_uring provides kernel-level async I/O with zero-copy operations. It's a **transport layer** that can be combined with any protocol.
+The `io-uring` feature provides a buffered `AsyncRead`/`AsyncWrite` compatibility layer over tokio-uring TCP streams. The native methods accept owned buffers and avoid the compatibility layer's copies.
 
 ### io_uring with HTTP/1.1
 
@@ -642,7 +716,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### io_uring with HTTP/2
 
-Combine io_uring transport with HTTP/2 protocol for maximum performance:
+The TCP adapter also satisfies the I/O traits used by the HTTP/2 implementation:
 
 ```rust
 use sockudo_ws::io_uring::UringStream;
@@ -789,14 +863,37 @@ outstanding, but it does not extend or satisfy that Ping's Pong deadline. If a
 hard `idle_timeout` and Pong deadline tie, the more specific Pong timeout wins,
 so only one Close and one typed terminal error are produced.
 
-On timeout, the server rejects further application data, attempts one
+Timeout handling between writes rejects further application data, attempts one
 configured Close within `close_timeout`, and completes local cleanup even when
 the peer is unreachable. Code 4201 can be observed on a writable path, but no
 implementation can guarantee delivery through an already-dead TCP path.
 
-These semantics are shared by Tokio and Compio, plain and
+The heartbeat state machine is shared by Tokio and Compio, plain and
 permessage-deflate, unified and split APIs. Generic TCP/TLS and HTTP/2/HTTP/3
-streams inherit the state machine from their runtime WebSocket stream.
+streams inherit it from their runtime WebSocket stream.
+
+Tokio split streams also enforce Idle/Pong expiry while an open connection's
+write or flush is blocked. They drop the owned transport before reporting the
+timeout to readers and senders, including queued sends. They do not append a
+Close frame to a partially written frame. A deferred automatic Ping waits for
+the current frame to finish; its Pong deadline starts after the Ping is flushed.
+Inbound ordinary data still updates idle activity, and timely matching Pongs
+still clear the outstanding deadline while output is blocked. This blocked-write
+handling has not been added to unified streams.
+
+Compio plain and compressed split streams enforce the same blocked-write
+deadlines. `split()` cancels the write future and releases the driver's writer
+before reporting the timeout to pending readers and senders, including queued
+sends. Fatal read/parse errors and EOF return without waiting for the driver
+and queue cancellation of pending writes.
+
+Compio may retain native I/O operations and the reader's transport reference;
+cancellation does not guarantee immediate transport closure or resource
+reclamation. Applications own any further transport shutdown or process restart
+policy. Split requires a `Splittable` transport; native Compio TLS and
+HTTP/2/HTTP/3 wrappers currently do not provide split adapters. The active Close
+write retains its existing timing contract: `close_timeout` starts after the
+Close frame is flushed.
 
 ### Compression Modes
 
@@ -804,10 +901,32 @@ streams inherit the state machine from their runtime WebSocket stream.
 |------|-------------|
 | `Compression::Disabled` | No compression |
 | `Compression::Dedicated` | Per-connection compressor (best ratio, more memory) |
-| `Compression::Shared` | Shared compressor (good for many connections) |
-| `Compression::Shared4KB` | Shared with 4KB sliding window |
-| `Compression::Shared8KB` | Shared with 8KB sliding window |
-| `Compression::Shared16KB` | Shared with 16KB sliding window |
+| `Compression::Shared` | Process-wide shared compressor pool (lower encoder memory, possible contention) |
+| `Compression::Window1KB` | Dedicated compressor with a 1KB window |
+| `Compression::Window2KB` | Dedicated compressor with a 2KB window |
+| `Compression::Window4KB` | Dedicated compressor with a 4KB window |
+| `Compression::Window8KB` | Dedicated compressor with an 8KB window |
+| `Compression::Window16KB` | Dedicated compressor with a 16KB window |
+| `Compression::Window32KB` | Dedicated compressor with a 32KB window |
+
+The default `Shared` mode uses one process-wide pool of four synchronous encoder
+slots; decoders remain per connection. Concurrent sends can wait for a slot.
+Custom asymmetric server/client window settings use separate four-slot encoder
+pools for the two directions.
+
+Smaller negotiated windows bound the retained takeover dictionary and reduce
+encoder memory. The configured zlib-rs decoder can still retain an internal
+32 KiB window per connection, including with `DeflateConfig::low_memory()`.
+
+The configured flate2/zlib-rs backend supports window bits 9–15.
+`DeflateConfig` uses `DeflateWindowBits`, so unsupported sizes cannot be passed
+to compressed stream constructors. An offered `server_max_window_bits=8` is
+declined because it would require the server encoder to use an unsupported
+window. An offered `client_max_window_bits=8` can be accepted: the client still
+compresses with an 8-bit window while the server uses its compatible 9-bit
+decoder window. If a server policy requires a client window below 15, the
+client offer must include `client_max_window_bits`; otherwise negotiation is
+declined because the response cannot introduce that parameter.
 
 ## Feature Flags
 
@@ -879,14 +998,14 @@ Transport features are runtime-neutral. Pair `http2` or `http3` with either `tok
 
 | Feature | Description |
 |---------|-------------|
-| `mimalloc` | Use mimalloc as global allocator (10-30% throughput improvement) |
+| `mimalloc` | Use mimalloc as the process global allocator |
 
 ### Integration Features
 
 | Feature | Description |
 |---------|-------------|
 | `axum-integration` | Axum web framework support |
-| `full` | All features enabled |
+| `full` | Bundled runtime, transport, SIMD, and compression features (excludes `test-util`) |
 
 ### Test Clock
 
@@ -965,9 +1084,9 @@ if ws.is_backpressured() {
 }
 ```
 
-### Lock-Free Split Streams
+### Split Streams
 
-For concurrent read/write operations with zero mutex contention:
+For read/write operations in separate tasks:
 
 ```rust
 let (reader, writer) = ws.split();
@@ -986,10 +1105,10 @@ writer.flush().await?;  // Flush accepted application writes
 ```
 
 **Implementation Details:**
-- Uses `tokio::io::split()` for OS-level stream splitting
-- Reader owns `ReadHalf<S>` and protocol decoder
-- One connection-scoped driver exclusively owns `WriteHalf<S>` and the encoder
-- Bounded control/application queues provide backpressure under Ping floods
+- Tokio handles share a private transport holder that supports release on timeout
+- Reader owns the protocol decoder and a handle to the transport
+- One connection-scoped driver owns the encoder and performs all writes
+- Control/application queues are bounded; during a blocked write, pending peer Pings may be coalesced to the latest Pong response (RFC 6455 §5.5.3)
 - Pong and Close responses progress without later application `send()`/`flush()`
 - Dropping either half cancels the driver; EOF/Close/timeout propagates to both
 - No lock is held across an await
@@ -1022,6 +1141,19 @@ if let Message::Text(bytes) = msg {
 
 ```bash
 cargo test
+cargo test --features test-util
+```
+
+The default run exercises the quanta clock and ignores virtual-time tests with
+an explicit `requires test-util clock` reason. The second run includes those tests
+using Tokio's virtual clock. Run both when changing heartbeat or timer behavior.
+
+The service benchmark includes shared-compressor contention and concurrent
+Pub/Sub membership churn:
+
+```bash
+cargo bench --bench services_bench -- shared_compression_concurrency
+cargo bench --bench services_bench -- pubsub_publish_with_churn
 ```
 
 ### With Features
@@ -1165,7 +1297,7 @@ sockudo-ws/
 3. **Zero-Copy**: Parses frames directly from receive buffer without copying
 4. **Cork Buffer**: Batches small writes into 16KB chunks for fewer syscalls
 5. **Vectored I/O**: Uses `writev()` to send multiple buffers in single syscall
-6. **io_uring**: Kernel-level async I/O with submission queue batching
+6. **io_uring**: Completion-based Linux TCP I/O with native owned-buffer methods
 7. **Alignment-Aware SIMD**: Handles unaligned prefix/suffix for optimal memory access
 8. **Optional mimalloc**: High-performance allocator for reduced allocation latency
 

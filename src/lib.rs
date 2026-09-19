@@ -210,8 +210,8 @@ impl Default for Http2Config {
 
 /// HTTP/3 configuration (RFC 9220)
 ///
-/// The built-in endpoints do not currently apply these fields. Configure an
-/// external QUIC endpoint directly when transport settings are required.
+/// Built-in endpoints apply these settings. An externally supplied endpoint
+/// retains its transport and TLS settings; HTTP/3 protocol settings still apply.
 #[cfg(feature = "http3")]
 #[derive(Debug, Clone)]
 pub struct Http3Config {
@@ -333,7 +333,7 @@ impl From<DeflateWindowBits> for u8 {
 /// |------|-------------|-------------|-------------|
 /// | `Disabled` | No compression | - | - |
 /// | `Dedicated` | Per-connection compressor | 15 | 32KB |
-/// | `Shared` | Shared compressor pool | 15 | 32KB |
+/// | `Shared` | Process-wide four-slot encoder pool | 15 | 32KB |
 /// | `Window1KB` | 1KB sliding window | 10 | 1KB |
 /// | `Window2KB` | 2KB sliding window | 11 | 2KB |
 /// | `Window4KB` | 4KB sliding window | 12 | 4KB |
@@ -347,7 +347,7 @@ pub enum Compression {
     Disabled,
     /// Dedicated compressor per connection (32KB window, best compression)
     Dedicated,
-    /// Shared compressor pool (32KB window, good for many connections)
+    /// Process-wide four-slot synchronous encoder pool (32KB window)
     Shared,
     /// 1KB sliding window (window_bits=10)
     Window1KB,
@@ -497,7 +497,8 @@ pub struct Config {
     /// Maximum backpressure in bytes before dropping connection (default: 1MB)
     /// If an application frame makes the encoded write buffer exceed this limit,
     /// the connection becomes terminal and the write returns `Error::BufferFull`.
-    /// This bounds queued encoded bytes, not peak encoding memory.
+    /// This bounds queued encoded bytes, not peak encoding memory or input messages
+    /// waiting in a split writer queue.
     pub max_backpressure: usize,
     /// Send native Pings after inbound inactivity (default: true).
     ///
@@ -786,7 +787,9 @@ impl ConfigBuilder {
         self
     }
 
-    /// Enable or disable HTTP/3 0-RTT
+    /// Request HTTP/3 0-RTT support
+    ///
+    /// Built-in endpoints reject this until peer settings can be safely restored.
     #[cfg(feature = "http3")]
     pub fn http3_enable_0rtt(mut self, enabled: bool) -> Self {
         self.config.http3.enable_0rtt = enabled;

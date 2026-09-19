@@ -1,5 +1,9 @@
 # sockudo-ws performance audit
 
+> Historical baseline measurements. Later changes to the split writer, clock,
+> and SIMD paths have not been remeasured by this report; its numbers do not
+> establish the performance of those implementations.
+
 > **Update 2026-09-19 (post v2.1.0).** Every item in section 4 ("Not fixed") except the
 > runtime itself has since been implemented; see section 6 for the follow-up and its numbers.
 > The competitor's harness has also been published since; section 7 reviews it.
