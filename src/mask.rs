@@ -28,15 +28,19 @@ pub fn generate_mask() -> [u8; 4] {
 
 /// Generate the 16 random bytes used by a WebSocket handshake key.
 ///
-/// Prefer the default fast generator when it is available. The handshake
-/// nonce does not share the stronger entropy requirement of frame mask keys,
-/// whose backend priority is documented on [`generate_mask`].
+/// Uses the same backend priority as [`generate_mask`]: getrandom, rand_rng,
+/// then fastrand. Selecting a cryptographic backend must also apply to the
+/// public handshake nonce; the default fastrand backend is non-cryptographic.
 #[inline]
 pub(crate) fn generate_key_bytes() -> [u8; 16] {
     generate_key_bytes_inner()
 }
 
-#[cfg(feature = "fastrand")]
+#[cfg(all(
+    feature = "fastrand",
+    not(feature = "getrandom"),
+    not(feature = "rand_rng")
+))]
 #[inline]
 fn generate_key_bytes_inner() -> [u8; 16] {
     let mut bytes = [0u8; 16];
@@ -44,18 +48,14 @@ fn generate_key_bytes_inner() -> [u8; 16] {
     bytes
 }
 
-#[cfg(all(feature = "rand_rng", not(feature = "fastrand")))]
+#[cfg(all(feature = "rand_rng", not(feature = "getrandom")))]
 #[inline]
 fn generate_key_bytes_inner() -> [u8; 16] {
     use rand::RngExt;
     rand::rng().random()
 }
 
-#[cfg(all(
-    feature = "getrandom",
-    not(feature = "fastrand"),
-    not(feature = "rand_rng")
-))]
+#[cfg(feature = "getrandom")]
 #[inline]
 fn generate_key_bytes_inner() -> [u8; 16] {
     let mut bytes = [0u8; 16];
