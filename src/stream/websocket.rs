@@ -868,7 +868,8 @@ impl Default for WebSocketStreamBuilder {
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use super::split_transport::SplitTransport;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -1058,6 +1059,9 @@ where
             .await;
         drop(sink);
         if result.is_err() {
+            if self.shared.status.load(Ordering::Acquire) == SPLIT_CLOSED {
+                return Err(self.current_error());
+            }
             self.shared.terminate(TerminalCause::ConnectionClosed);
             return result;
         }
@@ -1079,6 +1083,9 @@ where
         };
         drop(sink);
         if result.is_err() {
+            if self.shared.status.load(Ordering::Acquire) == SPLIT_CLOSED {
+                return Err(self.current_error());
+            }
             self.shared.terminate(TerminalCause::ConnectionClosed);
         }
         result
@@ -1112,7 +1119,7 @@ impl SplitEncoder for Protocol {
 
 /// The read half of a split WebSocket stream.
 pub struct SplitReader<S> {
-    reader: ReadHalf<S>,
+    reader: SplitTransport<S>,
     protocol: Protocol,
     read_buf: BytesMut,
     has_unprocessed_read_data: bool,
@@ -1127,7 +1134,7 @@ pub struct SplitReader<S> {
 ///
 /// The transport writer itself is owned by the per-connection control driver.
 pub struct SplitWriter<S> {
-    core: SplitWriterCore<WriteHalf<S>, Protocol>,
+    core: SplitWriterCore<SplitTransport<S>, Protocol>,
 }
 
 impl<S> WebSocketStream<S>
@@ -1139,7 +1146,8 @@ where
     /// This starts one connection-scoped Tokio task that exclusively owns the
     /// transport writer. Dropping either returned half cancels that task.
     pub fn split(self) -> (SplitReader<S>, SplitWriter<S>) {
-        let (reader, writer) = tokio::io::split(self.inner);
+        let (reader, writer) = SplitTransport::pair(self.inner);
+        let transport = reader.clone();
         let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
         let shared = SplitShared::new(self.state != StreamState::Open);
         let terminal_rx = shared.terminal_tx.subscribe();
@@ -1148,11 +1156,12 @@ where
             self.config.max_frame_size,
             self.config.max_message_size,
         );
-        let sink: SharedSink<WriteHalf<S>, Protocol> = Arc::new(tokio::sync::Mutex::new(
+        let sink: SharedSink<SplitTransport<S>, Protocol> = Arc::new(tokio::sync::Mutex::new(
             SplitSink::new(writer, self.protocol, self.config.write_buffer_size),
         ));
 
         tokio::spawn(split_writer_driver(
+            transport,
             sink.clone(),
             self.config,
             control_rx,
@@ -1355,19 +1364,58 @@ impl<S> Drop for SplitWriter<S> {
     }
 }
 
-async fn split_writer_driver<W, E>(
+/// Control writes stay in the driver's select loop while waiting for the sink
+/// or transport, so neither phase suppresses heartbeats or peer control work.
+enum SplitControlFrame {
+    Ping(Bytes),
+    Pong(Bytes),
+    Close,
+}
+
+async fn write_split_control<W, E>(
     sink: SharedSink<W, E>,
+    frame: SplitControlFrame,
+    cancel: CancellationToken,
+) -> (SplitControlFrame, Result<()>)
+where
+    W: AsyncWrite + Unpin,
+    E: SplitEncoder,
+{
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(Error::ConnectionClosed),
+        result = async {
+            let mut guard = sink.lock().await;
+            guard.write_frame(&cancel, |encoder, buf| {
+                match &frame {
+                    SplitControlFrame::Ping(payload) => encoder.encode_message(&Message::Ping(payload.clone()), buf),
+                    SplitControlFrame::Pong(payload) => { encoder.encode_pong(payload, buf); Ok(()) }
+                    SplitControlFrame::Close => { encoder.encode_close_response(buf); Ok(()) }
+                }
+            }).await
+        } => result,
+    };
+    (frame, result)
+}
+
+async fn split_writer_driver<S, E>(
+    transport: SplitTransport<S>,
+    sink: SharedSink<SplitTransport<S>, E>,
     config: Config,
     mut control_rx: mpsc::Receiver<ControlRequest>,
     shared: Arc<SplitShared>,
 ) where
-    W: AsyncWrite + Unpin,
+    S: AsyncWrite + Unpin,
     E: SplitEncoder,
 {
     let epoch = shared.epoch;
     let mut heartbeat = Heartbeat::new(&config, 0);
     let mut closing_deadline = None;
     let mut local_close_sent = false;
+    let mut peer_close = false;
+    let mut pending_pong = None;
+    let pending_write = None;
+    tokio::pin!(pending_write);
 
     // One timer for the whole connection: re-armed lazily when it fires or when
     // the deadline moves earlier, never per message.
@@ -1383,7 +1431,44 @@ async fn split_writer_driver<W, E>(
             heartbeat.on_inbound(observed_inbound, None);
         }
 
-        let heartbeat_deadline = heartbeat.next_deadline();
+        if pending_write.is_none() {
+            if peer_close {
+                if local_close_sent {
+                    // Include acquiring the sink in the shutdown bound, too.
+                    let _ = tokio::time::timeout(
+                        closing_deadline
+                            .unwrap_or_else(tokio::time::Instant::now)
+                            .saturating_duration_since(tokio::time::Instant::now()),
+                        async {
+                            let mut guard = sink.lock().await;
+                            guard.writer.flush().await?;
+                            guard.writer.shutdown().await
+                        },
+                    )
+                    .await;
+                    transport.close_with(|| shared.terminate(TerminalCause::ConnectionClosed));
+                    shared.cancel.cancel();
+                    break;
+                }
+                pending_write.set(Some(write_split_control(
+                    sink.clone(),
+                    SplitControlFrame::Close,
+                    shared.cancel.clone(),
+                )));
+            } else if let Some(payload) = pending_pong.take() {
+                pending_write.set(Some(write_split_control(
+                    sink.clone(),
+                    SplitControlFrame::Pong(payload),
+                    shared.cancel.clone(),
+                )));
+            }
+        }
+
+        let heartbeat_deadline = if pending_write.is_some() {
+            heartbeat.next_timeout()
+        } else {
+            heartbeat.next_deadline()
+        };
         if let Some(deadline) = heartbeat_deadline {
             let at = deadline.at();
             let rearm = match heartbeat_armed_ms {
@@ -1406,115 +1491,89 @@ async fn split_writer_driver<W, E>(
         tokio::select! {
             biased;
             _ = shared.cancel.cancelled() => {
-                shared.terminate(TerminalCause::ConnectionClosed);
+                transport.close_with(|| shared.terminate(TerminalCause::ConnectionClosed));
                 break;
             }
             request = control_rx.recv() => {
                 let Some(request) = request else {
-                    shared.terminate(TerminalCause::ConnectionClosed);
+                    transport.close_with(|| shared.terminate(TerminalCause::ConnectionClosed));
+                    shared.cancel.cancel();
                     break;
                 };
                 match request {
                     ControlRequest::Ping(payload, received_at) => {
-                        let received_ms =
-                            received_at.saturating_duration_since(epoch).as_millis() as u64;
-                        heartbeat.on_inbound(received_ms, None);
-                        let written = sink
-                            .lock()
-                            .await
-                            .write_frame(&shared.cancel, |encoder, buf| {
-                                encoder.encode_pong(&payload, buf);
-                                Ok(())
-                            })
-                            .await;
-                        if written.is_err() {
-                            shared.terminate(TerminalCause::ConnectionClosed);
-                            break;
-                        }
+                        heartbeat.on_inbound(received_at.saturating_duration_since(epoch).as_millis() as u64, None);
+                        // RFC 6455 allows replying only to the latest Ping when
+                        // earlier replies are still pending. Keep this bounded.
+                        pending_pong = Some(payload);
                     }
                     ControlRequest::Pong(payload, received_at) => {
-                        let received_ms =
-                            received_at.saturating_duration_since(epoch).as_millis() as u64;
+                        let received_ms = received_at.saturating_duration_since(epoch).as_millis() as u64;
                         heartbeat.on_inbound(received_ms, Some(&payload));
                     }
                     ControlRequest::PeerClose => {
                         heartbeat.stop();
-                        let mut guard = sink.lock().await;
-                        if !local_close_sent {
-                            let _ = guard
-                                .write_frame(&shared.cancel, |encoder, buf| {
-                                    encoder.encode_close_response(buf);
-                                    Ok(())
-                                })
-                                .await;
-                        }
-                        let _ = bounded_shutdown(&mut guard.writer, config.close_timeout).await;
-                        drop(guard);
-                        shared.terminate(TerminalCause::ConnectionClosed);
-                        break;
+                        peer_close = true;
+                        closing_deadline.get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(config.close_timeout.into()));
                     }
                     ControlRequest::LocalCloseSent => {
                         heartbeat.stop();
                         local_close_sent = true;
-                        closing_deadline = Some(
-                            tokio::time::Instant::now()
-                                + Duration::from_secs(config.close_timeout.into()),
-                        );
+                        closing_deadline.get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(config.close_timeout.into()));
                     }
                     ControlRequest::Eof => {
                         heartbeat.stop();
-                        shared.terminate(TerminalCause::ConnectionClosed);
+                        transport.close_with(|| shared.terminate(TerminalCause::ConnectionClosed));
+                        shared.cancel.cancel();
                         break;
                     }
                 }
             }
             _ = tokio::time::sleep(close_delay), if closing_deadline.is_some() => {
-                let _ = bounded_shutdown(&mut sink.lock().await.writer, config.close_timeout).await;
-                shared.terminate(TerminalCause::ConnectionClosed);
+                // A writer may own a partial frame. Do not wait for its lock or
+                // append a Close frame to that unfinished payload.
+                transport.close_with(|| shared.terminate(TerminalCause::ConnectionClosed));
+                shared.cancel.cancel();
                 break;
             }
             _ = &mut heartbeat_sleep, if heartbeat_deadline.is_some() && shared.is_open() => {
+                // Activity can arrive while this select is parked on the timer.
+                let observed_inbound = shared.last_inbound_ms.load(Ordering::Relaxed);
+                if observed_inbound > last_synced_inbound_ms {
+                    last_synced_inbound_ms = observed_inbound;
+                    heartbeat.on_inbound(observed_inbound, None);
+                }
                 let now_ms = epoch.elapsed().as_millis() as u64;
-                match heartbeat.next_deadline() {
-                    Some(Deadline::Ping(at)) if at <= now_ms => {
+                match if pending_write.is_some() { heartbeat.next_timeout() } else { heartbeat.next_deadline() } {
+                    Some(Deadline::Ping(at)) if at <= now_ms && pending_write.is_none() => {
                         if let Some(payload) = heartbeat.ping_due(now_ms) {
-                            let written = sink
-                                .lock()
-                                .await
-                                .write_frame(&shared.cancel, |encoder, buf| {
-                                    encoder.encode_message(&Message::Ping(payload), buf)
-                                })
-                                .await;
-                            if written.is_err() {
-                                shared.terminate(TerminalCause::ConnectionClosed);
-                                break;
-                            }
-                            heartbeat.ping_flushed(epoch.elapsed().as_millis() as u64);
+                            pending_write.set(Some(write_split_control(sink.clone(), SplitControlFrame::Ping(payload), shared.cancel.clone())));
                         }
                     }
                     Some(Deadline::Pong(at)) if at <= now_ms => {
-                        timeout_close(
-                            &sink,
-                            &config,
-                            config.pong_timeout_close_code,
-                            &config.pong_timeout_close_reason,
-                            &shared.cancel,
-                        ).await;
-                        shared.terminate(TerminalCause::HeartbeatTimeout);
+                        timeout_close(&transport, &sink, &config, config.pong_timeout_close_code, &config.pong_timeout_close_reason, &shared, TerminalCause::HeartbeatTimeout).await;
                         break;
                     }
                     Some(Deadline::Idle(at)) if at <= now_ms => {
-                        timeout_close(
-                            &sink,
-                            &config,
-                            CloseReason::GOING_AWAY,
-                            "Connection idle timeout",
-                            &shared.cancel,
-                        ).await;
-                        shared.terminate(TerminalCause::IdleTimeout);
+                        timeout_close(&transport, &sink, &config, CloseReason::GOING_AWAY, "Connection idle timeout", &shared, TerminalCause::IdleTimeout).await;
                         break;
                     }
                     _ => {}
+                }
+            }
+            (frame, result) = async { pending_write.as_mut().as_pin_mut().unwrap().await }, if pending_write.is_some() => {
+                pending_write.set(None);
+                if result.is_err() {
+                    transport.close_with(|| shared.terminate(TerminalCause::ConnectionClosed));
+                    shared.cancel.cancel();
+                    break;
+                }
+                match frame {
+                    SplitControlFrame::Ping(_) => {
+                        heartbeat.ping_flushed(epoch.elapsed().as_millis() as u64);
+                    },
+                    SplitControlFrame::Close => local_close_sent = true,
+                    SplitControlFrame::Pong(_) => {}
                 }
             }
         }
@@ -1539,37 +1598,36 @@ where
     }
 }
 
-async fn bounded_shutdown<W>(writer: &mut W, seconds: u32) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    tokio::time::timeout(Duration::from_secs(seconds.into()), async {
-        writer.flush().await?;
-        writer.shutdown().await
-    })
-    .await
-    .map_err(|_| Error::ConnectionClosed)?
-    .map_err(Into::into)
-}
-
-async fn timeout_close<W, E>(
-    sink: &SharedSink<W, E>,
+async fn timeout_close<S, E>(
+    transport: &SplitTransport<S>,
+    sink: &SharedSink<SplitTransport<S>, E>,
     config: &Config,
     code: u16,
     reason: &str,
-    cancel: &CancellationToken,
+    shared: &SplitShared,
+    cause: TerminalCause,
 ) where
-    W: AsyncWrite + Unpin,
+    S: AsyncWrite + Unpin,
     E: SplitEncoder,
 {
-    let mut guard = sink.lock().await;
-    let close = Message::Close(Some(CloseReason::new(code, bounded_close_reason(reason))));
-    let _ = tokio::time::timeout(
-        Duration::from_secs(config.close_timeout.into()),
-        guard.write_frame(cancel, |encoder, buf| encoder.encode_message(&close, buf)),
-    )
-    .await;
-    let _ = bounded_shutdown(&mut guard.writer, config.close_timeout).await;
+    if let Ok(mut guard) = sink.try_lock() {
+        let close = Message::Close(Some(CloseReason::new(code, bounded_close_reason(reason))));
+        let _ = tokio::time::timeout(Duration::from_secs(config.close_timeout.into()), async {
+            guard
+                .write_frame(&shared.cancel, |encoder, buf| {
+                    encoder.encode_message(&close, buf)
+                })
+                .await?;
+            guard.writer.flush().await?;
+            guard.writer.shutdown().await?;
+            Ok::<(), Error>(())
+        })
+        .await;
+    }
+    // Release the transport and publish its typed cause before waking either handle.
+    transport.close_with(|| shared.terminate(cause));
+    // A held sink may contain a partial frame. Cancel it without appending Close.
+    shared.cancel.cancel();
 }
 
 // ============================================================================
@@ -2155,7 +2213,7 @@ where
 #[cfg(feature = "permessage-deflate")]
 pub struct CompressedSplitReader<S> {
     /// Read half of the underlying stream
-    reader: ReadHalf<S>,
+    reader: SplitTransport<S>,
     /// Protocol for decoding with decompression
     protocol: crate::protocol::CompressedReaderProtocol,
     /// Read buffer
@@ -2175,7 +2233,7 @@ pub struct CompressedSplitReader<S> {
 /// completely independently from the read half.
 #[cfg(feature = "permessage-deflate")]
 pub struct CompressedSplitWriter<S> {
-    core: SplitWriterCore<WriteHalf<S>, crate::protocol::CompressedWriterProtocol>,
+    core: SplitWriterCore<SplitTransport<S>, crate::protocol::CompressedWriterProtocol>,
 }
 
 #[cfg(feature = "permessage-deflate")]
@@ -2224,8 +2282,9 @@ where
     /// writer.send(Message::Text("Hello".into())).await?;
     /// ```
     pub fn split(self) -> (CompressedSplitReader<S>, CompressedSplitWriter<S>) {
-        // Split the underlying transport at the OS level
-        let (reader, writer) = tokio::io::split(self.inner);
+        // Share the transport so the driver can release it while handles live
+        let (reader, writer) = SplitTransport::pair(self.inner);
+        let transport = reader.clone();
 
         let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
         let shared = SplitShared::new(self.state != StreamState::Open);
@@ -2242,6 +2301,7 @@ where
         )));
 
         tokio::spawn(split_writer_driver(
+            transport,
             sink.clone(),
             self.config,
             control_rx,
