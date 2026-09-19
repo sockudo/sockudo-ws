@@ -376,6 +376,10 @@ impl AsyncRead for UpgradedStream {
 }
 
 impl AsyncWrite for UpgradedStream {
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -683,8 +687,19 @@ impl Sink<Message> for WebSocket {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/vectored.rs"]
+mod vectored_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upgraded_stream_preserves_vectored_capability_and_partial_writes() {
+        vectored_tests::check_vectored_forwarding(|inner| UpgradedStream {
+            inner: Box::new(inner),
+        });
+    }
 
     #[test]
     fn test_accept_key() {
