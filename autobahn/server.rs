@@ -93,7 +93,7 @@ async fn handle_connection(mut stream: TcpStream) -> Result<()> {
                     println!("Client requested extensions: {}", ext);
                 }
                 // Parse the offers and accept the first one compatible with our policy.
-                if let Some(negotiation) = negotiate_server_deflate(ext, &DeflateConfig::default())
+                if let Some(negotiation) = negotiate_server_deflate(&ext, &DeflateConfig::default())
                 {
                     let resp = Some(negotiation.to_response_header());
                     deflate_config = Some(negotiation.config);

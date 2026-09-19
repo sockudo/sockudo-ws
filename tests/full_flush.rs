@@ -2,7 +2,7 @@
 use sockudo_ws::deflate::DeflateEncoder;
 #[test]
 fn no_takeover_messages_decode_with_fresh_peer_contexts() {
-    let mut encoder = DeflateEncoder::new(15, true, 6, 0);
+    let mut encoder = DeflateEncoder::new(sockudo_ws::deflate::DeflateWindowBits::Bits15, true, 6, 0);
     for payload in [
         b"repeat one ".repeat(1000),
         b"repeat two ".repeat(300),
