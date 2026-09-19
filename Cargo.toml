@@ -309,3 +309,33 @@ strip = true
 opt-level = 3
 lto = "thin"
 debug = true
+
+[[bench]]
+name = "stream_bench"
+harness = false
+required-features = ["tokio-runtime"]
+
+[[bench]]
+name = "split_delivery_bench"
+harness = false
+required-features = ["tokio-runtime"]
+
+[[bench]]
+name = "send_latency_bench"
+harness = false
+required-features = ["tokio-runtime"]
+
+[[bench]]
+name = "batch_latency_bench"
+harness = false
+required-features = ["tokio-runtime"]
+
+[[bench]]
+name = "pending_write_bench"
+harness = false
+required-features = ["tokio-runtime"]
+
+[[bench]]
+name = "receive_state_bench"
+harness = false
+required-features = ["tokio-runtime"]
