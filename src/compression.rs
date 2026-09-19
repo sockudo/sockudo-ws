@@ -262,6 +262,11 @@ impl SharedCompressorPool {
 
     /// Compress data using a pooled encoder
     pub fn compress(&self, data: &[u8]) -> Result<Option<Bytes>> {
+        // Check threshold before selecting or locking an encoder, including split sends.
+        if data.len() < self.inner.config.compression_threshold {
+            return Ok(None);
+        }
+
         let encoders = if self.is_server {
             &self.inner.server
         } else {
@@ -321,6 +326,10 @@ fn shared_pool_for_config(config: &DeflateConfig) -> Arc<SharedCompressorPool> {
     pools.insert(config.clone(), Arc::downgrade(&pool.inner));
     pool
 }
+
+#[cfg(test)]
+#[path = "compression/threshold_tests.rs"]
+mod threshold_tests;
 
 #[cfg(test)]
 mod tests {
