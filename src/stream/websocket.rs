@@ -1224,6 +1224,7 @@ where
     /// Ping and Pong frames remain visible after their automatic state-machine
     /// processing. A terminal heartbeat/idle cause is yielded once as an error.
     pub async fn next(&mut self) -> Option<Result<Message>> {
+        tokio::task::consume_budget().await;
         loop {
             if self.terminal_reported {
                 return None;
@@ -2453,6 +2454,7 @@ where
     /// Returns `None` when the connection is closed.
     /// This method NEVER blocks the writer - true concurrent I/O!
     pub async fn next(&mut self) -> Option<Result<Message>> {
+        tokio::task::consume_budget().await;
         loop {
             if self.terminal_reported {
                 return None;
