@@ -46,6 +46,29 @@ pub use ::compio::net;
 /// Re-exported Compio runtime utilities for users of `compio-runtime`.
 pub use ::compio::runtime;
 
+// Compio has no task-wide cooperative budget. Bound each reader's ready burst.
+const READ_BURST_LIMIT: usize = 32;
+
+async fn consume_read_budget(budget: &mut usize) {
+    if *budget == 0 {
+        // Reset before yielding so cancelling next() does not repeatedly stall
+        // delivery of the same buffered message.
+        *budget = READ_BURST_LIMIT;
+        let mut yielded = false;
+        std::future::poll_fn(|cx| {
+            if yielded {
+                std::task::Poll::Ready(())
+            } else {
+                yielded = true;
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+    }
+    *budget -= 1;
+}
+
 const DEFAULT_HIGH_WATER_MARK: usize = 64 * 1024;
 const DEFAULT_LOW_WATER_MARK: usize = 16 * 1024;
 const MAX_HEADER_SIZE: usize = 8192;
@@ -1160,6 +1183,7 @@ pub struct CompioWebSocketStream<S> {
     state: CompioStreamState,
     config: Config,
     pending_messages: Vec<Message>,
+    read_budget: usize,
     clock_epoch: Instant,
     heartbeat: Heartbeat,
     high_water_mark: usize,
@@ -1197,6 +1221,7 @@ where
             state: CompioStreamState::Open,
             config,
             pending_messages: Vec::new(),
+            read_budget: READ_BURST_LIMIT,
             clock_epoch,
             heartbeat,
             high_water_mark: DEFAULT_HIGH_WATER_MARK,
@@ -1286,6 +1311,7 @@ where
 
     /// Receive the next WebSocket message.
     pub async fn next(&mut self) -> Option<Result<Message>> {
+        consume_read_budget(&mut self.read_budget).await;
         loop {
             if self.state == CompioStreamState::Closed {
                 return None;
@@ -1536,6 +1562,7 @@ where
                 protocol: reader_protocol,
                 read_buf: self.read_buf,
                 pending_messages: self.pending_messages,
+                read_budget: self.read_budget,
                 control_tx,
                 terminal_rx,
                 cancel_tx: cancel_tx.clone(),
@@ -1631,6 +1658,7 @@ pub struct CompioSplitReader<R> {
     protocol: Protocol,
     read_buf: BytesMut,
     pending_messages: Vec<Message>,
+    read_budget: usize,
     control_tx: mpsc::Sender<ControlRequest>,
     terminal_rx: mpsc::UnboundedReceiver<CompioTerminalCause>,
     cancel_tx: mpsc::UnboundedSender<()>,
@@ -1652,6 +1680,7 @@ where
 {
     /// Receive the next message, including Ping and Pong control frames.
     pub async fn next(&mut self) -> Option<Result<Message>> {
+        consume_read_budget(&mut self.read_budget).await;
         loop {
             if self.shared.status.get() == SPLIT_CLOSED {
                 if self.terminal_reported {
@@ -2138,6 +2167,7 @@ pub struct CompioCompressedWebSocketStream<S> {
     state: CompioStreamState,
     config: Config,
     pending_messages: Vec<Message>,
+    read_budget: usize,
     clock_epoch: Instant,
     heartbeat: Heartbeat,
     high_water_mark: usize,
@@ -2180,6 +2210,7 @@ where
             state: CompioStreamState::Open,
             config,
             pending_messages: Vec::new(),
+            read_budget: READ_BURST_LIMIT,
             clock_epoch,
             heartbeat,
             high_water_mark: DEFAULT_HIGH_WATER_MARK,
@@ -2218,6 +2249,7 @@ where
             state: CompioStreamState::Open,
             config,
             pending_messages: Vec::new(),
+            read_budget: READ_BURST_LIMIT,
             clock_epoch,
             heartbeat,
             high_water_mark: DEFAULT_HIGH_WATER_MARK,
@@ -2227,6 +2259,7 @@ where
 
     /// Receive the next WebSocket message.
     pub async fn next(&mut self) -> Option<Result<Message>> {
+        consume_read_budget(&mut self.read_budget).await;
         loop {
             if self.state == CompioStreamState::Closed {
                 return None;
@@ -2499,6 +2532,7 @@ where
                 protocol: reader_protocol,
                 read_buf: self.read_buf,
                 pending_messages: self.pending_messages,
+                read_budget: self.read_budget,
                 control_tx,
                 terminal_rx,
                 cancel_tx: cancel_tx.clone(),
@@ -2522,6 +2556,7 @@ pub struct CompioCompressedSplitReader<R> {
     protocol: CompressedReaderProtocol,
     read_buf: BytesMut,
     pending_messages: Vec<Message>,
+    read_budget: usize,
     control_tx: mpsc::Sender<ControlRequest>,
     terminal_rx: mpsc::UnboundedReceiver<CompioTerminalCause>,
     cancel_tx: mpsc::UnboundedSender<()>,
@@ -2545,6 +2580,7 @@ where
 {
     /// Receive the next non-control message.
     pub async fn next(&mut self) -> Option<Result<Message>> {
+        consume_read_budget(&mut self.read_budget).await;
         loop {
             if self.shared.status.get() == SPLIT_CLOSED {
                 if self.terminal_reported {
