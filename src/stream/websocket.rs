@@ -563,6 +563,11 @@ where
             }
 
             // First, return any pending messages
+            if !self.pending_messages.is_empty() {
+                // Already-buffered messages do not otherwise poll cooperative I/O.
+                let budget = std::task::ready!(tokio::task::coop::poll_proceed(cx));
+                budget.made_progress();
+            }
             if let Some(msg) = self.as_mut().get_mut().next_pending_message() {
                 let this = self.as_mut().get_mut();
                 let now = this.clock_epoch.elapsed().as_millis() as u64;
@@ -1166,6 +1171,7 @@ where
     /// Ping and Pong frames remain visible after their automatic state-machine
     /// processing. A terminal heartbeat/idle cause is yielded once as an error.
     pub async fn next(&mut self) -> Option<Result<Message>> {
+        tokio::task::coop::consume_budget().await;
         loop {
             if let Some(result) = self.take_terminal() {
                 return result;
@@ -1953,6 +1959,11 @@ where
                 }
             }
 
+            if !self.pending_messages.is_empty() {
+                // Already-buffered messages do not otherwise poll cooperative I/O.
+                let budget = std::task::ready!(tokio::task::coop::poll_proceed(cx));
+                budget.made_progress();
+            }
             if let Some(msg) = self.as_mut().get_mut().next_pending_message() {
                 let this = self.as_mut().get_mut();
                 let now = this.clock_epoch.elapsed().as_millis() as u64;
@@ -2252,6 +2263,7 @@ where
     /// Returns `None` when the connection is closed.
     /// This method NEVER blocks the writer - true concurrent I/O!
     pub async fn next(&mut self) -> Option<Result<Message>> {
+        tokio::task::coop::consume_budget().await;
         loop {
             if let Some(result) = self.take_terminal() {
                 return result;
