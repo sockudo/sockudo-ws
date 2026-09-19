@@ -261,7 +261,9 @@ where
         self.low_water_mark
     }
 
-    /// Send a close frame
+    /// Send a close frame and shut down the transport write half.
+    ///
+    /// The read half remains available for the peer's closing response.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         if self.state != StreamState::Open {
             return Ok(());
@@ -274,6 +276,8 @@ where
 
         // Flush the close frame
         self.flush_write_buf().await?;
+        // Finish the send half so multiplexed transports retain queued frames.
+        self.inner.shutdown().await?;
         Ok(())
     }
 
@@ -1665,7 +1669,9 @@ where
         self.write_buf.pending_bytes()
     }
 
-    /// Send a close frame
+    /// Send a close frame and shut down the transport write half.
+    ///
+    /// The read half remains available for the peer's closing response.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         if self.state != StreamState::Open {
             return Ok(());
@@ -1677,6 +1683,8 @@ where
         self.state = StreamState::CloseSent;
 
         self.flush_write_buf().await?;
+        // Finish the send half so multiplexed transports retain queued frames.
+        self.inner.shutdown().await?;
         Ok(())
     }
 

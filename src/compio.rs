@@ -1427,14 +1427,19 @@ where
         self.send(Message::Binary(data)).await
     }
 
-    /// Send a close frame.
+    /// Send a close frame and shut down the transport write half.
+    ///
+    /// The read half remains available for the peer's closing response.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         if self.state != CompioStreamState::Open {
             return Ok(());
         }
 
         self.send(Message::Close(Some(CloseReason::new(code, reason))))
-            .await
+            .await?;
+        // Finish the send half so multiplexed transports retain queued frames.
+        self.inner.shutdown().await?;
+        Ok(())
     }
 
     /// Flush pending writes to the underlying Compio stream.
@@ -2367,14 +2372,19 @@ where
         self.send(Message::Binary(data)).await
     }
 
-    /// Send a close frame.
+    /// Send a close frame and shut down the transport write half.
+    ///
+    /// The read half remains available for the peer's closing response.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         if self.state != CompioStreamState::Open {
             return Ok(());
         }
 
         self.send(Message::Close(Some(CloseReason::new(code, reason))))
-            .await
+            .await?;
+        // Finish the send half so multiplexed transports retain queued frames.
+        self.inner.shutdown().await?;
+        Ok(())
     }
 
     /// Flush pending writes.
