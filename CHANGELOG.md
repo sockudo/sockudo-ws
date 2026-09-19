@@ -9,7 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Encoded pending-output limits are now enforced and BufferFull is terminal rather than retryable. The default outbound limit is 1 MiB, independently of the inbound message limit.
+- `max_backpressure` now applies queued-write backpressure before the Tokio Sink
+  accepts another message. A single message may exceed the threshold; split and
+  Compio sends retain large-message compatibility and do not apply a size cap.
 
 - Outbound frames are coalesced across `send()` calls while inbound messages
   that were already parsed are still queued for the application

@@ -1,97 +1,102 @@
 #![cfg(feature = "tokio-runtime")]
 
-use futures_util::SinkExt;
-use sockudo_ws::{Config, Error, Message, WebSocketStream};
+use futures_util::{SinkExt, StreamExt};
+use sockudo_ws::{Config, Message, WebSocketStream};
+use tokio::io::AsyncReadExt;
 
-#[tokio::test]
-async fn exceeding_pending_byte_limit_terminates_unified_writes() {
-    let (io, _peer) = tokio::io::duplex(1024);
-    let mut ws = WebSocketStream::server(io, Config::builder().max_backpressure(16).build());
-    ws.feed(Message::binary(vec![1; 8])).await.unwrap();
-    let result = ws.feed(Message::binary(vec![2; 8])).await;
-    assert!(matches!(result, Err(Error::BufferFull)));
-    assert!(matches!(ws.flush().await, Err(Error::ConnectionClosed)));
+macro_rules! queued_threshold_case {
+    ($name:ident, $make:expr) => {
+        #[tokio::test]
+        async fn $name() {
+            for threshold in [0, 10] {
+                let (io, mut peer) = tokio::io::duplex(1);
+                let config = Config::builder().max_backpressure(threshold).build();
+                let mut ws = ($make)(io, config);
+                // One 10-byte frame may reach or exceed the soft threshold.
+                ws.feed(Message::Ping(bytes::Bytes::from_static(&[1; 8])))
+                    .await
+                    .unwrap();
+                let next = ws.feed(Message::Ping(bytes::Bytes::from_static(&[2; 8])));
+                let mut next = std::pin::pin!(next);
+                assert!(futures_util::poll!(next.as_mut()).is_pending());
+                let mut wire = [0; 10];
+                let (sent, read) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(next, peer.read_exact(&mut wire))
+                })
+                .await
+                .unwrap();
+                sent.unwrap();
+                read.unwrap();
+                assert_eq!(wire, [0x89, 8, 1, 1, 1, 1, 1, 1, 1, 1]);
+            }
+        }
+    };
 }
-
+queued_threshold_case!(
+    unified_waits_for_queued_bytes_to_drain,
+    WebSocketStream::server
+);
 #[cfg(feature = "permessage-deflate")]
-#[tokio::test]
-async fn exceeding_pending_byte_limit_terminates_compressed_writes() {
-    use sockudo_ws::{CompressedWebSocketStream, deflate::DeflateConfig};
-    let (io, _peer) = tokio::io::duplex(1024);
-    let mut ws = CompressedWebSocketStream::server(
-        io,
-        Config::builder().max_backpressure(16).build(),
-        DeflateConfig::default(),
-    );
-    ws.feed(Message::Ping(bytes::Bytes::from_static(&[1; 8])))
-        .await
-        .unwrap();
-    let result = ws
-        .feed(Message::Ping(bytes::Bytes::from_static(&[2; 8])))
-        .await;
-    assert!(matches!(result, Err(Error::BufferFull)));
-    assert!(matches!(ws.flush().await, Err(Error::ConnectionClosed)));
-}
+queued_threshold_case!(compressed_waits_for_queued_bytes_to_drain, |io, config| {
+    sockudo_ws::CompressedWebSocketStream::server(io, config, sockudo_ws::DeflateConfig::default())
+});
 
-#[tokio::test]
-async fn oversized_split_frame_fails_before_writing() {
-    let (io, _peer) = tokio::io::duplex(1024);
-    let (_reader, mut writer) =
-        WebSocketStream::server(io, Config::builder().max_backpressure(16).build()).split();
-    let result = writer.send(Message::binary(vec![1; 32])).await;
-    assert!(matches!(result, Err(Error::BufferFull)));
-    assert!(writer.is_closed());
+macro_rules! large_message_case {
+    ($name:ident, $make:expr) => {
+        #[tokio::test]
+        async fn $name() {
+            let (io, peer) = tokio::io::duplex(4096);
+            let (mut writer, _guard) = ($make)(io);
+            let mut reader = WebSocketStream::client(peer, Config::default());
+            let payload = bytes::Bytes::from(vec![1; 2 * 1024 * 1024]);
+            let send = async {
+                writer.send(Message::Binary(payload.clone())).await.unwrap();
+                writer.send(Message::binary(vec![2])).await.unwrap();
+            };
+            let receive = async {
+                assert!(matches!(reader.next().await.unwrap().unwrap(), Message::Binary(data) if data == payload));
+                assert!(matches!(reader.next().await.unwrap().unwrap(), Message::Binary(data) if data.as_ref() == [2]));
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(send, receive);
+            }).await.unwrap();
+        }
+    };
 }
-
-#[tokio::test]
-async fn zero_copy_payloads_count_toward_the_encoded_limit() {
-    let size = sockudo_ws::cork::ZERO_COPY_MIN;
-    let (io, mut peer) = tokio::io::duplex(1024);
-    let mut ws = WebSocketStream::server(io, Config::builder().max_backpressure(size).build());
-    assert!(matches!(
-        ws.feed(Message::binary(vec![1; size])).await,
-        Err(Error::BufferFull)
-    ));
-    assert!(matches!(ws.flush().await, Err(Error::ConnectionClosed)));
-    let mut byte = [0];
-    use tokio::io::AsyncReadExt;
-    let read = std::pin::pin!(peer.read(&mut byte));
-    assert!(futures_util::poll!(read).is_pending());
-}
-
-#[tokio::test]
-async fn an_encoded_frame_exactly_at_the_limit_is_accepted() {
-    let (io, mut peer) = tokio::io::duplex(64);
-    let mut ws = WebSocketStream::server(io, Config::builder().max_backpressure(10).build());
-    ws.send(Message::binary(vec![1; 8])).await.unwrap();
-    let mut wire = [0; 10];
-    use tokio::io::AsyncReadExt;
-    peer.read_exact(&mut wire).await.unwrap();
-    assert_eq!(&wire[..2], &[0x82, 8]);
-    assert_eq!(&wire[2..], &[1; 8]);
-}
-
+large_message_case!(unified_preserves_default_large_message_sends, |io| (
+    WebSocketStream::server(io, Config::default()),
+    ()
+));
+large_message_case!(split_preserves_default_large_message_sends, |io| {
+    let (reader, writer) = WebSocketStream::server(io, Config::default()).split();
+    (writer, reader)
+});
+// Keep the encoded frame above the threshold when testing compressed streams.
 #[cfg(feature = "permessage-deflate")]
-#[tokio::test]
-async fn oversized_compressed_split_frame_is_rejected() {
-    let (io, _peer) = tokio::io::duplex(64);
-    let (_reader, mut writer) = sockudo_ws::CompressedWebSocketStream::server(
+large_message_case!(compressed_preserves_default_large_message_sends, |io| (
+    sockudo_ws::CompressedWebSocketStream::server(
         io,
-        Config::builder().max_backpressure(8).build(),
-        sockudo_ws::DeflateConfig::default(),
-    )
-    .split();
-    assert!(matches!(
-        writer
-            .send(Message::Ping(bytes::Bytes::from_static(b"12345678")))
-            .await,
-        Err(Error::BufferFull)
-    ));
-    assert!(writer.is_closed());
-}
-
-#[test]
-fn encoded_buffer_limit_is_a_terminal_error() {
-    assert!(Error::BufferFull.is_fatal());
-    assert!(!Error::BufferFull.is_recoverable());
-}
+        Config::default(),
+        sockudo_ws::DeflateConfig {
+            compression_threshold: usize::MAX,
+            ..Default::default()
+        }
+    ),
+    ()
+));
+#[cfg(feature = "permessage-deflate")]
+large_message_case!(
+    compressed_split_preserves_default_large_message_sends,
+    |io| {
+        let (reader, writer) = sockudo_ws::CompressedWebSocketStream::server(
+            io,
+            Config::default(),
+            sockudo_ws::DeflateConfig {
+                compression_threshold: usize::MAX,
+                ..Default::default()
+            },
+        )
+        .split();
+        (writer, reader)
+    }
+);

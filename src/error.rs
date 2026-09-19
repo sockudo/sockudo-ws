@@ -27,7 +27,7 @@ pub enum Error {
     InvalidHttp(&'static str),
     /// Handshake failed
     HandshakeFailed(&'static str),
-    /// Encoded write buffer limit exceeded; the connection is terminal.
+    /// Buffer full (backpressure)
     BufferFull,
     /// Would block (non-blocking I/O)
     WouldBlock,
@@ -201,7 +201,6 @@ impl Error {
                 | Error::InvalidCloseCode(_)
                 | Error::HeartbeatTimeout
                 | Error::IdleTimeout
-                | Error::BufferFull
         )
     }
 
@@ -210,7 +209,7 @@ impl Error {
     /// Recoverable errors are transient and the operation may succeed if retried.
     #[inline]
     pub fn is_recoverable(&self) -> bool {
-        matches!(self, Error::WouldBlock)
+        matches!(self, Error::WouldBlock | Error::BufferFull)
     }
 
     /// Check if this error is a timeout
