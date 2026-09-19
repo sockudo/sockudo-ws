@@ -264,13 +264,59 @@ impl Default for IoUringConfig {
 // Compression
 // ============================================================================
 
+/// LZ77 window sizes supported by the configured compression backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum DeflateWindowBits {
+    /// 512-byte window.
+    Bits9 = 9,
+    /// 1KB window.
+    Bits10 = 10,
+    /// 2KB window.
+    Bits11 = 11,
+    /// 4KB window.
+    Bits12 = 12,
+    /// 8KB window.
+    Bits13 = 13,
+    /// 16KB window.
+    Bits14 = 14,
+    /// 32KB window.
+    Bits15 = 15,
+}
+
+impl TryFrom<u8> for DeflateWindowBits {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            9 => Ok(Self::Bits9),
+            10 => Ok(Self::Bits10),
+            11 => Ok(Self::Bits11),
+            12 => Ok(Self::Bits12),
+            13 => Ok(Self::Bits13),
+            14 => Ok(Self::Bits14),
+            15 => Ok(Self::Bits15),
+            _ => Err(Error::Compression(format!(
+                "unsupported deflate window bits {value}; backend supports 9-15"
+            ))),
+        }
+    }
+}
+
+impl From<DeflateWindowBits> for u8 {
+    fn from(value: DeflateWindowBits) -> Self {
+        value as Self
+    }
+}
+
 /// Compression mode for WebSocket connections (RFC 7692 permessage-deflate)
 ///
 /// This enum controls how compression is handled for WebSocket connections.
 ///
-/// Per RFC 7692, the LZ77 sliding window size is limited to 8-15 bits
-/// (256 bytes to 32KB). Larger windows provide better compression but
-/// use more memory per connection.
+/// Per RFC 7692, the LZ77 sliding window size is limited to 8-15 bits. The
+/// configured compression backend supports 9-15, so valid configurations start
+/// at a 512-byte window. Larger windows provide better compression but use more
+/// memory per connection.
 ///
 /// # Memory Usage per Connection
 ///
@@ -279,7 +325,6 @@ impl Default for IoUringConfig {
 /// | `Disabled` | No compression | - | - |
 /// | `Dedicated` | Per-connection compressor | 15 | 32KB |
 /// | `Shared` | Shared compressor pool | 15 | 32KB |
-/// | `Window256B` | Minimal memory | 8 | 256B |
 /// | `Window1KB` | 1KB sliding window | 10 | 1KB |
 /// | `Window2KB` | 2KB sliding window | 11 | 2KB |
 /// | `Window4KB` | 4KB sliding window | 12 | 4KB |
@@ -295,8 +340,6 @@ pub enum Compression {
     Dedicated,
     /// Shared compressor pool (32KB window, good for many connections)
     Shared,
-    /// 256 byte sliding window (window_bits=8, minimal memory)
-    Window256B,
     /// 1KB sliding window (window_bits=10)
     Window1KB,
     /// 2KB sliding window (window_bits=11)
@@ -332,18 +375,19 @@ impl Compression {
 
     /// Get the window bits for this compression mode
     ///
-    /// Returns the LZ77 window bits (8-15) for RFC 7692 compliance.
+    /// Returns the configured LZ77 window size, or `None` when disabled.
     #[inline]
-    pub fn window_bits(&self) -> u8 {
+    pub fn window_bits(&self) -> Option<DeflateWindowBits> {
         match self {
-            Compression::Disabled => 0,
-            Compression::Window256B => 8,
-            Compression::Window1KB => 10,
-            Compression::Window2KB => 11,
-            Compression::Window4KB => 12,
-            Compression::Window8KB => 13,
-            Compression::Window16KB => 14,
-            Compression::Dedicated | Compression::Shared | Compression::Window32KB => 15,
+            Compression::Disabled => None,
+            Compression::Window1KB => Some(DeflateWindowBits::Bits10),
+            Compression::Window2KB => Some(DeflateWindowBits::Bits11),
+            Compression::Window4KB => Some(DeflateWindowBits::Bits12),
+            Compression::Window8KB => Some(DeflateWindowBits::Bits13),
+            Compression::Window16KB => Some(DeflateWindowBits::Bits14),
+            Compression::Dedicated | Compression::Shared | Compression::Window32KB => {
+                Some(DeflateWindowBits::Bits15)
+            }
         }
     }
 
@@ -355,7 +399,6 @@ impl Compression {
     pub fn compression_threshold(&self) -> usize {
         match self {
             Compression::Disabled => usize::MAX,
-            Compression::Window256B => 128,
             Compression::Window1KB => 64,
             Compression::Window2KB => 48,
             Compression::Window4KB => 40,
@@ -377,7 +420,6 @@ impl Compression {
             self,
             Compression::Disabled
                 | Compression::Shared
-                | Compression::Window256B
                 | Compression::Window1KB
                 | Compression::Window2KB
         )
@@ -386,11 +428,7 @@ impl Compression {
     /// Convert to DeflateConfig
     #[cfg(feature = "permessage-deflate")]
     pub fn to_deflate_config(&self) -> Option<crate::deflate::DeflateConfig> {
-        if !self.is_enabled() {
-            return None;
-        }
-
-        let window_bits = self.window_bits();
+        let window_bits = self.window_bits()?;
         let no_context_takeover = !self.context_takeover();
 
         Some(crate::deflate::DeflateConfig {
@@ -399,10 +437,10 @@ impl Compression {
             server_no_context_takeover: no_context_takeover,
             client_no_context_takeover: no_context_takeover,
             compression_level: match self {
-                Compression::Window256B | Compression::Window1KB => 1, // Fast for small windows
-                Compression::Window2KB | Compression::Window4KB => 3,  // Balanced
+                Compression::Window1KB => 1, // Fast for small windows
+                Compression::Window2KB | Compression::Window4KB => 3, // Balanced
                 Compression::Window8KB | Compression::Window16KB => 5, // Good compression
-                _ => 6,                                                // Best for 32KB
+                _ => 6,                      // Best for 32KB
             },
             compression_threshold: self.compression_threshold(),
         })
