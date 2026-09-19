@@ -295,7 +295,7 @@ unsafe impl Send for RawInflateDecoder {}
 unsafe impl Sync for RawInflateDecoder {}
 
 impl RawInflateDecoder {
-    fn new(window_bits: u8) -> Self {
+    fn new(window_bits: DeflateWindowBits) -> Self {
         let mut stream = Box::new(z_stream::default());
         // A negative window size selects raw DEFLATE, as required by RFC 7692.
         // SAFETY: z_stream::default supplies the allocator callbacks required by
@@ -304,7 +304,7 @@ impl RawInflateDecoder {
         let status = unsafe {
             inflateInit2_(
                 &mut *stream,
-                -i32::from(window_bits),
+                -i32::from(u8::from(window_bits)),
                 zlibVersion(),
                 std::mem::size_of::<z_stream>() as i32,
             )
@@ -396,7 +396,7 @@ impl DeflateDecoder {
     /// Create a new decoder
     pub fn new(window_bits: DeflateWindowBits, no_context_takeover: bool) -> Self {
         // Use raw deflate (no zlib header) with the negotiated window_bits
-        let decompress = RawInflateDecoder::new(window_bits.into());
+        let decompress = RawInflateDecoder::new(window_bits);
 
         Self {
             decompress,
@@ -958,7 +958,48 @@ mod tests {
         let first = ctx.compress(msg).unwrap().unwrap();
         let second = ctx.compress(msg).unwrap().unwrap();
 
-        assert_eq!(first.len(), second.len());
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn test_no_context_takeover_outputs_decode_independently() {
+        let mut encoder = DeflateEncoder::new(MAX_WINDOW_BITS, true, 6, 0);
+        let payloads = [
+            b"first independently compressed message ".repeat(64),
+            b"second independently compressed message ".repeat(64),
+        ];
+
+        for payload in payloads {
+            let compressed = encoder.compress(&payload).unwrap().unwrap();
+            let mut decoder = DeflateDecoder::new(MAX_WINDOW_BITS, true);
+
+            assert_eq!(
+                decoder
+                    .decompress(&compressed, payload.len())
+                    .unwrap()
+                    .as_ref(),
+                payload
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_context_takeover_recovers_after_uncompressed_message() {
+        let mut encoder = DeflateEncoder::new(MAX_WINDOW_BITS, true, 6, 0);
+        let incompressible: Vec<_> = (0..=u8::MAX).collect();
+        assert!(encoder.compress(&incompressible).unwrap().is_none());
+
+        let payload = b"compressible message after an uncompressed message ".repeat(64);
+        let compressed = encoder.compress(&payload).unwrap().unwrap();
+        let mut decoder = DeflateDecoder::new(MAX_WINDOW_BITS, true);
+
+        assert_eq!(
+            decoder
+                .decompress(&compressed, payload.len())
+                .unwrap()
+                .as_ref(),
+            payload
+        );
     }
 
     #[test]

@@ -283,3 +283,15 @@ async fn pong_received_during_ping_flush_prevents_false_timeout() {
     assert!(futures_util::poll!(task.as_mut()).is_pending());
     assert!(peer.shared.terminal.get().is_none());
 }
+
+#[test]
+fn first_terminal_cause_survives_later_cleanup() {
+    let shared = CompioSplitShared::new(false, &Config::default());
+    shared.terminate(CompioTerminalCause::IdleTimeout);
+    shared.terminate(CompioTerminalCause::ConnectionClosed);
+
+    assert!(matches!(
+        shared.read_terminal(),
+        Some(Err(Error::IdleTimeout))
+    ));
+}

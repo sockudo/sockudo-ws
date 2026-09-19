@@ -423,3 +423,47 @@ async fn pending_reader_observes_timeout_after_transport_release() {
     let (_writer, result) = send.await.unwrap();
     assert!(matches!(result, Err(Error::IdleTimeout)));
 }
+
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
+#[tokio::test(start_paused = true)]
+async fn application_close_observes_its_deadline_while_blocked() {
+    let (io, _peer, gate) = connection(0);
+    let config = Config::builder()
+        .auto_ping(false)
+        .idle_timeout(0)
+        .close_timeout(1)
+        .build();
+    let (_reader, mut writer) = WebSocketStream::client(io, config).split();
+    let send = tokio::spawn(async move { writer.send(Message::Close(None)).await });
+    gate.blocked.notified().await;
+    tokio::time::advance(Duration::from_millis(1001)).await;
+    tokio::task::yield_now().await;
+    assert!(send.is_finished(), "blocked Close exceeded its budget");
+    assert!(matches!(send.await.unwrap(), Err(Error::ConnectionClosed)));
+    assert!(gate.dropped.load(Ordering::Relaxed));
+}
+
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
+#[tokio::test(start_paused = true)]
+async fn peer_close_bounds_an_existing_application_write() {
+    let (io, mut peer, gate) = connection(0);
+    let config = Config::builder()
+        .auto_ping(false)
+        .idle_timeout(0)
+        .close_timeout(1)
+        .build();
+    let (mut reader, mut writer) = WebSocketStream::client(io, config).split();
+    let send = tokio::spawn(async move { writer.send_text("blocked").await });
+    gate.blocked.notified().await;
+    peer.write_all(b"\x88\x00").await.unwrap();
+    assert!(matches!(reader.next().await, Some(Ok(Message::Close(_)))));
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(1001)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        send.is_finished(),
+        "peer Close did not bound the pending write"
+    );
+    assert!(matches!(send.await.unwrap(), Err(Error::ConnectionClosed)));
+    assert!(gate.dropped.load(Ordering::Relaxed));
+}

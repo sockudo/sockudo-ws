@@ -295,6 +295,25 @@ mod tests {
             .build();
         assert_eq!(Heartbeat::new(&zero_interval, 0).next_deadline(), None);
     }
+    #[test]
+    fn queued_pong_does_not_move_inactivity_backwards() {
+        let mut heartbeat = Heartbeat::new(&config(), 0);
+        let payload = heartbeat.ping_due(10_000).unwrap();
+        heartbeat.ping_flushed(10_000);
+        heartbeat.on_inbound(12_000, None);
+        assert!(heartbeat.on_inbound(11_000, Some(&payload)));
+        assert_eq!(heartbeat.next_deadline(), Some(Deadline::Ping(22_000)));
+    }
+
+    #[test]
+    fn pong_at_deadline_cannot_clear_outstanding_ping() {
+        let mut heartbeat = Heartbeat::new(&config(), 0);
+        let payload = heartbeat.ping_due(10_000).unwrap();
+        heartbeat.ping_flushed(10_000);
+        heartbeat.on_inbound(14_999, None);
+        assert!(!heartbeat.on_inbound(15_000, Some(&payload)));
+        assert_eq!(heartbeat.next_deadline(), Some(Deadline::Pong(15_000)));
+    }
 }
 
 #[cfg(test)]
@@ -312,6 +331,7 @@ mod deadline_order_test {
         assert!(heartbeat.ping_due(1000).is_some());
         heartbeat.ping_flushed(1000);
         assert_eq!(heartbeat.next_deadline(), Some(Deadline::Idle(2000)));
+        assert_eq!(heartbeat.next_timeout(), Some(Deadline::Idle(2000)));
     }
 }
 

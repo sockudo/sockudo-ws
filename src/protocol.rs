@@ -400,6 +400,7 @@ impl Protocol {
 
     /// Report accepted non-final data frames, which do not yield a message.
     /// Complete messages and control frames retain stream-level activity handling.
+    #[inline]
     pub(crate) fn process_into_with_activity(
         &mut self,
         buf: &mut BytesMut,
@@ -945,6 +946,7 @@ impl CompressedProtocol {
 
     /// Report accepted non-final data frames, which do not yield a message.
     /// Complete messages and control frames retain stream-level activity handling.
+    #[inline]
     pub(crate) fn process_into_with_activity(
         &mut self,
         buf: &mut BytesMut,
@@ -1294,6 +1296,7 @@ impl CompressedReaderProtocol {
 
     /// Report accepted non-final data frames, which do not yield a message.
     /// Complete messages and control frames retain stream-level activity handling.
+    #[inline]
     pub(crate) fn process_into_with_activity(
         &mut self,
         buf: &mut BytesMut,

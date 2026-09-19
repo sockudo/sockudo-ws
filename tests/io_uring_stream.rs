@@ -137,3 +137,25 @@ fn native_read_preserves_poll_read_ahead() {
         .unwrap();
     });
 }
+
+#[test]
+fn consuming_beyond_read_ahead_saturates_at_buffer_end() {
+    tokio_uring::start(async {
+        let listener = tokio_uring::net::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio_uring::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"AB".to_vec()).await.0.unwrap();
+        });
+        let stream = tokio_uring::net::TcpStream::connect(address).await.unwrap();
+        let mut adapter = UringStreamAdapter::new(UringStream::new(stream));
+        peer.await.unwrap();
+        let mut first = [0];
+        adapter.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, b"A");
+
+        adapter.consume(usize::MAX);
+
+        assert!(adapter.buffered_data().is_empty());
+    });
+}

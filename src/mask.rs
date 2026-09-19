@@ -47,7 +47,7 @@ fn generate_key_bytes_inner() -> [u8; 16] {
 #[cfg(all(feature = "rand_rng", not(feature = "fastrand")))]
 #[inline]
 fn generate_key_bytes_inner() -> [u8; 16] {
-    use rand::Rng;
+    use rand::RngExt;
     rand::rng().random()
 }
 
@@ -59,7 +59,7 @@ fn generate_key_bytes_inner() -> [u8; 16] {
 #[inline]
 fn generate_key_bytes_inner() -> [u8; 16] {
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).expect("getrandom failed");
+    getrandom::fill(&mut bytes).expect("getrandom failed");
     bytes
 }
 

@@ -47,8 +47,11 @@ mod tokio_http2_e2e {
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             WebSocketServer::<Http2>::new(Config::default())
+                .protocols(["superchat", "chat"])
+                .unwrap()
                 .serve(stream, |mut ws, req| async move {
                     assert_eq!(req.path, "/tokio-h2");
+                    assert_eq!(req.selected_subprotocol.as_deref(), Some("superchat"));
                     let msg = ws.next().await.unwrap().unwrap();
                     assert!(matches!(&msg, Message::Text(text) if text == "tokio-h2"));
                     ws.send(msg).await.unwrap();
@@ -63,7 +66,7 @@ mod tokio_http2_e2e {
             .connect(
                 stream,
                 &format!("https://localhost:{}/tokio-h2", addr.port()),
-                Some("sockudo.e2e"),
+                Some("chat, superchat"),
             )
             .await
             .unwrap();
@@ -123,10 +126,10 @@ mod tokio_http2_e2e {
 
 #[cfg(all(feature = "tokio-runtime", feature = "http3"))]
 mod tokio_http3_e2e {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use futures_util::{SinkExt, StreamExt};
-    use sockudo_ws::{Config, Http3, Message, WebSocketClient, WebSocketServer};
+    use sockudo_ws::{Config, Error, Http3, Message, WebSocketClient, WebSocketServer};
 
     fn server_endpoint(server_tls: rustls::ServerConfig) -> quinn::Endpoint {
         let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).unwrap();
@@ -135,16 +138,104 @@ mod tokio_http3_e2e {
     }
 
     #[tokio::test]
+    async fn bind_rejects_http3_idle_timeout_outside_quic_range() {
+        let (server_tls, _) = crate::h3_support::tls_configs();
+        let config = Config::builder().http3_idle_timeout(u64::MAX).build();
+
+        let result =
+            WebSocketServer::<Http3>::bind("127.0.0.1:0".parse().unwrap(), server_tls, config)
+                .await;
+
+        assert!(matches!(result, Err(Error::Http3(message)) if message.contains("idle timeout")));
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_http3_stream_window_outside_quic_range() {
+        let (server_tls, _) = crate::h3_support::tls_configs();
+        let config = Config::builder().http3_stream_window_size(u64::MAX).build();
+
+        let result =
+            WebSocketServer::<Http3>::bind("127.0.0.1:0".parse().unwrap(), server_tls, config)
+                .await;
+
+        assert!(matches!(result, Err(Error::Http3(message)) if message.contains("stream window")));
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_http3_udp_payload_below_quic_minimum() {
+        let (server_tls, _) = crate::h3_support::tls_configs();
+        let config = Config::builder().http3_max_udp_payload_size(1199).build();
+
+        let result =
+            WebSocketServer::<Http3>::bind("127.0.0.1:0".parse().unwrap(), server_tls, config)
+                .await;
+
+        assert!(matches!(result, Err(Error::Http3(message)) if message.contains("UDP payload")));
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_unsupported_http3_zero_rtt() {
+        let (server_tls, _) = crate::h3_support::tls_configs();
+        let config = Config::builder().http3_enable_0rtt(true).build();
+
+        let result =
+            WebSocketServer::<Http3>::bind("127.0.0.1:0".parse().unwrap(), server_tls, config)
+                .await;
+
+        assert!(matches!(result, Err(Error::Http3(message)) if message.contains("0-RTT")));
+    }
+
+    #[tokio::test]
+    async fn disabled_http3_extended_connect_rejects_websocket_requests() {
+        let (server_tls, client_tls) = crate::h3_support::tls_configs();
+        let endpoint = server_endpoint(server_tls);
+        let addr = endpoint.local_addr().unwrap();
+        let config = Config::builder()
+            .http3_enable_connect_protocol(false)
+            .build();
+        let server = WebSocketServer::<Http3>::from_endpoint(endpoint.clone(), config);
+
+        let server_task = tokio::spawn(async move {
+            server
+                .serve(|_, _| async move {
+                    panic!("disabled Extended CONNECT reached the WebSocket handler")
+                })
+                .await
+                .unwrap();
+        });
+
+        let client = WebSocketClient::<Http3>::new(Config::default());
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.connect(addr, "localhost", "/disabled", client_tls),
+        )
+        .await;
+
+        endpoint.close(quinn::VarInt::from_u32(0x100), b"done");
+        server_task.await.unwrap();
+
+        match result {
+            Ok(Err(Error::ExtendedConnectNotSupported)) => {}
+            Ok(Err(error)) => panic!("unexpected connection error: {error:?}"),
+            Ok(Ok(_)) => panic!("disabled Extended CONNECT established a WebSocket"),
+            Err(error) => panic!("connection attempt timed out: {error:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn websocket_over_http3_quic_e2e() {
         let (server_tls, client_tls) = crate::h3_support::tls_configs();
         let endpoint = server_endpoint(server_tls);
         let addr = endpoint.local_addr().unwrap();
-        let server = WebSocketServer::<Http3>::from_endpoint(endpoint.clone(), Config::default());
+        let server = WebSocketServer::<Http3>::from_endpoint(endpoint.clone(), Config::default())
+            .protocols(["superchat", "chat"])
+            .unwrap();
 
         let server_task = tokio::spawn(async move {
             server
                 .serve(|mut ws, req| async move {
                     assert_eq!(req.path, "/tokio-h3");
+                    assert_eq!(req.selected_subprotocol.as_deref(), Some("superchat"));
                     let msg = ws.next().await.unwrap().unwrap();
                     assert!(matches!(&msg, Message::Text(text) if text == "tokio-h3"));
                     ws.send(msg).await.unwrap();
@@ -155,7 +246,13 @@ mod tokio_http3_e2e {
 
         let client = WebSocketClient::<Http3>::new(Config::default());
         let mut ws = client
-            .connect(addr, "localhost", "/tokio-h3", client_tls)
+            .connect_with_protocol(
+                addr,
+                "localhost",
+                "/tokio-h3",
+                "chat, superchat",
+                client_tls,
+            )
             .await
             .unwrap();
 
@@ -254,7 +351,9 @@ mod compio_http1_e2e {
 #[cfg(all(feature = "compio-runtime", feature = "http2"))]
 mod compio_http2_e2e {
     use sockudo_ws::compio::net::{TcpListener, TcpStream};
-    use sockudo_ws::compio::{connect_http2, connect_http2_multiplexed, runtime, serve_http2};
+    use sockudo_ws::compio::{
+        connect_http2, connect_http2_multiplexed, runtime, serve_http2, serve_http2_with_protocols,
+    };
     use sockudo_ws::{Config, Message};
 
     #[compio::test]
@@ -264,12 +363,18 @@ mod compio_http2_e2e {
 
         let server_task = runtime::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            serve_http2(stream, Config::default(), |mut ws, req| async move {
-                assert_eq!(req.path, "/compio-h2");
-                let msg = ws.next().await.unwrap().unwrap();
-                assert!(matches!(&msg, Message::Text(text) if text == "compio-h2"));
-                ws.send(msg).await.unwrap();
-            })
+            serve_http2_with_protocols(
+                stream,
+                Config::default(),
+                ["superchat", "chat"],
+                |mut ws, req| async move {
+                    assert_eq!(req.path, "/compio-h2");
+                    assert_eq!(req.selected_subprotocol.as_deref(), Some("superchat"));
+                    let msg = ws.next().await.unwrap().unwrap();
+                    assert!(matches!(&msg, Message::Text(text) if text == "compio-h2"));
+                    ws.send(msg).await.unwrap();
+                },
+            )
             .await
             .unwrap();
         });
@@ -278,7 +383,7 @@ mod compio_http2_e2e {
         let mut ws = connect_http2(
             stream,
             &format!("https://localhost:{}/compio-h2", addr.port()),
-            Some("sockudo.e2e"),
+            Some("chat, superchat"),
             Config::default(),
         )
         .await
@@ -339,10 +444,12 @@ mod compio_http2_e2e {
 
 #[cfg(all(feature = "compio-runtime", feature = "http3"))]
 mod compio_http3_e2e {
+    use std::time::Duration;
+
     use sockudo_ws::compio::{
         CompioHttp3Server, connect_http3, connect_http3_multiplexed, runtime,
     };
-    use sockudo_ws::{Config, Message};
+    use sockudo_ws::{Config, Error, Message};
 
     async fn server_endpoint(server_tls: rustls::ServerConfig) -> compio::quic::Endpoint {
         compio::quic::ServerBuilder::new_with_rustls_server_config(server_tls)
@@ -353,16 +460,62 @@ mod compio_http3_e2e {
     }
 
     #[compio::test]
+    async fn disabled_http3_extended_connect_rejects_websocket_requests() {
+        let (server_tls, client_tls) = crate::h3_support::tls_configs();
+        let endpoint = server_endpoint(server_tls).await;
+        let addr = endpoint.local_addr().unwrap();
+        let config = Config::builder()
+            .http3_enable_connect_protocol(false)
+            .build();
+        let server = CompioHttp3Server::from_endpoint(endpoint.clone(), config);
+
+        let server_task = runtime::spawn(async move {
+            server
+                .serve(|_, _| async move {
+                    panic!("disabled Extended CONNECT reached the WebSocket handler")
+                })
+                .await
+                .unwrap();
+        });
+
+        let result = compio::time::timeout(
+            Duration::from_secs(2),
+            connect_http3(
+                addr,
+                "localhost",
+                "/disabled",
+                None,
+                client_tls,
+                Config::default(),
+            ),
+        )
+        .await;
+
+        endpoint.close(compio::quic::VarInt::from_u32(0x100), b"done");
+        server_task.await.unwrap();
+
+        match result {
+            Ok(Err(Error::ExtendedConnectNotSupported)) => {}
+            Ok(Err(error)) => panic!("unexpected connection error: {error:?}"),
+            Ok(Ok(_)) => panic!("disabled Extended CONNECT established a WebSocket"),
+            Err(error) => panic!("connection attempt timed out: {error:?}"),
+        }
+    }
+
+    #[compio::test]
     async fn websocket_over_http3_quic_e2e() {
         let (server_tls, client_tls) = crate::h3_support::tls_configs();
         let endpoint = server_endpoint(server_tls).await;
         let addr = endpoint.local_addr().unwrap();
-        let server = CompioHttp3Server::from_endpoint(endpoint.clone(), Config::default());
+        let server = CompioHttp3Server::from_endpoint(endpoint.clone(), Config::default())
+            .protocols(["superchat", "chat"])
+            .unwrap();
 
         let server_task = runtime::spawn(async move {
             server
                 .serve(|mut ws, req| async move {
                     assert_eq!(req.path, "/compio-h3");
+                    assert_eq!(req.selected_subprotocol.as_deref(), Some("superchat"));
                     let msg = ws.next().await.unwrap().unwrap();
                     assert!(matches!(&msg, Message::Text(text) if text == "compio-h3"));
                     ws.send(msg).await.unwrap();
@@ -375,7 +528,7 @@ mod compio_http3_e2e {
             addr,
             "localhost",
             "/compio-h3",
-            Some("sockudo.e2e"),
+            Some("chat, superchat"),
             client_tls,
             Config::default(),
         )

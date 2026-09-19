@@ -3405,6 +3405,36 @@ mod tests {
     }
 
     #[compio::test]
+    async fn compio_server_selects_supported_subprotocol() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = ::compio::runtime::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (_ws, handshake) =
+                accept_async_with_protocols(stream, Config::default(), ["superchat", "chat"])
+                    .await
+                    .unwrap();
+            handshake
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (_client, handshake) = connect_async(
+            stream,
+            &addr.to_string(),
+            "/chat",
+            Some("chat, superchat"),
+            Config::default(),
+        )
+        .await
+        .unwrap();
+        let server_handshake = server.await.unwrap();
+
+        assert_eq!(handshake.protocol.as_deref(), Some("superchat"));
+        assert_eq!(server_handshake.protocol.as_deref(), Some("superchat"));
+    }
+
+    #[compio::test]
     async fn compio_http1_client_sends_custom_headers() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
