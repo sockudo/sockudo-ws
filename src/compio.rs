@@ -67,7 +67,6 @@ const SPLIT_CLOSED: u8 = 2;
 
 #[derive(Debug, Clone)]
 enum ControlRequest {
-    Activity(Instant),
     Pong(Bytes, Instant),
     PeerPing(Bytes, Instant),
     PeerClose,
@@ -105,6 +104,10 @@ impl CompioTerminalCause {
 struct CompioSplitShared {
     status: Cell<u8>,
     terminal: Cell<Option<CompioTerminalCause>>,
+    /// Clock epoch shared by the reader and the writer driver
+    epoch: Instant,
+    /// Milliseconds since `epoch` of the last inbound data frame (reader -> driver)
+    last_inbound_ms: Cell<u64>,
 }
 
 impl CompioSplitShared {
@@ -112,7 +115,16 @@ impl CompioSplitShared {
         Rc::new(Self {
             status: Cell::new(if closed { SPLIT_CLOSED } else { SPLIT_OPEN }),
             terminal: Cell::new(closed.then_some(CompioTerminalCause::ConnectionClosed)),
+            epoch: Instant::now(),
+            last_inbound_ms: Cell::new(0),
         })
+    }
+
+    #[inline]
+    fn note_inbound(&self) {
+        let now_ms = self.epoch.elapsed().as_millis() as u64;
+        self.last_inbound_ms
+            .set(self.last_inbound_ms.get().max(now_ms));
     }
 
     fn is_open(&self) -> bool {
@@ -1148,7 +1160,6 @@ pub struct CompioWebSocketStream<S> {
     state: CompioStreamState,
     config: Config,
     pending_messages: Vec<Message>,
-    pending_index: usize,
     clock_epoch: Instant,
     heartbeat: Heartbeat,
     high_water_mark: usize,
@@ -1186,7 +1197,6 @@ where
             state: CompioStreamState::Open,
             config,
             pending_messages: Vec::new(),
-            pending_index: 0,
             clock_epoch,
             heartbeat,
             high_water_mark: DEFAULT_HIGH_WATER_MARK,
@@ -1437,28 +1447,18 @@ where
             return Ok(false);
         }
 
-        let messages = self.protocol.process(&mut self.read_buf)?;
-        if messages.is_empty() {
-            Ok(false)
-        } else {
-            self.pending_messages = messages;
-            self.pending_index = 0;
-            Ok(true)
-        }
+        // Reuse the message Vec across reads; messages are popped from the
+        // back, so keep them in reverse order.
+        debug_assert!(self.pending_messages.is_empty());
+        self.protocol
+            .process_into(&mut self.read_buf, &mut self.pending_messages)?;
+        self.pending_messages.reverse();
+        Ok(!self.pending_messages.is_empty())
     }
 
+    #[inline]
     fn next_pending_message(&mut self) -> Option<Message> {
-        if self.pending_index < self.pending_messages.len() {
-            let msg = self.pending_messages[self.pending_index].clone();
-            self.pending_index += 1;
-            if self.pending_index >= self.pending_messages.len() {
-                self.pending_messages.clear();
-                self.pending_index = 0;
-            }
-            Some(msg)
-        } else {
-            None
-        }
+        self.pending_messages.pop()
     }
 
     async fn handle_incoming_message(&mut self, msg: Message) -> Result<Message> {
@@ -1536,7 +1536,6 @@ where
                 protocol: reader_protocol,
                 read_buf: self.read_buf,
                 pending_messages: self.pending_messages,
-                pending_index: self.pending_index,
                 control_tx,
                 terminal_rx,
                 cancel_tx: cancel_tx.clone(),
@@ -1632,7 +1631,6 @@ pub struct CompioSplitReader<R> {
     protocol: Protocol,
     read_buf: BytesMut,
     pending_messages: Vec<Message>,
-    pending_index: usize,
     control_tx: mpsc::Sender<ControlRequest>,
     terminal_rx: mpsc::UnboundedReceiver<CompioTerminalCause>,
     cancel_tx: mpsc::UnboundedSender<()>,
@@ -1669,15 +1667,7 @@ where
                 };
             }
 
-            if self.pending_index < self.pending_messages.len() {
-                let msg = self.pending_messages[self.pending_index].clone();
-                self.pending_index += 1;
-
-                if self.pending_index >= self.pending_messages.len() {
-                    self.pending_messages.clear();
-                    self.pending_index = 0;
-                }
-
+            if let Some(msg) = self.pending_messages.pop() {
                 let request = match &msg {
                     Message::Ping(data) => ControlRequest::PeerPing(data.clone(), Instant::now()),
                     Message::Pong(data) => ControlRequest::Pong(data.clone(), Instant::now()),
@@ -1685,7 +1675,12 @@ where
                         self.shared.begin_closing();
                         ControlRequest::PeerClose
                     }
-                    _ => ControlRequest::Activity(Instant::now()),
+                    _ => {
+                        // Data frames only refresh the inactivity clock; no
+                        // channel round trip per message.
+                        self.shared.note_inbound();
+                        return Some(Ok(msg));
+                    }
                 };
                 if self.control_tx.send(request).await.is_err() {
                     self.shared.terminate(CompioTerminalCause::ConnectionClosed);
@@ -1695,13 +1690,17 @@ where
             }
 
             if !self.read_buf.is_empty() {
-                match self.protocol.process(&mut self.read_buf) {
-                    Ok(messages) if !messages.is_empty() => {
-                        self.pending_messages = messages;
-                        self.pending_index = 0;
-                        continue;
+                debug_assert!(self.pending_messages.is_empty());
+                match self
+                    .protocol
+                    .process_into(&mut self.read_buf, &mut self.pending_messages)
+                {
+                    Ok(()) => {
+                        self.pending_messages.reverse();
+                        if !self.pending_messages.is_empty() {
+                            continue;
+                        }
                     }
-                    Ok(_) => {}
                     Err(e) => {
                         self.shared.terminate(CompioTerminalCause::ConnectionClosed);
                         return Some(Err(e));
@@ -1844,13 +1843,21 @@ async fn compio_split_writer_driver<W, E>(
         terminal_tx,
         shared,
     } = channels;
-    let epoch = Instant::now();
+    let epoch = shared.epoch;
     let mut heartbeat = Heartbeat::new(&config, 0);
     let mut closing_deadline: Option<Instant> = None;
     let mut local_close_sent = false;
     let mut write_buf = BytesMut::with_capacity(config.write_buffer_size);
+    let mut last_synced_inbound_ms = 0u64;
 
     loop {
+        // Pick up data-frame activity published by the reader without a channel.
+        let observed_inbound = shared.last_inbound_ms.get();
+        if observed_inbound > last_synced_inbound_ms {
+            last_synced_inbound_ms = observed_inbound;
+            heartbeat.on_inbound(observed_inbound, None);
+        }
+
         let now_ms = epoch.elapsed().as_millis() as u64;
         let heartbeat_delay = heartbeat
             .next_deadline()
@@ -1885,11 +1892,6 @@ async fn compio_split_writer_driver<W, E>(
                 break;
             }
             CompioDriverWake::Control(Some(request)) => match request {
-                ControlRequest::Activity(received_at) => {
-                    let received_ms =
-                        received_at.saturating_duration_since(epoch).as_millis() as u64;
-                    heartbeat.on_inbound(received_ms, None);
-                }
                 ControlRequest::Pong(payload, received_at) => {
                     let received_ms =
                         received_at.saturating_duration_since(epoch).as_millis() as u64;
@@ -2136,7 +2138,6 @@ pub struct CompioCompressedWebSocketStream<S> {
     state: CompioStreamState,
     config: Config,
     pending_messages: Vec<Message>,
-    pending_index: usize,
     clock_epoch: Instant,
     heartbeat: Heartbeat,
     high_water_mark: usize,
@@ -2179,7 +2180,6 @@ where
             state: CompioStreamState::Open,
             config,
             pending_messages: Vec::new(),
-            pending_index: 0,
             clock_epoch,
             heartbeat,
             high_water_mark: DEFAULT_HIGH_WATER_MARK,
@@ -2218,7 +2218,6 @@ where
             state: CompioStreamState::Open,
             config,
             pending_messages: Vec::new(),
-            pending_index: 0,
             clock_epoch,
             heartbeat,
             high_water_mark: DEFAULT_HIGH_WATER_MARK,
@@ -2413,28 +2412,18 @@ where
             return Ok(false);
         }
 
-        let messages = self.protocol.process(&mut self.read_buf)?;
-        if messages.is_empty() {
-            Ok(false)
-        } else {
-            self.pending_messages = messages;
-            self.pending_index = 0;
-            Ok(true)
-        }
+        // Reuse the message Vec across reads; messages are popped from the
+        // back, so keep them in reverse order.
+        debug_assert!(self.pending_messages.is_empty());
+        self.protocol
+            .process_into(&mut self.read_buf, &mut self.pending_messages)?;
+        self.pending_messages.reverse();
+        Ok(!self.pending_messages.is_empty())
     }
 
+    #[inline]
     fn next_pending_message(&mut self) -> Option<Message> {
-        if self.pending_index < self.pending_messages.len() {
-            let msg = self.pending_messages[self.pending_index].clone();
-            self.pending_index += 1;
-            if self.pending_index >= self.pending_messages.len() {
-                self.pending_messages.clear();
-                self.pending_index = 0;
-            }
-            Some(msg)
-        } else {
-            None
-        }
+        self.pending_messages.pop()
     }
 
     async fn handle_incoming_message(&mut self, msg: Message) -> Result<Message> {
@@ -2510,7 +2499,6 @@ where
                 protocol: reader_protocol,
                 read_buf: self.read_buf,
                 pending_messages: self.pending_messages,
-                pending_index: self.pending_index,
                 control_tx,
                 terminal_rx,
                 cancel_tx: cancel_tx.clone(),
@@ -2534,7 +2522,6 @@ pub struct CompioCompressedSplitReader<R> {
     protocol: CompressedReaderProtocol,
     read_buf: BytesMut,
     pending_messages: Vec<Message>,
-    pending_index: usize,
     control_tx: mpsc::Sender<ControlRequest>,
     terminal_rx: mpsc::UnboundedReceiver<CompioTerminalCause>,
     cancel_tx: mpsc::UnboundedSender<()>,
@@ -2573,15 +2560,7 @@ where
                 };
             }
 
-            if self.pending_index < self.pending_messages.len() {
-                let msg = self.pending_messages[self.pending_index].clone();
-                self.pending_index += 1;
-
-                if self.pending_index >= self.pending_messages.len() {
-                    self.pending_messages.clear();
-                    self.pending_index = 0;
-                }
-
+            if let Some(msg) = self.pending_messages.pop() {
                 let request = match &msg {
                     Message::Ping(data) => ControlRequest::PeerPing(data.clone(), Instant::now()),
                     Message::Pong(data) => ControlRequest::Pong(data.clone(), Instant::now()),
@@ -2589,7 +2568,12 @@ where
                         self.shared.begin_closing();
                         ControlRequest::PeerClose
                     }
-                    _ => ControlRequest::Activity(Instant::now()),
+                    _ => {
+                        // Data frames only refresh the inactivity clock; no
+                        // channel round trip per message.
+                        self.shared.note_inbound();
+                        return Some(Ok(msg));
+                    }
                 };
                 if self.control_tx.send(request).await.is_err() {
                     self.shared.terminate(CompioTerminalCause::ConnectionClosed);
@@ -2599,13 +2583,17 @@ where
             }
 
             if !self.read_buf.is_empty() {
-                match self.protocol.process(&mut self.read_buf) {
-                    Ok(messages) if !messages.is_empty() => {
-                        self.pending_messages = messages;
-                        self.pending_index = 0;
-                        continue;
+                debug_assert!(self.pending_messages.is_empty());
+                match self
+                    .protocol
+                    .process_into(&mut self.read_buf, &mut self.pending_messages)
+                {
+                    Ok(()) => {
+                        self.pending_messages.reverse();
+                        if !self.pending_messages.is_empty() {
+                            continue;
+                        }
                     }
-                    Ok(_) => {}
                     Err(e) => {
                         self.shared.terminate(CompioTerminalCause::ConnectionClosed);
                         return Some(Err(e));

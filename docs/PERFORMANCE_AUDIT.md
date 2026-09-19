@@ -1,5 +1,9 @@
 # sockudo-ws performance audit
 
+> **Update 2026-09-19 (post v2.1.0).** Every item in section 4 ("Not fixed") except the
+> runtime itself has since been implemented; see section 6 for the follow-up and its numbers.
+> The competitor's harness has also been published since; section 7 reviews it.
+
 Date: 2026-09-19. Machine: Apple M5 Pro (arm64), macOS, rustc 1.98.1, release profile
 (`lto = "fat"`, `codegen-units = 1`). Baseline commit: `0d7e79c` (v2.0.1).
 
@@ -271,3 +275,119 @@ cargo build --release --bin autobahn-server && ./target/release/autobahn-server 
 
 The head-to-head harness (three echo servers plus a neutral connect/echo client) lives outside the
 repo; it is ~150 lines and is described in section 2.2 closely enough to recreate.
+
+---
+
+## 6. Follow-up: write path, split writer, masking (post v2.1.0)
+
+All of section 4 except the runtime is now done, in the working tree after v2.1.0.
+
+### 6.1 Batch-scoped write coalescing (`Config::write_coalescing`, default on)
+
+`Sink::poll_flush` returns `Ready` without writing while inbound messages that were already
+parsed are still queued for the application and the write buffer is under the high-water mark.
+`poll_next` writes everything in one vectored write before it next waits on the transport, so a
+reply is never delayed past the end of the read batch it belongs to. This is the uWebSockets
+cork, scoped to a read batch instead of an event-loop callback. Sequential request/response
+traffic (nothing queued) is unaffected; bursts are where it pays.
+
+Same neutral client as section 2.2, `depth` messages in flight per connection:
+
+| case | sockudo, coalescing | sockudo, `write_coalescing=false` | tungstenite |
+|---|---|---|---|
+| 64 B, depth 8, 1 conn | **266k msg/s** | 125k | 130k |
+| 64 B, depth 8, 8 conns | **1.12M** | 268k | 267k |
+| 64 B, depth 8, 32 conns | **1.23M** | 283k | 279k |
+| 256 B, depth 32, 1 conn | **906k** | 185k | 186k |
+| 256 B, depth 32, 8 conns | **3.88M** | 235k | 240k |
+| 256 B, depth 32, 32 conns | **4.53M** | 294k | 288k |
+| 64 B, sequential, 1 / 8 / 32 conns | 31k / 148k / 159k | 34k / 149k / 157k | 34k / 145k / 152k |
+
+The coalesced numbers are 2x at depth 8 on one connection and 15x at depth 32 on 32 connections;
+that is the syscall count going from one per message to one per batch. Sequential traffic is
+within noise of before.
+
+Regression tests: `read_batch_answered_with_sends_is_one_write_when_coalescing` counts the
+transport writes (1 vs 3), and `coalesced_frames_are_written_before_waiting_on_the_transport`
+proves the batch is flushed before the stream blocks on the next read.
+
+### 6.2 Zero-copy large sends
+
+`CorkBuffer` is now an ordered list of `Bytes` segments plus an open tail buffer, so a frame
+header written into the buffer and a payload queued by reference keep their order, and the next
+small frame lands behind both. Server-side data payloads of 8 KiB or more (`cork::ZERO_COPY_MIN`)
+are queued this way; masked client sends still copy, because masking needs a copy anyway.
+
+| case | sockudo | tungstenite |
+|---|---|---|
+| 64 KiB, sequential, 1 conn | 21.6k msg/s | 19.8k |
+| 64 KiB, sequential, 8 conns | 81.5k | 76.4k |
+| 64 KiB, depth 4, 1 conn | 40.7k | 34.7k |
+| 64 KiB, depth 4, 8 conns | 88.9k | 87.5k |
+
+5 to 17 % on large messages; the memcpy was never the dominant cost, the syscall is.
+
+### 6.3 Split writer without a task hop
+
+`SplitWriter::send` used to push `(Message, oneshot::Sender)` through a bounded channel to the
+driver task, which wrote and answered through the oneshot: two task hops and two allocations per
+message. Now the transport write half and the encoder live in an `Arc<tokio::sync::Mutex<..>>`
+shared by the application handle and the control driver. Each side locks it for one frame write;
+an uncontended tokio mutex is an atomic and allocates nothing. Pong, Ping and Close frames from
+the driver interleave at frame boundaries. The `ApplicationRequest` channel is gone; the writer
+tells the driver about a locally sent Close with one control message so the close deadline still
+applies.
+
+In the head-to-head, the split server now measures the same as the unified stream on sequential
+traffic (33.9k vs 34.2k msg/s at one connection). It does not get the coalescing win because a
+split writer has no view of the reader's queue; `SplitWriter::send` is one write per call by design.
+
+### 6.4 Masking
+
+The hand-written 16-byte NEON loop lost to a plain `u64` word loop that LLVM unrolls wider. The
+aarch64 path (and the generic fallback) is now a `u64` loop over 64-byte blocks, aligned to 16
+bytes above 2 KiB. Measured with the competitor's own `benches/micro.rs` against the patched
+crate, on this machine:
+
+| size | before | after | nago-wss | tungstenite |
+|---|---|---|---|---|
+| 64 B | 24.5 GB/s | 19.0 | 17.8 | 21.6 |
+| 1 KiB | 52.9 | **89.6** | 86.3 | 78.5 |
+| 16 KiB | 67.6 | **127.9** | 128.4 | 128.6 |
+| 256 KiB | 65.5 | **76.1** | 76.2 | 76.5 |
+
+Level with both from 1 KiB up; the 64-byte row trades 5 GB/s for the win everywhere else. The x86
+AVX2 / AVX-512 paths are unchanged (not measurable here).
+
+### 6.5 Compio
+
+The compio streams and split readers got the same read-path treatment as tokio in v2.0.2
+(reused message Vec, no clone, inbound activity through a shared cell instead of a channel
+message per frame). Not done there: write coalescing, zero-copy sends, the shared-sink split
+writer, and the per-iteration timer (compio's timer is a heap in a single-threaded runtime, so
+that one is cheap).
+
+Autobahn after all of the above: 517 cases, 514 OK, 3 INFORMATIONAL, unchanged.
+
+---
+
+## 7. The competitor's harness, now published
+
+`pathscale/nago-wss` published its benchmarks (`benches/micro.rs`, `echo.rs`, `concurrent.rs`,
+`scale.rs`). Two findings:
+
+1. **The published README already retracts most of the Discord table.** Its micro rows show
+   sockudo winning or level on masking at 64 B and on every UTF-8 row, and its echo row shows
+   sockudo 1.21x faster than nago on round trips. The Discord screenshots were from an earlier,
+   unpublished run.
+2. **The sockudo client arm reads the HTTP 101 response one byte per `read()` syscall**
+   (`client_handshake` in `scale.rs`, `concurrent.rs`, `echo.rs`), roughly 130 syscalls per
+   connection, while the tungstenite arm uses tungstenite's buffered handshake. `scale.rs` times
+   10 000 of those, and `concurrent.rs` times connect plus handshake with only 50 messages per
+   connection. That is where the "4.7x slower to establish" and part of the 8-connection dip came
+   from. A three-line change to a buffered `read_buf` + `parse_response` makes the arms
+   comparable; the neutral head-to-head in section 2.2 (same client for both libraries) is the
+   fair version of that measurement.
+
+Running the unmodified harness here confirmed sockudo's UTF-8 rows level with nago's and masking
+as in 6.4 before the fix.

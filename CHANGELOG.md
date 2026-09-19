@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Outbound frames are coalesced across `send()` calls while inbound messages
+  that were already parsed are still queued for the application
+  (`Config::write_coalescing`, default on). A read batch of N messages
+  answered with N sends is one vectored write instead of N; everything is
+  written before the stream next waits on the transport, so no reply is
+  delayed past the end of its batch. Disable with
+  `Config::builder().write_coalescing(false)`.
+- Server-side data payloads of 8 KiB or more are queued by reference behind
+  their frame header and sent with vectored I/O instead of being copied into
+  the write buffer (`CorkBuffer::push_segment`, `cork::ZERO_COPY_MIN`).
+- `CorkBuffer` is now an ordered list of `Bytes` segments plus an open tail
+  buffer; `write_bytes` keeps output order and `write` no longer spills into a
+  separate overflow queue.
+- `SplitWriter` / `CompressedSplitWriter` write directly to the transport
+  through a sink shared with the connection's control driver, instead of a
+  channel plus a oneshot completion per `send()`. Automatic Pong/Ping/Close
+  frames interleave at frame boundaries. `SplitWriter::send` now requires
+  `S: AsyncWrite + Unpin` (which `split()` already required).
+- Frame masking uses an auto-vectorised 64-byte block loop on aarch64 and
+  other non-x86 targets (aligned above 2 KiB): 1 KiB 53 -> 84 GB/s,
+  16 KiB 67 -> 127 GB/s, 64 B 12 -> 19 GB/s on an Apple M5 Pro.
+- Compio streams and split readers reuse the message Vec across reads, pop
+  messages instead of cloning them, and publish inbound activity through a
+  shared cell instead of a channel message per data frame.
+
 ## [2.1.0] - 2026-09-19
 
 ### Added
