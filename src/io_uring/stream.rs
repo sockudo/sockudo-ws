@@ -310,7 +310,8 @@ impl std::fmt::Debug for UringStream {
 impl UringStream {
     /// Read data using io_uring (native async, preferred method)
     ///
-    /// This avoids the copy required by the poll-based compatibility bridge.
+    /// This avoids the bridge's copy when no earlier poll-based read is pending
+    /// or buffered. Any bytes already read by the bridge are returned first.
     ///
     /// # Example
     ///
@@ -320,20 +321,41 @@ impl UringStream {
     /// let n = result?;
     /// // buf[..n] contains the data
     /// ```
-    pub async fn read_native(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    pub async fn read_native(&mut self, mut buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        if self.has_buffered_data() || self.read_state.pending_read.is_some() || self.read_state.eof
+        {
+            let initialized = buf.len();
+            buf.clear();
+            let mut read_buf = ReadBuf::uninit(buf.spare_capacity_mut());
+            let result =
+                std::future::poll_fn(|cx| Pin::new(&mut *self).poll_read(cx, &mut read_buf)).await;
+            let filled = read_buf.filled().len();
+            // SAFETY: the old prefix was initialized before clear, and ReadBuf
+            // guarantees initialization of its filled prefix.
+            unsafe {
+                buf.set_len(initialized.max(filled));
+            }
+            return (result.map(|()| filled), buf);
+        }
         self.inner.read(buf).await
     }
 
     /// Write data using io_uring (native async, preferred method)
     ///
     /// This avoids the buffering and copy required by the poll-based
-    /// compatibility bridge.
-    pub async fn write_native(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    /// compatibility bridge after flushing any earlier poll-based writes.
+    pub async fn write_native(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        if let Err(error) = std::future::poll_fn(|cx| self.poll_flush_buffer(cx)).await {
+            return (Err(error), buf);
+        }
         self.inner.write(buf).submit().await
     }
 
-    /// Write all data using io_uring
-    pub async fn write_all_native(&self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
+    /// Write all data using io_uring, after flushing earlier poll-based writes.
+    pub async fn write_all_native(&mut self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
+        if let Err(error) = std::future::poll_fn(|cx| self.poll_flush_buffer(cx)).await {
+            return (Err(error), buf);
+        }
         self.inner.write_all(buf).await
     }
 }

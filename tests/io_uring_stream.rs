@@ -80,3 +80,60 @@ fn websocket_echo_uses_poll_io_bridge() {
 fn test_config() -> Config {
     Config::builder().auto_ping(false).idle_timeout(0).build()
 }
+
+#[test]
+fn native_write_preserves_preceding_poll_write() {
+    tokio_uring::start(async {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let listener =
+                tokio_uring::net::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let address = listener.local_addr().unwrap();
+            let peer = tokio_uring::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = UringStream::new(stream);
+                let mut bytes = vec![0; 2];
+                stream.read_exact(&mut bytes).await.unwrap();
+                bytes
+            });
+            let mut stream =
+                UringStream::new(tokio_uring::net::TcpStream::connect(address).await.unwrap());
+            stream.write_all(b"A").await.unwrap();
+            stream.write_all_native(b"B".to_vec()).await.0.unwrap();
+            stream.flush().await.unwrap();
+            assert_eq!(peer.await.unwrap(), b"AB");
+        })
+        .await
+        .unwrap();
+    });
+}
+
+#[test]
+fn native_read_preserves_poll_read_ahead() {
+    tokio_uring::start(async {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let listener =
+                tokio_uring::net::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let address = listener.local_addr().unwrap();
+            let peer = tokio_uring::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                stream.write_all(b"AB".to_vec()).await.0.unwrap();
+                stream.shutdown(std::net::Shutdown::Write).unwrap();
+            });
+            let mut stream =
+                UringStream::new(tokio_uring::net::TcpStream::connect(address).await.unwrap());
+            peer.await.unwrap();
+            let mut first = [0];
+            stream.read_exact(&mut first).await.unwrap();
+            assert_eq!(&first, b"A");
+            assert!(
+                stream.has_buffered_data(),
+                "peer sent the complete input before reading"
+            );
+            let (result, bytes) = stream.read_native(vec![0; 1]).await;
+            assert_eq!(result.unwrap(), 1);
+            assert_eq!(bytes, b"B");
+        })
+        .await
+        .unwrap();
+    });
+}
