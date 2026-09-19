@@ -98,6 +98,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Compatibility
 
+- HTTP/3 applies its configured transport values, including the default 1 MiB
+  send window and 1350-byte maximum UDP payload.
+
 - `DeflateConfig` window fields, `Compression::window_bits()`, and the deflate
   window constants now use `DeflateWindowBits`; `DeflateEncoder::new` and
   `DeflateDecoder::new` accept that type. `MIN_WINDOW_BITS` is now 9 and
