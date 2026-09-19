@@ -61,3 +61,5 @@ count rate_per_connection [ws|raw] [off|on]`. Tracing is for diagnosis, not timi
 Absolute scheduled-lateness percentiles depend on timer phase; compare
 per-connection spreads and actual send-to-delivery latency, with a raw TCP
 control, before attributing differences to scheduler fairness.
+
+The standalone diagnostics accept Cargo’s `--bench` argument. With no arguments they run a short synthetic case. For file-based receive diagnostics, `-` selects the built-in JSON payload; batch latency CPU `-` leaves affinity unchanged. These defaults check the harness without external fixtures.
