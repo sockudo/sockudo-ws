@@ -118,3 +118,19 @@ fn masked_medium_frames_preserve_protocol_errors() {
         }
     }
 }
+
+#[test]
+fn medium_frame_header_errors_precede_size_errors() {
+    for masked in [false, true] {
+        for (first, expected) in [
+            (0xa2, "Protocol error: RSV2 and RSV3 must be 0"),
+            (0x83, "Invalid frame: invalid opcode"),
+            (0x09, "Protocol error: control frame must not be fragmented"),
+        ] {
+            let mut wire =
+                BytesMut::from(&[first, 126 | if masked { 128 } else { 0 }, 1, 0, 0, 0, 0, 0][..]);
+            let mut parser = FrameParser::new(128, masked);
+            assert_eq!(parser.parse(&mut wire).unwrap_err().to_string(), expected);
+        }
+    }
+}
