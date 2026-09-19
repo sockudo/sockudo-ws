@@ -18,13 +18,14 @@
 //!
 //! # Alignment Strategy
 //!
-//! For optimal performance, all SIMD implementations use an alignment-aware strategy:
+//! The x86_64 SIMD implementations use an alignment-aware strategy:
 //! 1. Process unaligned prefix bytes with scalar operations
 //! 2. Process aligned chunks with SIMD operations
 //! 3. Process unaligned suffix bytes with scalar operations
 //!
-//! This ensures optimal memory access patterns and avoids potential performance
-//! penalties from unaligned loads/stores on some architectures.
+//! This retains aligned loads/stores on those architectures. The aarch64 kernel
+//! uses unaligned, non-overlapping chunks to avoid scalar prefix work on short
+//! WebSocket payloads.
 //!
 //! # Architecture Support
 //!
@@ -43,6 +44,9 @@
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 
 /// Apply WebSocket mask using the fastest available SIMD instructions
 ///
@@ -74,10 +78,7 @@ pub fn apply_mask(data: &mut [u8], mask: [u8; 4]) {
 
     #[cfg(target_arch = "aarch64")]
     {
-        // A word loop over 64-byte blocks is what LLVM vectorises best here;
-        // it beat a hand-written 16-byte NEON loop at every size (see the
-        // benchmark notes on `apply_mask_blocks`).
-        apply_mask_blocks(data, mask);
+        unsafe { apply_mask_neon(data, mask) };
     }
 
     #[cfg(target_arch = "loongarch64")]
@@ -405,6 +406,40 @@ unsafe fn apply_mask_sse2_aligned(data: &mut [u8], mask: [u8; 4]) {
             let slice = std::slice::from_raw_parts_mut(ptr, remaining);
             apply_mask_scalar_offset(slice, mask, mask_offset);
         }
+    }
+}
+
+/// NEON implementation for ARM64 using non-overlapping unaligned chunks.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn apply_mask_neon(data: &mut [u8], mask: [u8; 4]) {
+    let mask_word = u32::from_ne_bytes(mask);
+    let mask_vec = vreinterpretq_u8_u32(vdupq_n_u32(mask_word));
+    let (chunks, mut tail) = data.as_chunks_mut::<16>();
+
+    // Process 16 bytes at a time. Each chunk is disjoint and keeps mask phase zero.
+    for chunk in chunks {
+        // SAFETY: Each chunk contains 16 readable/writable bytes. NEON byte
+        // loads and stores accept unaligned pointers, and do not cross the slice.
+        unsafe {
+            let data_vec = vld1q_u8(chunk.as_ptr());
+            vst1q_u8(chunk.as_mut_ptr(), veorq_u8(data_vec, mask_vec));
+        }
+    }
+
+    // Handle remaining bytes with scalar operations, without overlapping a vector.
+    if tail.len() >= 8 {
+        let mask_word = u64::from(mask_word);
+        let mask_u64 = mask_word | (mask_word << u32::BITS);
+        // SAFETY: The tail has at least eight bytes and unaligned access is explicit.
+        unsafe {
+            let ptr = tail.as_mut_ptr().cast::<u64>();
+            ptr.write_unaligned(ptr.read_unaligned() ^ mask_u64);
+        }
+        tail = &mut tail[8..];
+    }
+    for (index, byte) in tail.iter_mut().enumerate() {
+        *byte ^= mask[index & 3];
     }
 }
 
