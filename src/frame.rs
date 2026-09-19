@@ -8,6 +8,9 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::{vdupq_n_u32, veorq_u8, vld1q_u8, vreinterpretq_u8_u32, vst1q_u8};
+
 use crate::error::{CloseReason, Error, Result};
 use crate::simd::{apply_mask, apply_mask_offset};
 use crate::utf8::validate_utf8;
@@ -1017,6 +1020,16 @@ pub fn encode_frame_with_rsv(
 
             // Copy and mask payload in a single pass
             let payload_dst = base.add(offset);
+            #[cfg(target_arch = "aarch64")]
+            if payload_len == 8 {
+                let mask_u32 = u32::from_ne_bytes(m);
+                let mask_u64 = ((mask_u32 as u64) << 32) | mask_u32 as u64;
+                let src_val = std::ptr::read_unaligned(payload.as_ptr() as *const u64);
+                std::ptr::write_unaligned(payload_dst as *mut u64, src_val ^ mask_u64);
+            } else {
+                encode_payload_masked_inline(payload_dst, payload.as_ptr(), payload_len, m);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
             encode_payload_masked_inline(payload_dst, payload.as_ptr(), payload_len, m);
         } else {
             // Fast path: just copy payload
@@ -1030,14 +1043,43 @@ pub fn encode_frame_with_rsv(
 
 /// Inline masking during copy - single pass for masked frames
 ///
-/// SAFETY: Caller must ensure dst has at least `len` bytes available
+/// SAFETY: Caller must ensure src has `len` initialized readable bytes and dst
+/// has at least `len` writable bytes. The regions must not overlap.
 #[inline]
 unsafe fn encode_payload_masked_inline(dst: *mut u8, src: *const u8, len: usize, mask: [u8; 4]) {
     unsafe {
         let mask_u32 = u32::from_ne_bytes(mask);
 
-        // Process 8 bytes at a time for better throughput
+        // Process 8 bytes at a time after any architecture-specific chunks.
         let mut i = 0;
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mask_vec = vreinterpretq_u8_u32(vdupq_n_u32(mask_u32));
+            while len - i >= 16 {
+                // Load only initialized source bytes; the destination is spare
+                // BytesMut capacity and must be initialized by stores, not read.
+                let data = vld1q_u8(src.add(i));
+                vst1q_u8(dst.add(i), veorq_u8(data, mask_vec));
+                i += 16;
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if len >= 16 {
+            use std::arch::x86_64::{
+                __m128i, _mm_loadu_si128, _mm_set1_epi32, _mm_storeu_si128, _mm_xor_si128,
+            };
+
+            // SSE2 is baseline on x86_64; unaligned accesses support any payload
+            // and frame-header offset. Only read complete initialized chunks.
+            let mask_vec = _mm_set1_epi32(mask_u32 as i32);
+            while len - i >= 16 {
+                let data = _mm_loadu_si128(src.add(i).cast::<__m128i>());
+                _mm_storeu_si128(dst.add(i).cast::<__m128i>(), _mm_xor_si128(data, mask_vec));
+                i += 16;
+            }
+        }
 
         // Process 8-byte chunks
         while i + 8 <= len {
