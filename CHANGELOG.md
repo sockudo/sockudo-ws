@@ -98,6 +98,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Compatibility
 
+- io_uring native read/write methods now require mutable access so they cannot
+  bypass pending bridge operations. Shared handles remain for inspection and configuration.
+
 - HTTP/3 applies its configured transport values, including the default 1 MiB
   send window and 1350-byte maximum UDP payload.
 

@@ -135,7 +135,11 @@ impl UringStream {
         Ok(Self::new(uring_stream))
     }
 
-    /// Get a reference to the underlying tokio-uring stream
+    /// Get a reference to the underlying tokio-uring stream.
+    ///
+    /// Use this for socket inspection and configuration. Performing I/O on
+    /// this reference bypasses pending and buffered operations in the bridge
+    /// and can reorder bytes. Use the bridge or its native methods for I/O.
     pub fn get_ref(&self) -> &UringTcpStream {
         &self.inner
     }
