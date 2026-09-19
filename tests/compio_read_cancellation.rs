@@ -66,7 +66,7 @@ async fn compressed_unified_read_preserves_partial_payload_across_ping_deadline(
         DeflateConfig::default(),
     );
     let payload = vec![b'A'; 1024];
-    let mut encoder = DeflateEncoder::new(15, false, 6, 0);
+    let mut encoder = DeflateEncoder::new(sockudo_ws::deflate::DeflateWindowBits::Bits15, false, 6, 0);
     let compressed = encoder.compress(&payload).unwrap().unwrap();
     let mut frame = BytesMut::new();
     encode_frame_with_rsv(&mut frame, OpCode::Binary, &compressed, true, None, true);
