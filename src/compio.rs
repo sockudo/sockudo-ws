@@ -1602,11 +1602,13 @@ where
         // Reuse the message Vec across reads; messages are popped from the
         // back, so keep them in reverse order.
         debug_assert!(self.pending_messages.is_empty());
-        let result = self
-            .protocol
-            .process_into(&mut self.read_buf, &mut self.pending_messages);
+        let result = self.protocol.process_into_with_activity(&mut self.read_buf, &mut self.pending_messages);
+        if matches!(result, Ok(true)) {
+            self.heartbeat.on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
+        }
+        // Preserve accepted messages even when a later frame fails.
         self.pending_messages.reverse();
-        result.map(|()| !self.pending_messages.is_empty())
+        result.map(|_| !self.pending_messages.is_empty())
     }
 
     #[inline]
@@ -1871,9 +1873,12 @@ where
                 debug_assert!(self.pending_messages.is_empty());
                 match self
                     .protocol
-                    .process_into(&mut self.read_buf, &mut self.pending_messages)
+                    .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)
                 {
-                    Ok(()) => {
+                    Ok(fragment_activity) => {
+                        if fragment_activity {
+                            self.shared.note_inbound();
+                        }
                         self.pending_messages.reverse();
                         if !self.pending_messages.is_empty() {
                             continue;
@@ -2727,11 +2732,13 @@ where
         // Reuse the message Vec across reads; messages are popped from the
         // back, so keep them in reverse order.
         debug_assert!(self.pending_messages.is_empty());
-        let result = self
-            .protocol
-            .process_into(&mut self.read_buf, &mut self.pending_messages);
+        let result = self.protocol.process_into_with_activity(&mut self.read_buf, &mut self.pending_messages);
+        if matches!(result, Ok(true)) {
+            self.heartbeat.on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
+        }
+        // Preserve accepted messages even when a later frame fails.
         self.pending_messages.reverse();
-        result.map(|()| !self.pending_messages.is_empty())
+        result.map(|_| !self.pending_messages.is_empty())
     }
 
     #[inline]
@@ -2919,9 +2926,12 @@ where
                 debug_assert!(self.pending_messages.is_empty());
                 match self
                     .protocol
-                    .process_into(&mut self.read_buf, &mut self.pending_messages)
+                    .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)
                 {
-                    Ok(()) => {
+                    Ok(fragment_activity) => {
+                        if fragment_activity {
+                            self.shared.note_inbound();
+                        }
                         self.pending_messages.reverse();
                         if !self.pending_messages.is_empty() {
                             continue;

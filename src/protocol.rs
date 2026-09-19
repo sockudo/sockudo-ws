@@ -393,15 +393,28 @@ impl Protocol {
     /// This variant allows reusing a Vec<Message> across calls to avoid allocations.
     #[inline]
     pub fn process_into(&mut self, buf: &mut BytesMut, messages: &mut Vec<Message>) -> Result<()> {
+        self.process_into_with_activity(buf, messages).map(|_| ())
+    }
+
+    /// Report accepted non-final data frames, which do not yield a message.
+    /// Complete messages and control frames retain stream-level activity handling.
+    pub(crate) fn process_into_with_activity(
+        &mut self,
+        buf: &mut BytesMut,
+        messages: &mut Vec<Message>,
+    ) -> Result<bool> {
         messages.clear();
+        let mut fragment_activity = false;
 
         while !buf.is_empty() {
             match self.parser.parse(buf)? {
                 Some(frame) => {
+                    let is_fragment = frame.header.opcode.is_data() && !frame.header.fin;
                     let prevalidated = std::mem::take(&mut self.partial_checked);
                     if let Some(msg) = self.handle_frame(frame, prevalidated)? {
                         messages.push(msg);
                     }
+                    fragment_activity |= is_fragment;
                 }
                 None => {
                     self.prevalidate_partial_text(buf)?;
@@ -410,7 +423,7 @@ impl Protocol {
             }
         }
 
-        Ok(())
+        Ok(fragment_activity)
     }
 
     /// Process incoming data and return complete raw messages.
@@ -893,8 +906,19 @@ impl CompressedProtocol {
     /// Process incoming data into a reusable message buffer
     #[inline]
     pub fn process_into(&mut self, buf: &mut BytesMut, messages: &mut Vec<Message>) -> Result<()> {
+        self.process_into_with_activity(buf, messages).map(|_| ())
+    }
+
+    /// Report accepted non-final data frames, which do not yield a message.
+    /// Complete messages and control frames retain stream-level activity handling.
+    pub(crate) fn process_into_with_activity(
+        &mut self,
+        buf: &mut BytesMut,
+        messages: &mut Vec<Message>,
+    ) -> Result<bool> {
         const DEBUG: bool = false;
         messages.clear();
+        let mut fragment_activity = false;
 
         while !buf.is_empty() {
             if DEBUG {
@@ -902,6 +926,7 @@ impl CompressedProtocol {
             }
             match self.inner.parser.parse(buf)? {
                 Some(frame) => {
+                    let is_fragment = frame.header.opcode.is_data() && !frame.header.fin;
                     if DEBUG {
                         eprintln!("[PROTOCOL] Parsed frame, handling...");
                     }
@@ -913,6 +938,7 @@ impl CompressedProtocol {
                     } else if DEBUG {
                         eprintln!("[PROTOCOL] No message from handle_frame (fragment or control)");
                     }
+                    fragment_activity |= is_fragment;
                 }
                 None => {
                     if DEBUG {
@@ -927,7 +953,7 @@ impl CompressedProtocol {
             eprintln!("[PROTOCOL] process_into done, {} messages", messages.len());
         }
 
-        Ok(())
+        Ok(fragment_activity)
     }
 
     /// Handle a parsed frame with decompression support
@@ -1225,7 +1251,18 @@ impl CompressedReaderProtocol {
 
     /// Process incoming data into a reusable message buffer
     pub fn process_into(&mut self, buf: &mut BytesMut, messages: &mut Vec<Message>) -> Result<()> {
+        self.process_into_with_activity(buf, messages).map(|_| ())
+    }
+
+    /// Report accepted non-final data frames, which do not yield a message.
+    /// Complete messages and control frames retain stream-level activity handling.
+    pub(crate) fn process_into_with_activity(
+        &mut self,
+        buf: &mut BytesMut,
+        messages: &mut Vec<Message>,
+    ) -> Result<bool> {
         messages.clear();
+        let mut fragment_activity = false;
 
         // Enable compression in parser
         self.parser.set_compression(true);
@@ -1233,15 +1270,17 @@ impl CompressedReaderProtocol {
         while !buf.is_empty() {
             match self.parser.parse(buf)? {
                 Some(frame) => {
+                    let is_fragment = frame.header.opcode.is_data() && !frame.header.fin;
                     if let Some(msg) = self.handle_frame(frame)? {
                         messages.push(msg);
                     }
+                    fragment_activity |= is_fragment;
                 }
                 None => break,
             }
         }
 
-        Ok(())
+        Ok(fragment_activity)
     }
 
     /// Handle a parsed frame with decompression support
