@@ -108,20 +108,25 @@ struct CompioSplitShared {
     epoch: Instant,
     /// Milliseconds since `epoch` of the last inbound data frame (reader -> driver)
     last_inbound_ms: Cell<u64>,
+    tracks_inbound_activity: bool,
 }
 
 impl CompioSplitShared {
-    fn new(closed: bool) -> Rc<Self> {
+    fn new(closed: bool, tracks_inbound_activity: bool) -> Rc<Self> {
         Rc::new(Self {
             status: Cell::new(if closed { SPLIT_CLOSED } else { SPLIT_OPEN }),
             terminal: Cell::new(closed.then_some(CompioTerminalCause::ConnectionClosed)),
             epoch: Instant::now(),
             last_inbound_ms: Cell::new(0),
+            tracks_inbound_activity,
         })
     }
 
     #[inline]
     fn note_inbound(&self) {
+        if !self.tracks_inbound_activity {
+            return;
+        }
         let now_ms = self.epoch.elapsed().as_millis() as u64;
         self.last_inbound_ms
             .set(self.last_inbound_ms.get().max(now_ms));
@@ -1453,7 +1458,7 @@ where
         let fragment_activity = self
             .protocol
             .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)?;
-        if fragment_activity {
+        if fragment_activity && self.heartbeat.tracks_inbound_activity() {
             self.heartbeat
                 .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
         }
@@ -1513,7 +1518,10 @@ where
         let (application_tx, application_rx) = mpsc::channel(SPLIT_APPLICATION_CAPACITY);
         let (cancel_tx, cancel_rx) = mpsc::unbounded();
         let (terminal_tx, terminal_rx) = mpsc::unbounded();
-        let shared = CompioSplitShared::new(self.state != CompioStreamState::Open);
+        let shared = CompioSplitShared::new(
+            self.state != CompioStreamState::Open,
+            self.heartbeat.tracks_inbound_activity(),
+        );
 
         let reader_protocol = Protocol::new(
             self.protocol.role,
@@ -2432,7 +2440,7 @@ where
         let fragment_activity = self
             .protocol
             .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)?;
-        if fragment_activity {
+        if fragment_activity && self.heartbeat.tracks_inbound_activity() {
             self.heartbeat
                 .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
         }
@@ -2493,7 +2501,10 @@ where
         let (application_tx, application_rx) = mpsc::channel(SPLIT_APPLICATION_CAPACITY);
         let (cancel_tx, cancel_rx) = mpsc::unbounded();
         let (terminal_tx, terminal_rx) = mpsc::unbounded();
-        let shared = CompioSplitShared::new(self.state != CompioStreamState::Open);
+        let shared = CompioSplitShared::new(
+            self.state != CompioStreamState::Open,
+            self.heartbeat.tracks_inbound_activity(),
+        );
         let (reader_protocol, writer_protocol) = self
             .protocol
             .split(self.config.max_frame_size, self.config.max_message_size);

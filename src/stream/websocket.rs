@@ -342,7 +342,7 @@ where
         let fragment_activity = self
             .protocol
             .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)?;
-        if fragment_activity {
+        if fragment_activity && self.heartbeat.tracks_inbound_activity() {
             self.heartbeat
                 .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
         }
@@ -901,10 +901,11 @@ struct SplitShared {
     epoch: tokio::time::Instant,
     /// Milliseconds since `epoch` of the last inbound data frame (reader -> driver)
     last_inbound_ms: AtomicU64,
+    tracks_inbound_activity: bool,
 }
 
 impl SplitShared {
-    fn new(closed: bool) -> Arc<Self> {
+    fn new(closed: bool, tracks_inbound_activity: bool) -> Arc<Self> {
         let (terminal_tx, _) = watch::channel(closed.then_some(TerminalCause::ConnectionClosed));
         Arc::new(Self {
             status: AtomicU8::new(if closed { SPLIT_CLOSED } else { SPLIT_OPEN }),
@@ -912,11 +913,15 @@ impl SplitShared {
             cancel: CancellationToken::new(),
             epoch: tokio::time::Instant::now(),
             last_inbound_ms: AtomicU64::new(0),
+            tracks_inbound_activity,
         })
     }
 
     #[inline]
     fn note_inbound(&self) {
+        if !self.tracks_inbound_activity {
+            return;
+        }
         let now_ms = self.epoch.elapsed().as_millis() as u64;
         self.last_inbound_ms.fetch_max(now_ms, Ordering::Relaxed);
     }
@@ -1105,7 +1110,10 @@ where
     pub fn split(self) -> (SplitReader<S>, SplitWriter<S>) {
         let (reader, writer) = tokio::io::split(self.inner);
         let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
-        let shared = SplitShared::new(self.state != StreamState::Open);
+        let shared = SplitShared::new(
+            self.state != StreamState::Open,
+            self.heartbeat.tracks_inbound_activity(),
+        );
         let terminal_rx = shared.terminal_tx.subscribe();
         let reader_protocol = Protocol::new(
             self.protocol.role,
@@ -1747,7 +1755,7 @@ where
         let fragment_activity = self
             .protocol
             .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)?;
-        if fragment_activity {
+        if fragment_activity && self.heartbeat.tracks_inbound_activity() {
             self.heartbeat
                 .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
         }
@@ -2194,7 +2202,10 @@ where
         let (reader, writer) = tokio::io::split(self.inner);
 
         let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
-        let shared = SplitShared::new(self.state != StreamState::Open);
+        let shared = SplitShared::new(
+            self.state != StreamState::Open,
+            self.heartbeat.tracks_inbound_activity(),
+        );
         let terminal_rx = shared.terminal_tx.subscribe();
 
         // Split the protocol into reader and writer halves

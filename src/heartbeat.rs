@@ -55,6 +55,11 @@ impl Heartbeat {
         }
     }
 
+    #[inline]
+    pub(crate) fn tracks_inbound_activity(&self) -> bool {
+        !self.stopped && (self.auto_ping || self.idle_timeout_ms != 0)
+    }
+
     pub(crate) fn next_deadline(&self) -> Option<Deadline> {
         if self.stopped {
             return None;
@@ -168,6 +173,7 @@ mod tests {
     #[test]
     fn inactivity_and_matching_pong_cycle() {
         let mut heartbeat = Heartbeat::new(&config(), 0);
+        assert!(heartbeat.tracks_inbound_activity());
         assert_eq!(heartbeat.next_deadline(), Some(Deadline::Ping(10_000)));
         assert!(heartbeat.ping_due(9_999).is_none());
 
@@ -251,13 +257,17 @@ mod tests {
             .ping_interval(1)
             .idle_timeout(0)
             .build();
-        assert_eq!(Heartbeat::new(&config, 0).next_deadline(), None);
+        let heartbeat = Heartbeat::new(&config, 0);
+        assert_eq!(heartbeat.next_deadline(), None);
+        assert!(!heartbeat.tracks_inbound_activity());
 
         let zero_interval = Config::builder()
             .auto_ping(true)
             .ping_interval(0)
             .idle_timeout(0)
             .build();
-        assert_eq!(Heartbeat::new(&zero_interval, 0).next_deadline(), None);
+        let heartbeat = Heartbeat::new(&zero_interval, 0);
+        assert_eq!(heartbeat.next_deadline(), None);
+        assert!(!heartbeat.tracks_inbound_activity());
     }
 }
