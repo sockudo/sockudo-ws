@@ -12,7 +12,9 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 
 use crate::Compression;
-use crate::deflate::{DeflateConfig, DeflateContext, DeflateDecoder, DeflateEncoder};
+use crate::deflate::{
+    DeflateConfig, DeflateContext, DeflateDecoder, DeflateEncoder, DeflateWindowBits,
+};
 use crate::error::Result;
 
 /// Number of compressors in the shared pool
@@ -62,7 +64,7 @@ impl CompressionContext {
             Compression::Shared => {
                 let config = mode.to_deflate_config().unwrap();
                 CompressionContext::Shared {
-                    pool: Arc::new(SharedCompressorPool::new(config.clone())),
+                    pool: Arc::new(SharedCompressorPool::new(config.clone()).for_role(false)),
                     decoder: DeflateDecoder::new(
                         config.server_max_window_bits,
                         config.server_no_context_takeover,
@@ -157,7 +159,7 @@ struct SharedEncoderPool {
 }
 
 impl SharedEncoderPool {
-    fn new(config: &DeflateConfig, window_bits: u8) -> Self {
+    fn new(config: &DeflateConfig, window_bits: DeflateWindowBits) -> Self {
         let encoders = (0..SHARED_POOL_SIZE)
             .map(|_| {
                 Mutex::new(DeflateEncoder::new(
@@ -271,6 +273,7 @@ pub fn global_shared_pool() -> Arc<SharedCompressorPool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DeflateWindowBits;
 
     #[test]
     fn test_compression_context_disabled() {
@@ -327,7 +330,6 @@ mod tests {
             Compression::Disabled,
             Compression::Dedicated,
             Compression::Shared,
-            Compression::Window256B,
             Compression::Window1KB,
             Compression::Window2KB,
             Compression::Window4KB,
@@ -340,25 +342,44 @@ mod tests {
             } else {
                 let config = mode.to_deflate_config();
                 assert!(config.is_some(), "Mode {:?} should have config", mode);
-
-                let config = config.unwrap();
-                assert!(config.server_max_window_bits >= 8);
-                assert!(config.server_max_window_bits <= 15);
             }
         }
     }
 
     #[test]
     fn test_window_sizes() {
-        assert_eq!(Compression::Disabled.window_bits(), 0);
-        assert_eq!(Compression::Window256B.window_bits(), 8);
-        assert_eq!(Compression::Window1KB.window_bits(), 10);
-        assert_eq!(Compression::Window2KB.window_bits(), 11);
-        assert_eq!(Compression::Window4KB.window_bits(), 12);
-        assert_eq!(Compression::Window8KB.window_bits(), 13);
-        assert_eq!(Compression::Window16KB.window_bits(), 14);
-        assert_eq!(Compression::Window32KB.window_bits(), 15);
-        assert_eq!(Compression::Dedicated.window_bits(), 15);
-        assert_eq!(Compression::Shared.window_bits(), 15);
+        assert_eq!(Compression::Disabled.window_bits(), None);
+        assert_eq!(
+            Compression::Window1KB.window_bits(),
+            Some(DeflateWindowBits::Bits10)
+        );
+        assert_eq!(
+            Compression::Window2KB.window_bits(),
+            Some(DeflateWindowBits::Bits11)
+        );
+        assert_eq!(
+            Compression::Window4KB.window_bits(),
+            Some(DeflateWindowBits::Bits12)
+        );
+        assert_eq!(
+            Compression::Window8KB.window_bits(),
+            Some(DeflateWindowBits::Bits13)
+        );
+        assert_eq!(
+            Compression::Window16KB.window_bits(),
+            Some(DeflateWindowBits::Bits14)
+        );
+        assert_eq!(
+            Compression::Window32KB.window_bits(),
+            Some(DeflateWindowBits::Bits15)
+        );
+        assert_eq!(
+            Compression::Dedicated.window_bits(),
+            Some(DeflateWindowBits::Bits15)
+        );
+        assert_eq!(
+            Compression::Shared.window_bits(),
+            Some(DeflateWindowBits::Bits15)
+        );
     }
 }
