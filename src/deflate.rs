@@ -14,6 +14,8 @@ use std::mem::MaybeUninit;
 pub use crate::DeflateWindowBits;
 use crate::error::{Error, Result};
 
+const INLINE_DEFLATE_INPUT_SIZE: usize = 4096;
+
 /// Trailer bytes that must be removed after compression and added before decompression
 const DEFLATE_TRAILER: [u8; 4] = [0x00, 0x00, 0xff, 0xff];
 
@@ -412,33 +414,54 @@ impl DeflateDecoder {
         let initial_cap = data.len().saturating_mul(4).max(1024).min(max_size);
         let mut output = Vec::with_capacity(initial_cap);
 
-        // Per RFC 7692: append the sync-flush trailer before decoding.
-        let mut input = BytesMut::with_capacity(data.len().saturating_add(4));
-        input.extend_from_slice(data);
-        input.extend_from_slice(&DEFLATE_TRAILER);
-        self.inflate_input(&input, data.len(), &mut output, max_size)?;
+        // Per RFC 7692: Append 0x00 0x00 0xff 0xff before decompressing.
+        // Short payloads get the trailer appended in a stack buffer, so the
+        // common case allocates nothing for input. Longer payloads are
+        // inflated in place and the trailer follows as a second chunk.
+        if data.len() <= INLINE_DEFLATE_INPUT_SIZE {
+            let mut inline_input =
+                MaybeUninit::<[u8; INLINE_DEFLATE_INPUT_SIZE + DEFLATE_TRAILER.len()]>::uninit();
+            let input_len = data.len() + DEFLATE_TRAILER.len();
+            let input_ptr = inline_input.as_mut_ptr().cast::<u8>();
+            // SAFETY: both copies stay within inline_input, initialize exactly
+            // input_len bytes, and the returned slice cannot outlive the array.
+            let input = unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), input_ptr, data.len());
+                std::ptr::copy_nonoverlapping(
+                    DEFLATE_TRAILER.as_ptr(),
+                    input_ptr.add(data.len()),
+                    DEFLATE_TRAILER.len(),
+                );
+                std::slice::from_raw_parts(input_ptr, input_len)
+            };
+            self.inflate_input(input, data.len(), &mut output, max_size)?;
+        } else if !self.inflate_input(data, data.len(), &mut output, max_size)? {
+            // No trailer byte is payload: a final block that ends while its
+            // output is still pending reaches StreamEnd before consuming any.
+            self.inflate_input(&DEFLATE_TRAILER, 0, &mut output, max_size)?;
+        }
 
         Ok(Bytes::from(output))
     }
 
     /// Inflate `input`, whose first `payload_len` bytes are message payload.
     ///
-    /// When a final DEFLATE block ends exactly at the payload end, the synthetic
-    /// trailer must not be fed to the fresh stream.
+    /// Returns whether a final DEFLATE block ended exactly at the payload end;
+    /// the synthetic trailer must then not be fed to the fresh stream.
     fn inflate_input(
         &mut self,
         mut input: &[u8],
         payload_len: usize,
         output: &mut Vec<u8>,
         max_size: usize,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let input_len = input.len();
         while !input.is_empty() {
             let (status, consumed) = self.inflate_chunk(input, output, max_size)?;
             input = &input[consumed..];
             if status != Status::StreamEnd {
                 if input.is_empty() {
-                    return Ok(());
+                    return Ok(false);
                 }
                 return Err(Error::Compression("incomplete deflate payload".into()));
             }
@@ -446,10 +469,10 @@ impl DeflateDecoder {
             // stream still references the window decoded so far.
             self.decompress.reset(!self.no_context_takeover)?;
             if input_len - input.len() == payload_len {
-                return Ok(());
+                return Ok(true);
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Inflate one input chunk, growing `output` while the decoder fills it.
