@@ -1160,6 +1160,8 @@ pub struct CompioWebSocketStream<S> {
     state: CompioStreamState,
     config: Config,
     pending_messages: Vec<Message>,
+    // Deliver accepted messages before a later parse failure.
+    pending_parse_error: Option<Error>,
     clock_epoch: Instant,
     heartbeat: Heartbeat,
     high_water_mark: usize,
@@ -1197,6 +1199,7 @@ where
             state: CompioStreamState::Open,
             config,
             pending_messages: Vec::new(),
+            pending_parse_error: None,
             clock_epoch,
             heartbeat,
             high_water_mark: DEFAULT_HIGH_WATER_MARK,
@@ -1301,13 +1304,18 @@ where
                 return Some(self.handle_incoming_message(msg).await);
             }
 
+            if let Some(error) = self.pending_parse_error.take() {
+                self.heartbeat.stop();
+                self.state = CompioStreamState::Closed;
+                return Some(Err(error));
+            }
+
             match self.process_read_buf() {
                 Ok(true) => continue,
                 Ok(false) => {}
-                Err(e) => {
-                    self.heartbeat.stop();
-                    self.state = CompioStreamState::Closed;
-                    return Some(Err(e));
+                Err(error) => {
+                    self.pending_parse_error = Some(error);
+                    continue;
                 }
             }
 
@@ -1450,10 +1458,11 @@ where
         // Reuse the message Vec across reads; messages are popped from the
         // back, so keep them in reverse order.
         debug_assert!(self.pending_messages.is_empty());
-        self.protocol
-            .process_into(&mut self.read_buf, &mut self.pending_messages)?;
+        let result = self
+            .protocol
+            .process_into(&mut self.read_buf, &mut self.pending_messages);
         self.pending_messages.reverse();
-        Ok(!self.pending_messages.is_empty())
+        result.map(|()| !self.pending_messages.is_empty())
     }
 
     #[inline]
@@ -1473,6 +1482,9 @@ where
             }
             Message::Close(reason) => {
                 self.heartbeat.stop();
+                self.pending_messages.clear();
+                self.pending_parse_error = None;
+                self.read_buf.clear();
                 if self.state == CompioStreamState::Open {
                     self.protocol.encode_close_response(&mut self.write_buf);
                     if let Err(error) = self.flush().await {
@@ -1536,6 +1548,7 @@ where
                 protocol: reader_protocol,
                 read_buf: self.read_buf,
                 pending_messages: self.pending_messages,
+                pending_parse_error: self.pending_parse_error,
                 control_tx,
                 terminal_rx,
                 cancel_tx: cancel_tx.clone(),
@@ -1631,6 +1644,8 @@ pub struct CompioSplitReader<R> {
     protocol: Protocol,
     read_buf: BytesMut,
     pending_messages: Vec<Message>,
+    // Deliver accepted messages before a later parse failure.
+    pending_parse_error: Option<Error>,
     control_tx: mpsc::Sender<ControlRequest>,
     terminal_rx: mpsc::UnboundedReceiver<CompioTerminalCause>,
     cancel_tx: mpsc::UnboundedSender<()>,
@@ -1653,7 +1668,10 @@ where
     /// Receive the next message, including Ping and Pong control frames.
     pub async fn next(&mut self) -> Option<Result<Message>> {
         loop {
-            if self.shared.status.get() == SPLIT_CLOSED {
+            if self.terminal_reported {
+                return None;
+            }
+            if self.pending_parse_error.is_none() && self.shared.status.get() == SPLIT_CLOSED {
                 if self.terminal_reported {
                     return None;
                 }
@@ -1673,6 +1691,10 @@ where
                     Message::Pong(data) => ControlRequest::Pong(data.clone(), Instant::now()),
                     Message::Close(_) => {
                         self.shared.begin_closing();
+                        self.pending_messages.clear();
+                        self.pending_parse_error = None;
+                        self.read_buf.clear();
+                        self.terminal_reported = true;
                         ControlRequest::PeerClose
                     }
                     _ => {
@@ -1689,6 +1711,12 @@ where
                 return Some(Ok(msg));
             }
 
+            if let Some(error) = self.pending_parse_error.take() {
+                self.shared.terminate(CompioTerminalCause::ConnectionClosed);
+                self.terminal_reported = true;
+                return Some(Err(error));
+            }
+
             if !self.read_buf.is_empty() {
                 debug_assert!(self.pending_messages.is_empty());
                 match self
@@ -1701,9 +1729,10 @@ where
                             continue;
                         }
                     }
-                    Err(e) => {
-                        self.shared.terminate(CompioTerminalCause::ConnectionClosed);
-                        return Some(Err(e));
+                    Err(error) => {
+                        self.pending_messages.reverse();
+                        self.pending_parse_error = Some(error);
+                        continue;
                     }
                 }
             }
@@ -2138,6 +2167,8 @@ pub struct CompioCompressedWebSocketStream<S> {
     state: CompioStreamState,
     config: Config,
     pending_messages: Vec<Message>,
+    // Deliver accepted messages before a later parse failure.
+    pending_parse_error: Option<Error>,
     clock_epoch: Instant,
     heartbeat: Heartbeat,
     high_water_mark: usize,
@@ -2180,6 +2211,7 @@ where
             state: CompioStreamState::Open,
             config,
             pending_messages: Vec::new(),
+            pending_parse_error: None,
             clock_epoch,
             heartbeat,
             high_water_mark: DEFAULT_HIGH_WATER_MARK,
@@ -2218,6 +2250,7 @@ where
             state: CompioStreamState::Open,
             config,
             pending_messages: Vec::new(),
+            pending_parse_error: None,
             clock_epoch,
             heartbeat,
             high_water_mark: DEFAULT_HIGH_WATER_MARK,
@@ -2242,13 +2275,18 @@ where
                 return Some(self.handle_incoming_message(msg).await);
             }
 
+            if let Some(error) = self.pending_parse_error.take() {
+                self.heartbeat.stop();
+                self.state = CompioStreamState::Closed;
+                return Some(Err(error));
+            }
+
             match self.process_read_buf() {
                 Ok(true) => continue,
                 Ok(false) => {}
-                Err(e) => {
-                    self.heartbeat.stop();
-                    self.state = CompioStreamState::Closed;
-                    return Some(Err(e));
+                Err(error) => {
+                    self.pending_parse_error = Some(error);
+                    continue;
                 }
             }
 
@@ -2415,10 +2453,11 @@ where
         // Reuse the message Vec across reads; messages are popped from the
         // back, so keep them in reverse order.
         debug_assert!(self.pending_messages.is_empty());
-        self.protocol
-            .process_into(&mut self.read_buf, &mut self.pending_messages)?;
+        let result = self
+            .protocol
+            .process_into(&mut self.read_buf, &mut self.pending_messages);
         self.pending_messages.reverse();
-        Ok(!self.pending_messages.is_empty())
+        result.map(|()| !self.pending_messages.is_empty())
     }
 
     #[inline]
@@ -2438,6 +2477,9 @@ where
             }
             Message::Close(reason) => {
                 self.heartbeat.stop();
+                self.pending_messages.clear();
+                self.pending_parse_error = None;
+                self.read_buf.clear();
                 if self.state == CompioStreamState::Open {
                     self.protocol.encode_close_response(&mut self.write_buf);
                     if let Err(error) = self.flush().await {
@@ -2499,6 +2541,7 @@ where
                 protocol: reader_protocol,
                 read_buf: self.read_buf,
                 pending_messages: self.pending_messages,
+                pending_parse_error: self.pending_parse_error,
                 control_tx,
                 terminal_rx,
                 cancel_tx: cancel_tx.clone(),
@@ -2522,6 +2565,8 @@ pub struct CompioCompressedSplitReader<R> {
     protocol: CompressedReaderProtocol,
     read_buf: BytesMut,
     pending_messages: Vec<Message>,
+    // Deliver accepted messages before a later parse failure.
+    pending_parse_error: Option<Error>,
     control_tx: mpsc::Sender<ControlRequest>,
     terminal_rx: mpsc::UnboundedReceiver<CompioTerminalCause>,
     cancel_tx: mpsc::UnboundedSender<()>,
@@ -2546,7 +2591,10 @@ where
     /// Receive the next non-control message.
     pub async fn next(&mut self) -> Option<Result<Message>> {
         loop {
-            if self.shared.status.get() == SPLIT_CLOSED {
+            if self.terminal_reported {
+                return None;
+            }
+            if self.pending_parse_error.is_none() && self.shared.status.get() == SPLIT_CLOSED {
                 if self.terminal_reported {
                     return None;
                 }
@@ -2566,6 +2614,10 @@ where
                     Message::Pong(data) => ControlRequest::Pong(data.clone(), Instant::now()),
                     Message::Close(_) => {
                         self.shared.begin_closing();
+                        self.pending_messages.clear();
+                        self.pending_parse_error = None;
+                        self.read_buf.clear();
+                        self.terminal_reported = true;
                         ControlRequest::PeerClose
                     }
                     _ => {
@@ -2582,6 +2634,12 @@ where
                 return Some(Ok(msg));
             }
 
+            if let Some(error) = self.pending_parse_error.take() {
+                self.shared.terminate(CompioTerminalCause::ConnectionClosed);
+                self.terminal_reported = true;
+                return Some(Err(error));
+            }
+
             if !self.read_buf.is_empty() {
                 debug_assert!(self.pending_messages.is_empty());
                 match self
@@ -2594,9 +2652,10 @@ where
                             continue;
                         }
                     }
-                    Err(e) => {
-                        self.shared.terminate(CompioTerminalCause::ConnectionClosed);
-                        return Some(Err(e));
+                    Err(error) => {
+                        self.pending_messages.reverse();
+                        self.pending_parse_error = Some(error);
+                        continue;
                     }
                 }
             }
