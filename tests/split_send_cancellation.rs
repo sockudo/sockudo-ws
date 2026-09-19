@@ -16,10 +16,10 @@ async fn cancelled_partial_send_closes_connection_before_next_frame() {
         let send = writer.send(Message::binary(vec![42; 64]));
         tokio::pin!(send);
         assert!(poll!(&mut send).is_pending());
+        let mut prefix = [0; 8];
+        peer.read_exact(&mut prefix).await.unwrap();
+        assert_eq!(&prefix[..2], &[0x82, 64]);
     }
-    let mut prefix = [0; 8];
-    peer.read_exact(&mut prefix).await.unwrap();
-    assert_eq!(&prefix[..2], &[0x82, 64]);
     assert!(writer.is_closed());
     assert!(matches!(
         writer.send(Message::text("next")).await,
@@ -44,9 +44,9 @@ async fn cancelled_compressed_writer_send_closes_connection() {
         let send = writer.send(Message::Ping(Bytes::from(vec![42; 64])));
         tokio::pin!(send);
         assert!(poll!(&mut send).is_pending());
+        let mut prefix = [0; 8];
+        peer.read_exact(&mut prefix).await.unwrap();
     }
-    let mut prefix = [0; 8];
-    peer.read_exact(&mut prefix).await.unwrap();
     assert!(writer.is_closed());
     assert!(matches!(
         writer.send(Message::text("next")).await,
