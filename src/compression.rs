@@ -12,7 +12,9 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 
 use crate::Compression;
-use crate::deflate::{DeflateConfig, DeflateContext, DeflateDecoder, DeflateEncoder};
+use crate::deflate::{
+    DeflateConfig, DeflateContext, DeflateDecoder, DeflateEncoder, DeflateWindowBits,
+};
 use crate::error::Result;
 
 /// Number of compressors in the shared pool
@@ -62,7 +64,7 @@ impl CompressionContext {
             Compression::Shared => {
                 let config = mode.to_deflate_config().unwrap();
                 CompressionContext::Shared {
-                    pool: Arc::new(SharedCompressorPool::new(config.clone())),
+                    pool: Arc::new(SharedCompressorPool::new(config.clone()).for_role(false)),
                     decoder: DeflateDecoder::new(
                         config.server_max_window_bits,
                         config.server_no_context_takeover,
@@ -157,7 +159,7 @@ struct SharedEncoderPool {
 }
 
 impl SharedEncoderPool {
-    fn new(config: &DeflateConfig, window_bits: u8) -> Self {
+    fn new(config: &DeflateConfig, window_bits: DeflateWindowBits) -> Self {
         let encoders = (0..SHARED_POOL_SIZE)
             .map(|_| {
                 Mutex::new(DeflateEncoder::new(
