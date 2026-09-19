@@ -77,14 +77,14 @@ fn generate_key_bytes_inner() -> [u8; 16] {
 #[inline]
 fn generate_mask_inner() -> [u8; 4] {
     let mut buf = [0u8; 4];
-    getrandom::getrandom(&mut buf).expect("getrandom failed");
+    getrandom::fill(&mut buf).expect("getrandom failed");
     buf
 }
 
 #[cfg(all(feature = "rand_rng", not(feature = "getrandom")))]
 #[inline]
 fn generate_mask_inner() -> [u8; 4] {
-    use rand::Rng;
+    use rand::RngExt;
     rand::rng().random()
 }
 

@@ -704,7 +704,7 @@ pub fn generate_mask() -> [u8; 4] {
     #[cfg(all(feature = "getrandom", not(feature = "fastrand")))]
     {
         let mut buf = [0u8; 4];
-        getrandom::getrandom(&mut buf).expect("getrandom failed");
+        getrandom::fill(&mut buf).expect("getrandom failed");
         return buf;
     }
 
@@ -714,7 +714,7 @@ pub fn generate_mask() -> [u8; 4] {
         not(feature = "getrandom")
     ))]
     {
-        use rand::Rng;
+        use rand::RngExt;
         return rand::rng().random::<[u8; 4]>();
     }
 

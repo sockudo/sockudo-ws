@@ -965,11 +965,12 @@ mod tokio_http3_tests {
     async fn tokio_http3_echo_round_trip() {
         install_test_crypto_provider();
 
-        let rcgen::CertifiedKey { cert, key_pair } =
+        let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
 
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
-        let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
 
         let server_tls = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -1019,11 +1020,12 @@ mod tokio_http3_tests {
     async fn tokio_http3_multiplexed_round_trip() {
         install_test_crypto_provider();
 
-        let rcgen::CertifiedKey { cert, key_pair } =
+        let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
 
         let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
-        let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
 
         let server_tls = rustls::ServerConfig::builder()
             .with_no_client_auth()
