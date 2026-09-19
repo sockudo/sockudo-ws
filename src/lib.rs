@@ -434,6 +434,12 @@ pub struct Config {
     pub max_frame_size: usize,
     /// Write buffer size for corking (default: 16KB)
     pub write_buffer_size: usize,
+    /// Disable Nagle on TCP sockets created by the built-in HTTP/1 URL client
+    /// and listener server (default: true).
+    ///
+    /// This does not change caller-supplied streams or other transport backends.
+    /// Configure the underlying socket directly when providing a TCP/TLS stream.
+    pub tcp_nodelay: bool,
     /// Compression mode (default: Disabled)
     pub compression: Compression,
     /// Hard inbound-idle timeout in seconds (default: 120, 0 = disabled).
@@ -495,6 +501,7 @@ impl Default for Config {
             max_message_size: 64 * 1024 * 1024,
             max_frame_size: 16 * 1024 * 1024,
             write_buffer_size: CORK_BUFFER_SIZE,
+            tcp_nodelay: true,
             compression: Compression::Disabled,
             idle_timeout: 120,
             max_backpressure: 1024 * 1024,
@@ -529,6 +536,7 @@ impl Config {
             max_message_size: 16 * 1024,
             max_frame_size: 16 * 1024,
             write_buffer_size: CORK_BUFFER_SIZE,
+            tcp_nodelay: true,
             compression: Compression::Shared,
             // A hard inbound-idle deadline shorter than the first Ping is
             // surprising. uWS-style defaults therefore leave hard idle
@@ -566,6 +574,14 @@ impl ConfigBuilder {
         Self {
             config: Config::default(),
         }
+    }
+
+    /// Set TCP_NODELAY for the built-in HTTP/1 TCP entry points.
+    ///
+    /// Caller-supplied streams and other transport backends are unaffected.
+    pub fn tcp_nodelay(mut self, enabled: bool) -> Self {
+        self.config.tcp_nodelay = enabled;
+        self
     }
 
     /// Set compression mode
