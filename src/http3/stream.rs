@@ -106,7 +106,8 @@ impl AsyncRead for Http3Stream {
         // First, drain any pending bytes from h3 layer
         if let Some(pending) = this.pending_bytes {
             let to_copy = std::cmp::min(buf.remaining(), pending.len());
-            buf.put_slice(&pending.split_to(to_copy));
+            buf.put_slice(&pending[..to_copy]);
+            pending.advance(to_copy);
             if pending.is_empty() {
                 *this.pending_bytes = None;
             }
@@ -116,7 +117,8 @@ impl AsyncRead for Http3Stream {
         // Then try internal buffer
         if !this.recv_buf.is_empty() {
             let to_copy = std::cmp::min(buf.remaining(), this.recv_buf.len());
-            buf.put_slice(&this.recv_buf.split_to(to_copy));
+            buf.put_slice(&this.recv_buf[..to_copy]);
+            this.recv_buf.advance(to_copy);
             return Poll::Ready(Ok(()));
         }
 
@@ -315,7 +317,8 @@ impl AsyncRead for Http3ServerStream {
         // First drain any buffered data
         if !this.read_buf.is_empty() {
             let to_copy = std::cmp::min(buf.remaining(), this.read_buf.len());
-            buf.put_slice(&this.read_buf.split_to(to_copy));
+            buf.put_slice(&this.read_buf[..to_copy]);
+            this.read_buf.advance(to_copy);
             return Poll::Ready(Ok(()));
         }
 
@@ -433,7 +436,8 @@ impl AsyncRead for Http3ClientStream {
         // First drain any buffered data
         if !this.read_buf.is_empty() {
             let to_copy = std::cmp::min(buf.remaining(), this.read_buf.len());
-            buf.put_slice(&this.read_buf.split_to(to_copy));
+            buf.put_slice(&this.read_buf[..to_copy]);
+            this.read_buf.advance(to_copy);
             return Poll::Ready(Ok(()));
         }
 
