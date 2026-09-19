@@ -1733,7 +1733,7 @@ where
 
     /// Send a WebSocket message.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
-        if self.state == CompioStreamState::Closed {
+        if self.state == CompioStreamState::Closed || self.pending_terminal_error.is_some() {
             return Err(Error::ConnectionClosed);
         }
 
@@ -1769,7 +1769,7 @@ where
 
     /// Send a close frame.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
-        if self.state != CompioStreamState::Open {
+        if self.state != CompioStreamState::Open || self.pending_terminal_error.is_some() {
             return Ok(());
         }
 
@@ -1873,6 +1873,18 @@ where
         let (cancel_tx, cancel_rx) = mpsc::unbounded();
         let (terminal_tx, terminal_rx) = mpsc::unbounded();
         let shared = CompioSplitShared::new(self.state != CompioStreamState::Open, &self.config);
+        // Splitting must not reopen application writes after a known parse error.
+        // A preceding accepted Close still needs its automatic response.
+        if self.pending_terminal_error.is_some() {
+            shared.begin_closing();
+            if !self.pending_messages[self.pending_index..]
+                .iter()
+                .any(Message::is_close)
+            {
+                shared.terminate(CompioTerminalCause::ConnectionClosed);
+                let _ = cancel_tx.unbounded_send(());
+            }
+        }
 
         let writer_protocol = Protocol::new(
             self.protocol.role,
@@ -2035,6 +2047,17 @@ where
     pub async fn next(&mut self) -> Option<Result<Message>> {
         compio_consume_read_budget(&mut self.read_budget).await;
         loop {
+            // Stop writes without discarding the already accepted message prefix.
+            // Only unread messages count when checking for a preceding Close.
+            if self.pending_terminal_error.is_some()
+                && self.shared.is_open()
+                && !self.pending_messages[self.pending_index..]
+                    .iter()
+                    .any(Message::is_close)
+            {
+                self.shared.terminate(CompioTerminalCause::ConnectionClosed);
+                compio_cancel_read(&self.shared, &self.cancel_tx);
+            }
             if self.pending_terminal_error.is_none() {
                 if self.terminal_reported {
                     return None;
@@ -2058,6 +2081,16 @@ where
                     self.pending_index = 0;
                 }
 
+                if self.pending_terminal_error.is_some() && self.shared.status.get() == SPLIT_CLOSED
+                {
+                    if msg.is_close() {
+                        self.pending_messages.clear();
+                        self.pending_index = 0;
+                        self.pending_terminal_error = None;
+                        self.terminal_reported = true;
+                    }
+                    return Some(Ok(msg));
+                }
                 let request = match &msg {
                     Message::Ping(data) => ControlRequest::PeerPing(data.clone(), Instant::now()),
                     Message::Pong(data) => ControlRequest::Pong(data.clone(), Instant::now()),
@@ -2924,7 +2957,7 @@ where
 
     /// Send a WebSocket message.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
-        if self.state == CompioStreamState::Closed {
+        if self.state == CompioStreamState::Closed || self.pending_terminal_error.is_some() {
             return Err(Error::ConnectionClosed);
         }
 
@@ -2960,7 +2993,7 @@ where
 
     /// Send a close frame.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
-        if self.state != CompioStreamState::Open {
+        if self.state != CompioStreamState::Open || self.pending_terminal_error.is_some() {
             return Ok(());
         }
 
@@ -3089,6 +3122,18 @@ where
         let (cancel_tx, cancel_rx) = mpsc::unbounded();
         let (terminal_tx, terminal_rx) = mpsc::unbounded();
         let shared = CompioSplitShared::new(self.state != CompioStreamState::Open, &self.config);
+        // Splitting must not reopen application writes after a known parse error.
+        // A preceding accepted Close still needs its automatic response.
+        if self.pending_terminal_error.is_some() {
+            shared.begin_closing();
+            if !self.pending_messages[self.pending_index..]
+                .iter()
+                .any(Message::is_close)
+            {
+                shared.terminate(CompioTerminalCause::ConnectionClosed);
+                let _ = cancel_tx.unbounded_send(());
+            }
+        }
         let (reader_protocol, writer_protocol) = self
             .protocol
             .split(self.config.max_frame_size, self.config.max_message_size);
@@ -3173,6 +3218,17 @@ where
     pub async fn next(&mut self) -> Option<Result<Message>> {
         compio_consume_read_budget(&mut self.read_budget).await;
         loop {
+            // Stop writes without discarding the already accepted message prefix.
+            // Only unread messages count when checking for a preceding Close.
+            if self.pending_terminal_error.is_some()
+                && self.shared.is_open()
+                && !self.pending_messages[self.pending_index..]
+                    .iter()
+                    .any(Message::is_close)
+            {
+                self.shared.terminate(CompioTerminalCause::ConnectionClosed);
+                compio_cancel_read(&self.shared, &self.cancel_tx);
+            }
             if self.pending_terminal_error.is_none() {
                 if self.terminal_reported {
                     return None;
@@ -3196,6 +3252,16 @@ where
                     self.pending_index = 0;
                 }
 
+                if self.pending_terminal_error.is_some() && self.shared.status.get() == SPLIT_CLOSED
+                {
+                    if msg.is_close() {
+                        self.pending_messages.clear();
+                        self.pending_index = 0;
+                        self.pending_terminal_error = None;
+                        self.terminal_reported = true;
+                    }
+                    return Some(Ok(msg));
+                }
                 let request = match &msg {
                     Message::Ping(data) => ControlRequest::PeerPing(data.clone(), Instant::now()),
                     Message::Pong(data) => ControlRequest::Pong(data.clone(), Instant::now()),
