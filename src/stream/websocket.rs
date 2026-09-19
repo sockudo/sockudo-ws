@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures_core::Stream;
 use futures_sink::Sink;
 use pin_project_lite::pin_project;
@@ -282,13 +282,13 @@ where
         use tokio::io::AsyncWriteExt;
 
         while self.write_buf.has_data() {
-            let mut slices = [IoSlice::new(&[]); MAX_WRITE_SLICES];
-            let count = self.write_buf.fill_write_slices(&mut slices);
-            if count == 0 {
-                break;
-            }
-
-            let n = self.inner.write_vectored(&slices[..count]).await?;
+            let n = if self.write_buf.has_segments() && self.inner.is_write_vectored() {
+                let mut slices = [IoSlice::new(&[]); MAX_WRITE_SLICES];
+                let count = self.write_buf.fill_write_slices(&mut slices);
+                self.inner.write_vectored(&slices[..count]).await?
+            } else {
+                self.inner.write(self.write_buf.chunk()).await?
+            };
             if n == 0 {
                 return Err(Error::ConnectionClosed);
             }
@@ -402,13 +402,14 @@ where
 
         // Write all pending data
         while this.write_buf.has_data() {
-            let mut slices = [IoSlice::new(&[]); MAX_WRITE_SLICES];
-            let count = this.write_buf.fill_write_slices(&mut slices);
-            if count == 0 {
-                break;
-            }
-
-            match Pin::new(&mut this.inner).poll_write_vectored(cx, &slices[..count]) {
+            let result = if this.write_buf.has_segments() && this.inner.is_write_vectored() {
+                let mut slices = [IoSlice::new(&[]); MAX_WRITE_SLICES];
+                let count = this.write_buf.fill_write_slices(&mut slices);
+                Pin::new(&mut this.inner).poll_write_vectored(cx, &slices[..count])
+            } else {
+                Pin::new(&mut this.inner).poll_write(cx, this.write_buf.chunk())
+            };
+            match result {
                 Poll::Ready(Ok(0)) => {
                     this.state = StreamState::Closed;
                     this.heartbeat.stop();
@@ -1685,13 +1686,13 @@ where
         use tokio::io::AsyncWriteExt;
 
         while self.write_buf.has_data() {
-            let mut slices = [IoSlice::new(&[]); MAX_WRITE_SLICES];
-            let count = self.write_buf.fill_write_slices(&mut slices);
-            if count == 0 {
-                break;
-            }
-
-            let n = self.inner.write_vectored(&slices[..count]).await?;
+            let n = if self.write_buf.has_segments() && self.inner.is_write_vectored() {
+                let mut slices = [IoSlice::new(&[]); MAX_WRITE_SLICES];
+                let count = self.write_buf.fill_write_slices(&mut slices);
+                self.inner.write_vectored(&slices[..count]).await?
+            } else {
+                self.inner.write(self.write_buf.chunk()).await?
+            };
             if n == 0 {
                 return Err(Error::ConnectionClosed);
             }
@@ -1797,13 +1798,14 @@ where
         let this = self.as_mut().get_mut();
 
         while this.write_buf.has_data() {
-            let mut slices = [IoSlice::new(&[]); MAX_WRITE_SLICES];
-            let count = this.write_buf.fill_write_slices(&mut slices);
-            if count == 0 {
-                break;
-            }
-
-            match Pin::new(&mut this.inner).poll_write_vectored(cx, &slices[..count]) {
+            let result = if this.write_buf.has_segments() && this.inner.is_write_vectored() {
+                let mut slices = [IoSlice::new(&[]); MAX_WRITE_SLICES];
+                let count = this.write_buf.fill_write_slices(&mut slices);
+                Pin::new(&mut this.inner).poll_write_vectored(cx, &slices[..count])
+            } else {
+                Pin::new(&mut this.inner).poll_write(cx, this.write_buf.chunk())
+            };
+            match result {
                 Poll::Ready(Ok(0)) => {
                     this.state = StreamState::Closed;
                     this.heartbeat.stop();
