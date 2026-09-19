@@ -883,6 +883,8 @@ enum ControlRequest {
     Ping(Bytes, tokio::time::Instant),
     Pong(Bytes, tokio::time::Instant),
     PeerClose,
+    /// Start one closing budget before the application writes its Close frame.
+    LocalCloseStarted(tokio::time::Instant),
     /// The application wrote a Close frame through the shared sink.
     LocalCloseSent,
     Eof,
@@ -1045,6 +1047,11 @@ where
         }
         let is_close = msg.is_close();
         if is_close {
+            let started = tokio::time::Instant::now();
+            self.control_tx
+                .send(ControlRequest::LocalCloseStarted(started))
+                .await
+                .map_err(|_| Error::ConnectionClosed)?;
             self.shared.begin_closing();
         }
         let result = sink
@@ -1531,6 +1538,10 @@ async fn split_writer_driver<W, E>(
                             tokio::time::Instant::now()
                                 + Duration::from_secs(config.close_timeout.into())
                         });
+                    }
+                    ControlRequest::LocalCloseStarted(started) => {
+                        heartbeat.stop();
+                        closing_deadline.get_or_insert(started + Duration::from_secs(config.close_timeout.into()));
                     }
                     ControlRequest::LocalCloseSent => {
                         heartbeat.stop();
