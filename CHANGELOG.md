@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- HTTP/3 endpoint configuration now takes effect, including the configured default 1 MiB stream window and 1350-byte UDP payload limit; these can differ from implicit Quinn defaults. Unsupported 0-RTT is rejected explicitly.
+
 - Outbound frames are coalesced across `send()` calls while inbound messages
   that were already parsed are still queued for the application
   (`Config::write_coalescing`, default on). A read batch of N messages

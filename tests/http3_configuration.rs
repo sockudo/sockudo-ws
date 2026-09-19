@@ -116,3 +116,40 @@ async fn tokio_client_rejects_disabled_extended_connect_before_connecting() {
         Err(sockudo_ws::Error::ExtendedConnectNotSupported)
     ));
 }
+
+#[tokio::test]
+async fn disabled_server_extended_connect_rejects_a_real_request() {
+    use sockudo_ws::{Config, Error, Http3, WebSocketClient, WebSocketServer};
+    use std::sync::Arc;
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (server_tls, client_tls) = h3_support::tls_configs();
+        let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).unwrap();
+        let endpoint = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(crypto)),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let server = WebSocketServer::<Http3>::from_endpoint(
+            endpoint.clone(),
+            Config::builder()
+                .http3_enable_connect_protocol(false)
+                .build(),
+        );
+        let serving = tokio::spawn(async move {
+            server
+                .serve(|_, _| async { panic!("disabled CONNECT reached handler") })
+                .await
+        });
+        let client = WebSocketClient::<Http3>::new(Config::default());
+
+        let result = client.connect(addr, "localhost", "/", client_tls).await;
+
+        assert!(matches!(result, Err(Error::ExtendedConnectNotSupported)));
+        endpoint.close(quinn::VarInt::from_u32(0x100), b"done");
+        serving.await.unwrap().unwrap();
+    })
+    .await
+    .unwrap();
+}
