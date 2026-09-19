@@ -1048,10 +1048,12 @@ where
             self.shared.terminate(TerminalCause::ConnectionClosed);
             return result;
         }
+        // The frame is fully flushed; cancelling a later control notification
+        // must not abort an otherwise complete write.
+        cancellation.completed = true;
         if is_close {
             let _ = self.control_tx.send(ControlRequest::LocalCloseSent).await;
         }
-        cancellation.completed = true;
         Ok(())
     }
 
@@ -1308,8 +1310,9 @@ where
     ///
     /// Cancelling after acquiring the write sink closes the connection: a
     /// partially written frame cannot safely be followed by another frame.
-    /// This also applies when the transport has not accepted any bytes yet,
-    /// or a Close was written but its driver notification is still pending.
+    /// This also applies when the transport has not accepted any bytes yet.
+    /// Once the frame is flushed, cancellation of a pending Close notification
+    /// does not abort the transport.
     /// Use a retained send future when racing it with other work; dropping it
     /// through `timeout` or `select!` abandons the connection at this boundary.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
@@ -2997,3 +3000,6 @@ mod tests {
         assert_eq!(big.as_ptr(), big_ptr);
     }
 }
+
+#[cfg(test)]
+mod cancellation_tests;
