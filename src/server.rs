@@ -240,6 +240,7 @@ impl WebSocketServer<Http1> {
     ///
     /// This is a convenience method that accepts connections from a listener
     /// and calls the handler for each successful WebSocket upgrade.
+    /// Accepted TCP sockets have `TCP_NODELAY` enabled when supported.
     ///
     /// # Example
     ///
@@ -264,11 +265,15 @@ impl WebSocketServer<Http1> {
     {
         loop {
             let (stream, _addr) = listener.accept().await.map_err(Error::Io)?;
-
             let handler = handler.clone();
             let config = self.config.clone();
 
             tokio::spawn(async move {
+                // A socket-option failure need not prevent a valid handshake.
+                // Report it locally and keep serving this connection.
+                if let Err(error) = stream.set_nodelay(true) {
+                    eprintln!("WebSocket socket setup error: {error}");
+                }
                 let server = WebSocketServer::<Http1>::new(config);
                 match server.accept(stream).await {
                     Ok((ws, handshake)) => {
