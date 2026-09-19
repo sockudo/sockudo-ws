@@ -24,8 +24,9 @@
 //! 3. Process unaligned suffix bytes with scalar operations
 //!
 //! This retains aligned loads/stores on those architectures. The aarch64 kernel
-//! uses unaligned, non-overlapping chunks to avoid scalar prefix work on short
-//! WebSocket payloads.
+//! uses unaligned, non-overlapping chunks. This differs from the upstream
+//! word-loop strategy for short payloads; neither path requires alignment
+//! prefixes in that size range.
 //!
 //! # Architecture Support
 //!
