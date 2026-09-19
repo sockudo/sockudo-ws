@@ -304,6 +304,11 @@ where
         let this = self.project();
 
         // Ensure we have space in the buffer
+        // Reuse an empty receive window when no delivered payload still owns it.
+        if this.read_buf.is_empty() {
+            let _ = this.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE);
+        }
+
         if this.read_buf.capacity() - this.read_buf.len() < 4096 {
             this.read_buf.reserve(crate::RECV_BUFFER_SIZE);
         }
@@ -1201,6 +1206,11 @@ where
                 }
             }
 
+            // Reuse an empty receive window when no delivered payload still owns it.
+            if self.read_buf.is_empty() {
+                let _ = self.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE);
+            }
+
             if self.read_buf.capacity() - self.read_buf.len() < 4096 {
                 self.read_buf.reserve(crate::RECV_BUFFER_SIZE);
             }
@@ -1689,6 +1699,11 @@ where
     /// Read more data from the underlying stream
     fn poll_read_more(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         let this = self.project();
+
+        // Reuse an empty receive window when no delivered payload still owns it.
+        if this.read_buf.is_empty() {
+            let _ = this.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE);
+        }
 
         if this.read_buf.capacity() - this.read_buf.len() < 4096 {
             this.read_buf.reserve(crate::RECV_BUFFER_SIZE);
@@ -2250,6 +2265,11 @@ where
                     continue;
                 }
                 return Some(Ok(msg));
+            }
+
+            // Reuse an empty receive window when no delivered payload still owns it.
+            if self.read_buf.is_empty() {
+                let _ = self.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE);
             }
 
             if self.read_buf.capacity() - self.read_buf.len() < 4096 {
