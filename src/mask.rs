@@ -43,8 +43,13 @@ pub(crate) fn generate_key_bytes() -> [u8; 16] {
 ))]
 #[inline]
 fn generate_key_bytes_inner() -> [u8; 16] {
+    thread_local! {
+        // Public handshake nonces must not consume the frame-mask RNG stream.
+        static NONCE_RNG: std::cell::RefCell<fastrand::Rng> =
+            std::cell::RefCell::new(fastrand::Rng::new());
+    }
     let mut bytes = [0u8; 16];
-    fastrand::fill(&mut bytes);
+    NONCE_RNG.with(|rng| rng.borrow_mut().fill(&mut bytes));
     bytes
 }
 
