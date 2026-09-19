@@ -17,8 +17,10 @@ use std::time::{Duration, Instant};
 #[cfg(any(feature = "http2", feature = "http3"))]
 use ::compio::buf::IoBufMut;
 use ::compio::buf::{BufResult, IoBuf};
+use ::compio::driver::ErrorExt;
 use ::compio::io::util::Splittable;
 use ::compio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use ::compio::runtime::{CancelToken, FutureExt as CompioFutureExt};
 #[cfg(any(feature = "http2", feature = "http3"))]
 use bytes::Buf;
 use bytes::{Bytes, BytesMut};
@@ -156,6 +158,84 @@ where
     let BufResult(res, read_buf) = reader.append(read_buf).await;
     *buf = read_buf;
     res
+}
+
+#[derive(Debug)]
+struct PollReadCancelled;
+
+impl std::fmt::Display for PollReadCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("poll-based read cancelled")
+    }
+}
+
+impl std::error::Error for PollReadCancelled {}
+
+fn poll_read_cancelled() -> io::Error {
+    io::Error::other(PollReadCancelled)
+}
+
+fn read_was_cancelled(result: &io::Result<usize>) -> bool {
+    result.is_cancelled()
+        || result.as_ref().is_err_and(|error| {
+            error
+                .get_ref()
+                .is_some_and(|source| source.is::<PollReadCancelled>())
+        })
+}
+
+#[cfg(any(feature = "http2", feature = "http3"))]
+async fn poll_read_until_cancelled<F>(read: F) -> Option<F::Output>
+where
+    F: Future,
+{
+    let Some(cancel) = CancelToken::current().await else {
+        return Some(read.await);
+    };
+    let read = read.fuse();
+    let cancelled = cancel.wait().fuse();
+    futures_util::pin_mut!(read, cancelled);
+
+    // Prefer data that became ready at the deadline. This preserves the
+    // fail-slow behavior used by native Compio reads.
+    futures_util::select_biased! {
+        result = read => Some(result),
+        () = cancelled => None,
+    }
+}
+
+enum DeadlineReadOutcome {
+    Read(io::Result<usize>),
+    Deadline(Option<io::Result<usize>>),
+}
+
+async fn read_more_until<R>(
+    reader: &mut R,
+    buf: &mut BytesMut,
+    delay: Duration,
+) -> DeadlineReadOutcome
+where
+    R: AsyncRead + ?Sized,
+{
+    let cancel = CancelToken::new();
+    let read = CompioFutureExt::with_cancel(read_more(reader, buf), cancel.clone()).fuse();
+    let timer = ::compio::time::sleep(delay).fuse();
+    futures_util::pin_mut!(read, timer);
+
+    futures_util::select! {
+        result = read => DeadlineReadOutcome::Read(result),
+        () = timer => {
+            // A Compio read owns the buffer until completion. Use fail-slow
+            // cancellation so read_more restores it before heartbeat handling.
+            cancel.cancel();
+            let result = read.await;
+            if read_was_cancelled(&result) {
+                DeadlineReadOutcome::Deadline(None)
+            } else {
+                DeadlineReadOutcome::Deadline(Some(result))
+            }
+        }
+    }
 }
 
 async fn write_all_owned<W, B>(writer: &mut W, buf: B) -> io::Result<()>
@@ -467,7 +547,14 @@ impl AsyncRead for CompioHttp2Stream {
             return BufResult(Ok(0), buf);
         }
 
-        match std::future::poll_fn(|cx| Pin::new(&mut self.recv).poll_data(cx)).await {
+        let Some(result) = poll_read_until_cancelled(std::future::poll_fn(|cx| {
+            Pin::new(&mut self.recv).poll_data(cx)
+        }))
+        .await
+        else {
+            return BufResult(Err(poll_read_cancelled()), buf);
+        };
+        match result {
             Some(Ok(mut data)) => {
                 let len = data.len();
                 let _ = self.recv.flow_control().release_capacity(len);
@@ -609,7 +696,9 @@ pub async fn connect_http2<S>(
     config: Config,
 ) -> Result<CompioWebSocketStream<CompioHttp2Stream>>
 where
-    S: AsyncRead + AsyncWrite + 'static,
+    S: Splittable + 'static,
+    S::ReadHalf: AsyncRead + Unpin,
+    S::WriteHalf: AsyncWrite + Unpin,
 {
     let mut conn = connect_http2_multiplexed(stream, config).await?;
     conn.open_websocket(uri, protocol).await
@@ -622,11 +711,13 @@ pub async fn connect_http2_multiplexed<S>(
     config: Config,
 ) -> Result<CompioHttp2Connection>
 where
-    S: AsyncRead + AsyncWrite + 'static,
+    S: Splittable + 'static,
+    S::ReadHalf: AsyncRead + Unpin,
+    S::WriteHalf: AsyncWrite + Unpin,
 {
     use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-    let stream = ::compio::io::compat::AsyncStream::new(stream).compat();
+    let stream = Box::pin(::compio::io::compat::AsyncStream::new(stream)).compat();
     let mut builder = h2::client::Builder::new();
     builder
         .initial_window_size(config.http2.initial_stream_window_size)
@@ -651,7 +742,9 @@ where
 #[cfg(feature = "http2")]
 pub async fn serve_http2<S, F, Fut>(stream: S, config: Config, handler: F) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + 'static,
+    S: Splittable + 'static,
+    S::ReadHalf: AsyncRead + Unpin,
+    S::WriteHalf: AsyncWrite + Unpin,
     F: Fn(CompioWebSocketStream<CompioHttp2Stream>, ExtendedConnectRequest) -> Fut
         + Clone
         + 'static,
@@ -659,7 +752,7 @@ where
 {
     use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-    let stream = ::compio::io::compat::AsyncStream::new(stream).compat();
+    let stream = Box::pin(::compio::io::compat::AsyncStream::new(stream)).compat();
     let mut builder = h2::server::Builder::new();
     builder
         .initial_window_size(config.http2.initial_stream_window_size)
@@ -758,7 +851,10 @@ impl CompioHttp3ClientStream {
 impl AsyncRead for CompioHttp3ClientStream {
     async fn read<B: IoBufMut>(&mut self, mut buf: B) -> BufResult<usize, B> {
         if self.recv_buf.is_empty() {
-            match self.stream.recv_data().await {
+            let Some(result) = poll_read_until_cancelled(self.stream.recv_data()).await else {
+                return BufResult(Err(poll_read_cancelled()), buf);
+            };
+            match result {
                 Ok(Some(mut data)) => {
                     while data.has_remaining() {
                         let chunk = data.chunk();
@@ -824,7 +920,10 @@ impl CompioHttp3ServerStream {
 impl AsyncRead for CompioHttp3ServerStream {
     async fn read<B: IoBufMut>(&mut self, mut buf: B) -> BufResult<usize, B> {
         if self.recv_buf.is_empty() {
-            match self.stream.recv_data().await {
+            let Some(result) = poll_read_until_cancelled(self.stream.recv_data()).await else {
+                return BufResult(Err(poll_read_cancelled()), buf);
+            };
+            match result {
                 Ok(Some(mut data)) => {
                     while data.has_remaining() {
                         let chunk = data.chunk();
@@ -1314,11 +1413,9 @@ where
             let read_result = if let Some(deadline) = self.heartbeat.next_deadline() {
                 let now = self.clock_epoch.elapsed().as_millis() as u64;
                 let delay = Duration::from_millis(deadline.at().saturating_sub(now));
-                match ::compio::time::timeout(delay, read_more(&mut self.inner, &mut self.read_buf))
-                    .await
-                {
-                    Ok(result) => Some(result),
-                    Err(_) => {
+                match read_more_until(&mut self.inner, &mut self.read_buf, delay).await {
+                    DeadlineReadOutcome::Read(result) => Some(result),
+                    DeadlineReadOutcome::Deadline(read_result) => {
                         let now = self.clock_epoch.elapsed().as_millis() as u64;
                         match self.heartbeat.next_deadline() {
                             Some(Deadline::Ping(at)) if at <= now => {
@@ -1336,7 +1433,7 @@ where
                                         self.clock_epoch.elapsed().as_millis() as u64,
                                     );
                                 }
-                                None
+                                read_result
                             }
                             Some(Deadline::Pong(at)) if at <= now => {
                                 self.heartbeat.stop();
@@ -1370,7 +1467,7 @@ where
                                 self.state = CompioStreamState::Closed;
                                 return Some(Err(Error::IdleTimeout));
                             }
-                            _ => None,
+                            _ => read_result,
                         }
                     }
                 }
@@ -2255,11 +2352,9 @@ where
             let read_result = if let Some(deadline) = self.heartbeat.next_deadline() {
                 let now = self.clock_epoch.elapsed().as_millis() as u64;
                 let delay = Duration::from_millis(deadline.at().saturating_sub(now));
-                match ::compio::time::timeout(delay, read_more(&mut self.inner, &mut self.read_buf))
-                    .await
-                {
-                    Ok(result) => Some(result),
-                    Err(_) => {
+                match read_more_until(&mut self.inner, &mut self.read_buf, delay).await {
+                    DeadlineReadOutcome::Read(result) => Some(result),
+                    DeadlineReadOutcome::Deadline(read_result) => {
                         let now = self.clock_epoch.elapsed().as_millis() as u64;
                         match self.heartbeat.next_deadline() {
                             Some(Deadline::Ping(at)) if at <= now => {
@@ -2277,7 +2372,7 @@ where
                                         self.clock_epoch.elapsed().as_millis() as u64,
                                     );
                                 }
-                                None
+                                read_result
                             }
                             Some(Deadline::Pong(at)) if at <= now => {
                                 self.heartbeat.stop();
@@ -2311,7 +2406,7 @@ where
                                 self.state = CompioStreamState::Closed;
                                 return Some(Err(Error::IdleTimeout));
                             }
-                            _ => None,
+                            _ => read_result,
                         }
                     }
                 }
