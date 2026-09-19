@@ -1725,11 +1725,19 @@ where
         deflate_config: crate::deflate::DeflateConfig,
         leftover: Option<Bytes>,
     ) -> Self {
-        let protocol = crate::protocol::CompressedProtocol::server(
-            config.max_frame_size,
-            config.max_message_size,
-            deflate_config,
-        );
+        let protocol = if config.compression.is_shared() {
+            crate::protocol::CompressedProtocol::server_with_shared_compression(
+                config.max_frame_size,
+                config.max_message_size,
+                deflate_config,
+            )
+        } else {
+            crate::protocol::CompressedProtocol::server(
+                config.max_frame_size,
+                config.max_message_size,
+                deflate_config,
+            )
+        };
 
         let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);
         if let Some(leftover) = leftover {
@@ -1773,11 +1781,19 @@ where
         deflate_config: crate::deflate::DeflateConfig,
         leftover: Option<Bytes>,
     ) -> Self {
-        let protocol = crate::protocol::CompressedProtocol::client(
-            config.max_frame_size,
-            config.max_message_size,
-            deflate_config,
-        );
+        let protocol = if config.compression.is_shared() {
+            crate::protocol::CompressedProtocol::client_with_shared_compression(
+                config.max_frame_size,
+                config.max_message_size,
+                deflate_config,
+            )
+        } else {
+            crate::protocol::CompressedProtocol::client(
+                config.max_frame_size,
+                config.max_message_size,
+                deflate_config,
+            )
+        };
 
         let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);
         if let Some(leftover) = leftover {

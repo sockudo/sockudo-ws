@@ -33,6 +33,20 @@ pub enum CompressionContext {
     },
 }
 
+pub(crate) enum CompressionEncoder {
+    Dedicated(DeflateEncoder),
+    Shared(Arc<SharedCompressorPool>),
+}
+
+impl CompressionEncoder {
+    pub(crate) fn compress(&mut self, data: &[u8]) -> Result<Option<Bytes>> {
+        match self {
+            Self::Dedicated(encoder) => encoder.compress(data),
+            Self::Shared(pool) => pool.compress(data),
+        }
+    }
+}
+
 impl CompressionContext {
     /// Create a new compression context for the given mode (server role)
     pub fn server(mode: Compression) -> Self {
@@ -133,6 +147,17 @@ impl CompressionContext {
             CompressionContext::Disabled => None,
             CompressionContext::Dedicated(ctx) => Some(&ctx.config),
             CompressionContext::Shared { config, .. } => Some(config),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (CompressionEncoder, DeflateDecoder) {
+        match self {
+            Self::Disabled => panic!("compressed protocol must have a compression context"),
+            Self::Dedicated(context) => (
+                CompressionEncoder::Dedicated(context.encoder),
+                context.decoder,
+            ),
+            Self::Shared { pool, decoder, .. } => (CompressionEncoder::Shared(pool), decoder),
         }
     }
 }
