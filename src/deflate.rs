@@ -202,10 +202,13 @@ impl DeflateEncoder {
             return Ok(None);
         }
 
-        // Reset context if required
-        if self.no_context_takeover {
-            self.compress.reset();
-        }
+        // Full flush forgets history at the message boundary instead of resetting
+        // before each no-context-takeover message.
+        let flush = if self.no_context_takeover {
+            FlushCompress::Full
+        } else {
+            FlushCompress::Sync
+        };
 
         // Estimate output size (compressed data is often smaller, but we need headroom)
         let max_output = data.len() + 64;
@@ -240,7 +243,7 @@ impl DeflateEncoder {
 
             let status = self
                 .compress
-                .compress_uninit(input, spare, FlushCompress::Sync)
+                .compress_uninit(input, spare, flush)
                 .map_err(|e| Error::Compression(format!("deflate error: {}", e)))?;
 
             let consumed = (self.compress.total_in() - before_in) as usize;
