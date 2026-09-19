@@ -38,7 +38,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
-use axum::http::{Method, Response, StatusCode, header};
+use axum::http::{Method, Response, StatusCode, Version, header};
 use axum::response::IntoResponse;
 use futures_core::Stream;
 use futures_sink::Sink;
@@ -49,7 +49,11 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::Config;
 use crate::error::{CloseReason, Error, Result};
-use crate::handshake::generate_accept_key;
+use crate::handshake::{
+    contains_header_token, generate_accept_key, is_valid_extension_list, is_valid_host,
+    is_valid_protocol_list, is_valid_websocket_key, is_zero_content_length, select_subprotocol,
+    validate_supported_protocols,
+};
 use crate::protocol::{Message, Role};
 use crate::stream::WebSocketStream;
 use crate::{SplitReader, SplitWriter};
@@ -65,6 +69,7 @@ use crate::stream::{CompressedSplitReader, CompressedSplitWriter, CompressedWebS
 /// a method to upgrade the connection.
 pub struct WebSocketUpgrade {
     key: String,
+    offered_protocols: Option<String>,
     protocol: Option<String>,
     extensions: Option<String>,
     config: Config,
@@ -96,6 +101,19 @@ impl WebSocketUpgrade {
         self
     }
 
+    /// Select a client-offered subprotocol using server preference order.
+    pub fn protocols<I, P>(mut self, protocols: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<String>,
+    {
+        let protocols = protocols.into_iter().map(Into::into).collect::<Vec<_>>();
+        validate_supported_protocols(&protocols)?;
+        self.protocol =
+            select_subprotocol(self.offered_protocols.as_deref(), &protocols).map(str::to_owned);
+        Ok(self)
+    }
+
     /// Upgrade the connection and call the provided handler
     pub fn on_upgrade<F, Fut>(self, handler: F) -> WebSocketUpgradeResponse
     where
@@ -117,36 +135,28 @@ impl WebSocketUpgrade {
                 .clone()
                 .or_else(|| handler_config.compression.to_deflate_config());
 
-            if let Some(ref server_config) = deflate_config {
-                // Check if client offers permessage-deflate
-                let negotiated = self.extensions.as_deref().and_then(|ext| {
-                    crate::deflate::parse_deflate_offer(ext).and_then(|params| {
-                        // Parse and validate deflate parameters from the client's offer
-                        crate::deflate::DeflateConfig::from_params(&params)
-                            .ok()
-                            .map(|_client_config| {
-                                // Use server's config but respect client's constraints
-                                server_config.clone()
-                            })
-                    })
-                });
+            match deflate_config {
+                Some(server_config) => {
+                    // Accept only a client offer compatible with the server policy, then use the
+                    // same negotiated parameters for the response and compression codec.
+                    let negotiated = self.extensions.as_deref().and_then(|offers| {
+                        crate::deflate::negotiate_server_deflate(offers, &server_config)
+                    });
 
-                if let Some(ref config) = negotiated {
-                    (Some(config.to_response_header()), Some(config.clone()))
-                } else {
-                    (None, None)
+                    match negotiated {
+                        Some(negotiation) => (
+                            Some(negotiation.to_response_header()),
+                            Some(negotiation.config),
+                        ),
+                        None => (None, None),
+                    }
                 }
-            } else {
-                (None, None)
+                None => (None, None),
             }
         };
 
         #[cfg(not(feature = "permessage-deflate"))]
         let extensions: Option<String> = None;
-
-        #[cfg(feature = "permessage-deflate")]
-        let config_for_response = handler_config.clone();
-        #[cfg(not(feature = "permessage-deflate"))]
         let config_for_response = handler_config.clone();
 
         WebSocketUpgradeResponse {
@@ -190,6 +200,31 @@ where
         if parts.method != Method::GET {
             return Err(WebSocketUpgradeRejection::MethodNotGet);
         }
+        if parts.version != Version::HTTP_11 {
+            return Err(WebSocketUpgradeRejection::HttpVersionNot11);
+        }
+
+        let mut hosts = parts.headers.get_all(header::HOST).iter();
+        let host = hosts
+            .next()
+            .ok_or(WebSocketUpgradeRejection::MissingHostHeader)?
+            .to_str()
+            .map_err(|_| WebSocketUpgradeRejection::InvalidHostHeader)?;
+        if hosts.next().is_some() || !is_valid_host(host) {
+            return Err(WebSocketUpgradeRejection::InvalidHostHeader);
+        }
+
+        if parts.headers.contains_key(header::TRANSFER_ENCODING) {
+            return Err(WebSocketUpgradeRejection::TransferEncodingNotAllowed);
+        }
+        for content_length in parts.headers.get_all(header::CONTENT_LENGTH) {
+            let content_length = content_length
+                .to_str()
+                .map_err(|_| WebSocketUpgradeRejection::InvalidContentLength)?;
+            if !is_zero_content_length(content_length) {
+                return Err(WebSocketUpgradeRejection::InvalidContentLength);
+            }
+        }
 
         // Check Upgrade header
         let upgrade = parts
@@ -198,7 +233,7 @@ where
             .and_then(|v| v.to_str().ok())
             .ok_or(WebSocketUpgradeRejection::MissingUpgradeHeader)?;
 
-        if !upgrade.to_ascii_lowercase().contains("websocket") {
+        if !contains_header_token(upgrade, "websocket") {
             return Err(WebSocketUpgradeRejection::InvalidUpgradeHeader);
         }
 
@@ -209,7 +244,7 @@ where
             .and_then(|v| v.to_str().ok())
             .ok_or(WebSocketUpgradeRejection::MissingConnectionHeader)?;
 
-        if !connection.to_ascii_lowercase().contains("upgrade") {
+        if !contains_header_token(connection, "upgrade") {
             return Err(WebSocketUpgradeRejection::InvalidConnectionHeader);
         }
 
@@ -218,8 +253,11 @@ where
             .headers
             .get("sec-websocket-key")
             .and_then(|v| v.to_str().ok())
-            .ok_or(WebSocketUpgradeRejection::MissingSecWebSocketKey)?
-            .to_string();
+            .ok_or(WebSocketUpgradeRejection::MissingSecWebSocketKey)?;
+        if !is_valid_websocket_key(key) {
+            return Err(WebSocketUpgradeRejection::InvalidSecWebSocketKey);
+        }
+        let key = key.to_string();
 
         // Check Sec-WebSocket-Version
         let version = parts
@@ -233,18 +271,32 @@ where
         }
 
         // Optional: Sec-WebSocket-Protocol
-        let protocol = parts
-            .headers
-            .get("sec-websocket-protocol")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.split(',').next().unwrap_or("").trim().to_string());
+        let offered_protocols = combined_header_values(
+            &parts.headers,
+            "sec-websocket-protocol",
+            WebSocketUpgradeRejection::InvalidSecWebSocketProtocol,
+        )?;
+        if offered_protocols
+            .as_deref()
+            .is_some_and(|protocols| !is_valid_protocol_list(protocols))
+        {
+            return Err(WebSocketUpgradeRejection::InvalidSecWebSocketProtocol);
+        }
+
+        let protocol = None;
 
         // Optional: Sec-WebSocket-Extensions
-        let extensions = parts
-            .headers
-            .get("sec-websocket-extensions")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+        let extensions = combined_header_values(
+            &parts.headers,
+            "sec-websocket-extensions",
+            WebSocketUpgradeRejection::InvalidSecWebSocketExtensions,
+        )?;
+        if extensions
+            .as_deref()
+            .is_some_and(|extensions| !is_valid_extension_list(extensions))
+        {
+            return Err(WebSocketUpgradeRejection::InvalidSecWebSocketExtensions);
+        }
 
         // Extract OnUpgrade from extensions (placed there by Axum/Hyper)
         let on_upgrade = parts
@@ -254,6 +306,7 @@ where
 
         Ok(WebSocketUpgrade {
             key,
+            offered_protocols,
             protocol,
             extensions,
             config: Config::default(),
@@ -262,15 +315,42 @@ where
     }
 }
 
+fn combined_header_values(
+    headers: &axum::http::HeaderMap,
+    name: &'static str,
+    invalid: WebSocketUpgradeRejection,
+) -> std::result::Result<Option<String>, WebSocketUpgradeRejection> {
+    let mut combined = None::<String>;
+    for value in headers.get_all(name) {
+        let value = value.to_str().map_err(|_| invalid)?;
+        match &mut combined {
+            Some(combined) => {
+                combined.push_str(", ");
+                combined.push_str(value);
+            }
+            None => combined = Some(value.to_string()),
+        }
+    }
+    Ok(combined)
+}
+
 /// Rejection type for WebSocket upgrade
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum WebSocketUpgradeRejection {
     MethodNotGet,
+    HttpVersionNot11,
+    MissingHostHeader,
+    InvalidHostHeader,
     MissingUpgradeHeader,
     InvalidUpgradeHeader,
     MissingConnectionHeader,
     InvalidConnectionHeader,
     MissingSecWebSocketKey,
+    InvalidSecWebSocketKey,
+    InvalidSecWebSocketProtocol,
+    InvalidSecWebSocketExtensions,
+    InvalidContentLength,
+    TransferEncodingNotAllowed,
     MissingSecWebSocketVersion,
     UnsupportedVersion,
     MissingUpgrade,
@@ -280,11 +360,25 @@ impl IntoResponse for WebSocketUpgradeRejection {
     fn into_response(self) -> Response<Body> {
         let (status, message) = match self {
             Self::MethodNotGet => (StatusCode::METHOD_NOT_ALLOWED, "Method must be GET"),
+            Self::HttpVersionNot11 => (StatusCode::BAD_REQUEST, "HTTP version must be 1.1"),
+            Self::MissingHostHeader => (StatusCode::BAD_REQUEST, "Missing Host header"),
+            Self::InvalidHostHeader => (StatusCode::BAD_REQUEST, "Invalid Host header"),
             Self::MissingUpgradeHeader => (StatusCode::BAD_REQUEST, "Missing Upgrade header"),
             Self::InvalidUpgradeHeader => (StatusCode::BAD_REQUEST, "Invalid Upgrade header"),
             Self::MissingConnectionHeader => (StatusCode::BAD_REQUEST, "Missing Connection header"),
             Self::InvalidConnectionHeader => (StatusCode::BAD_REQUEST, "Invalid Connection header"),
             Self::MissingSecWebSocketKey => (StatusCode::BAD_REQUEST, "Missing Sec-WebSocket-Key"),
+            Self::InvalidSecWebSocketKey => (StatusCode::BAD_REQUEST, "Invalid Sec-WebSocket-Key"),
+            Self::InvalidSecWebSocketProtocol => {
+                (StatusCode::BAD_REQUEST, "Invalid Sec-WebSocket-Protocol")
+            }
+            Self::InvalidSecWebSocketExtensions => {
+                (StatusCode::BAD_REQUEST, "Invalid Sec-WebSocket-Extensions")
+            }
+            Self::InvalidContentLength => (StatusCode::BAD_REQUEST, "Invalid Content-Length"),
+            Self::TransferEncodingNotAllowed => {
+                (StatusCode::BAD_REQUEST, "Transfer-Encoding is not allowed")
+            }
             Self::MissingSecWebSocketVersion => {
                 (StatusCode::BAD_REQUEST, "Missing Sec-WebSocket-Version")
             }
@@ -685,6 +779,27 @@ impl Sink<Message> for WebSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "permessage-deflate")]
+    use crate::DeflateWindowBits;
+
+    async fn extractor_rejection(request: axum::http::Request<()>) -> WebSocketUpgradeRejection {
+        let (mut parts, _) = request.into_parts();
+        match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+            Ok(_) => panic!("request should have been rejected"),
+            Err(rejection) => rejection,
+        }
+    }
+
+    fn upgrade_request() -> axum::http::request::Builder {
+        axum::http::Request::builder()
+            .method(Method::GET)
+            .version(Version::HTTP_11)
+            .header(header::HOST, "example.com")
+            .header(header::UPGRADE, "websocket")
+            .header(header::CONNECTION, "Upgrade")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-version", "13")
+    }
 
     #[test]
     fn test_accept_key() {
@@ -692,6 +807,173 @@ mod tests {
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
         let accept = generate_accept_key(key);
         assert_eq!(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    }
+
+    #[tokio::test]
+    async fn extractor_requires_http_11_host_exact_tokens_and_valid_key() {
+        let request = upgrade_request()
+            .version(Version::HTTP_10)
+            .body(())
+            .unwrap();
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::HttpVersionNot11
+        ));
+
+        let request = axum::http::Request::builder()
+            .method(Method::GET)
+            .version(Version::HTTP_11)
+            .header(header::UPGRADE, "websocket")
+            .header(header::CONNECTION, "Upgrade")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-version", "13")
+            .body(())
+            .unwrap();
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::MissingHostHeader
+        ));
+
+        let mut request = upgrade_request().body(()).unwrap();
+        request
+            .headers_mut()
+            .insert(header::HOST, "bad host".parse().unwrap());
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::InvalidHostHeader
+        ));
+
+        let mut request = upgrade_request().body(()).unwrap();
+        request
+            .headers_mut()
+            .insert(header::UPGRADE, "notwebsocket".parse().unwrap());
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::InvalidUpgradeHeader
+        ));
+
+        let mut request = upgrade_request().body(()).unwrap();
+        request
+            .headers_mut()
+            .insert(header::CONNECTION, "x-upgrade".parse().unwrap());
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::InvalidConnectionHeader
+        ));
+
+        let mut request = upgrade_request().body(()).unwrap();
+        request
+            .headers_mut()
+            .insert("sec-websocket-key", "YWJjZA==".parse().unwrap());
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::InvalidSecWebSocketKey
+        ));
+
+        let mut request = upgrade_request().body(()).unwrap();
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            "chat, invalid protocol".parse().unwrap(),
+        );
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::InvalidSecWebSocketProtocol
+        ));
+    }
+
+    #[tokio::test]
+    async fn extractor_validates_upgrade_body_framing_and_duplicate_host() {
+        let mut request = upgrade_request().body(()).unwrap();
+        request
+            .headers_mut()
+            .append(header::CONTENT_LENGTH, "0".parse().unwrap());
+        request
+            .headers_mut()
+            .append(header::CONTENT_LENGTH, "0, 0".parse().unwrap());
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::MissingUpgrade
+        ));
+
+        let request = upgrade_request()
+            .header(header::CONTENT_LENGTH, "1")
+            .body(())
+            .unwrap();
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::InvalidContentLength
+        ));
+
+        let request = upgrade_request()
+            .header(header::TRANSFER_ENCODING, "chunked")
+            .body(())
+            .unwrap();
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::TransferEncodingNotAllowed
+        ));
+
+        let request = upgrade_request()
+            .header(header::HOST, "other.example.com")
+            .body(())
+            .unwrap();
+        assert!(matches!(
+            extractor_rejection(request).await,
+            WebSocketUpgradeRejection::InvalidHostHeader
+        ));
+    }
+
+    #[test]
+    fn extractor_combines_repeatable_websocket_headers() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append("sec-websocket-protocol", "chat".parse().unwrap());
+        headers.append("sec-websocket-protocol", "superchat".parse().unwrap());
+
+        let combined = combined_header_values(
+            &headers,
+            "sec-websocket-protocol",
+            WebSocketUpgradeRejection::InvalidSecWebSocketProtocol,
+        )
+        .unwrap();
+        assert_eq!(combined.as_deref(), Some("chat, superchat"));
+    }
+
+    async fn subprotocol_handler(upgrade: WebSocketUpgrade) -> impl IntoResponse {
+        upgrade
+            .protocols(["superchat", "chat"])
+            .unwrap()
+            .on_upgrade(|_| async {})
+    }
+
+    #[tokio::test]
+    async fn axum_negotiates_subprotocol_in_server_preference_order() {
+        use axum::{Router, routing::get};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let app = Router::new().route("/protocol", get(subprotocol_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut request = format!("ws://{address}/protocol")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("sec-websocket-protocol", "chat, superchat".parse().unwrap());
+        let (_websocket, response) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.headers().get("sec-websocket-protocol").unwrap(),
+            "superchat"
+        );
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
@@ -892,24 +1174,14 @@ mod tests {
     fn test_deflate_negotiation_with_client_offer() {
         use crate::deflate::DeflateConfig;
 
-        // Test that deflate negotiation works when client offers permessage-deflate
+        // Negotiate the client offer and verify both codec and response parameters.
         let client_extension = "permessage-deflate; client_max_window_bits";
-
-        // Parse the offer as the code does
-        let params = crate::deflate::parse_deflate_offer(client_extension);
-        assert!(params.is_some());
-
-        // Validate that we can create a config from the parsed params
-        let params = params.unwrap();
-        let client_config = DeflateConfig::from_params(&params);
-        assert!(client_config.is_ok());
-
-        // Generate response header using server's config (as in on_upgrade)
         let server_config = DeflateConfig::default();
-        let response_header = server_config.to_response_header();
+        let negotiated =
+            crate::deflate::negotiate_server_deflate(client_extension, &server_config).unwrap();
 
-        // Verify response header contains permessage-deflate
-        assert!(response_header.starts_with("permessage-deflate"));
+        assert_eq!(negotiated.config, server_config);
+        assert_eq!(negotiated.to_response_header(), "permessage-deflate");
     }
 
     #[cfg(feature = "permessage-deflate")]
@@ -917,51 +1189,50 @@ mod tests {
     fn test_deflate_negotiation_with_parameters() {
         use crate::deflate::DeflateConfig;
 
-        // Test negotiation with specific deflate parameters
+        // Negotiate an offer with specific context and window constraints.
         let client_extension =
             "permessage-deflate; server_no_context_takeover; client_max_window_bits=10";
+        let config =
+            crate::deflate::negotiate_server_deflate(client_extension, &DeflateConfig::default())
+                .unwrap();
 
-        let params = crate::deflate::parse_deflate_offer(client_extension);
-        assert!(params.is_some());
-
-        let params = params.unwrap();
-        assert_eq!(params.len(), 2);
-        assert_eq!(params[0], ("server_no_context_takeover", None));
-        assert_eq!(params[1], ("client_max_window_bits", Some("10")));
-
-        let config = DeflateConfig::from_params(&params);
-        assert!(config.is_ok());
-        let config = config.unwrap();
-
-        // Verify parsed config has correct values
-        assert!(config.server_no_context_takeover);
-        assert_eq!(config.client_max_window_bits, 10);
-
-        // Verify response header generation
-        let response = config.to_response_header();
-        assert!(response.contains("permessage-deflate"));
-        assert!(response.contains("server_no_context_takeover"));
+        // Verify the negotiated codec values and generated response header.
+        assert!(config.config.server_no_context_takeover);
+        assert_eq!(
+            config.config.client_max_window_bits,
+            DeflateWindowBits::Bits10
+        );
+        assert_eq!(
+            config.to_response_header(),
+            "permessage-deflate; server_no_context_takeover; client_max_window_bits=10"
+        );
     }
 
     #[cfg(feature = "permessage-deflate")]
     #[test]
     fn test_deflate_negotiation_without_client_offer() {
-        // Test that when client doesn't offer deflate, negotiation returns None
+        // With no client offer, on_upgrade does not negotiate compression.
         let no_extension: Option<&str> = None;
+        let server_config = crate::deflate::DeflateConfig::default();
 
-        // Simulate what happens in on_upgrade when extensions is None
-        let result = no_extension.and_then(|ext| crate::deflate::parse_deflate_offer(ext));
-        assert!(result.is_none());
+        let negotiated = no_extension
+            .and_then(|offers| crate::deflate::negotiate_server_deflate(offers, &server_config));
+
+        assert!(negotiated.is_none());
     }
 
     #[cfg(feature = "permessage-deflate")]
     #[test]
     fn test_deflate_negotiation_with_non_deflate_extension() {
-        // Test that non-deflate extensions are ignored
+        // Extensions other than permessage-deflate are ignored by this negotiator.
         let other_extension = "some-other-extension";
 
-        let params = crate::deflate::parse_deflate_offer(other_extension);
-        assert!(params.is_none());
+        let negotiated = crate::deflate::negotiate_server_deflate(
+            other_extension,
+            &crate::deflate::DeflateConfig::default(),
+        );
+
+        assert!(negotiated.is_none());
     }
 
     #[cfg(feature = "permessage-deflate")]
@@ -985,8 +1256,8 @@ mod tests {
 
         // Test config with custom window bits
         let config = DeflateConfig {
-            server_max_window_bits: 12,
-            client_max_window_bits: 10,
+            server_max_window_bits: DeflateWindowBits::Bits12,
+            client_max_window_bits: DeflateWindowBits::Bits10,
             ..Default::default()
         };
         let header = config.to_response_header();
@@ -1046,20 +1317,20 @@ mod tests {
     fn test_deflate_invalid_parameters() {
         use crate::deflate::DeflateConfig;
 
-        // Test invalid window bits (too low)
-        let params = vec![("server_max_window_bits", Some("7"))];
-        let result = DeflateConfig::from_params(&params);
-        assert!(result.is_err());
-
-        // Test invalid window bits (too high)
-        let params = vec![("server_max_window_bits", Some("16"))];
-        let result = DeflateConfig::from_params(&params);
-        assert!(result.is_err());
-
-        // Test invalid parameter name
-        let params = vec![("invalid_parameter", None)];
-        let result = DeflateConfig::from_params(&params);
-        assert!(result.is_err());
+        // Reject window values that are too low, backend-unsupported, or too high,
+        // as well as valueless, duplicate, and unknown parameters.
+        for offer in [
+            "permessage-deflate; server_max_window_bits=7",
+            "permessage-deflate; server_max_window_bits=8",
+            "permessage-deflate; server_max_window_bits=16",
+            "permessage-deflate; server_max_window_bits",
+            "permessage-deflate; server_max_window_bits=12; server_max_window_bits=11",
+            "permessage-deflate; invalid_parameter",
+        ] {
+            let negotiated =
+                crate::deflate::negotiate_server_deflate(offer, &DeflateConfig::default());
+            assert!(negotiated.is_none(), "unexpectedly accepted {offer}");
+        }
     }
 
     #[cfg(feature = "permessage-deflate")]
@@ -1067,28 +1338,23 @@ mod tests {
     fn test_deflate_full_negotiation_flow() {
         use crate::deflate::DeflateConfig;
 
-        // Simulate the full flow in on_upgrade method
+        // Exercise parsing, validation, codec configuration, and response generation together.
         let client_offer =
             "permessage-deflate; client_no_context_takeover; client_max_window_bits=12";
-        let server_config = DeflateConfig::default();
+        let negotiated =
+            crate::deflate::negotiate_server_deflate(client_offer, &DeflateConfig::default())
+                .unwrap();
 
-        // Parse client offer
-        let parsed_params = crate::deflate::parse_deflate_offer(client_offer);
-        assert!(parsed_params.is_some());
-
-        let params = parsed_params.unwrap();
-
-        // Validate params - this confirms client's offer is valid
-        let validated_config = DeflateConfig::from_params(&params);
-        assert!(validated_config.is_ok());
-
-        // Generate response header using server's config (not client's)
-        // This matches the actual implementation in the on_upgrade method
-        let response_header = server_config.to_response_header();
-        assert!(response_header.starts_with("permessage-deflate"));
-
-        // Verify the negotiation produces a valid extension header
-        assert!(!response_header.is_empty());
+        assert!(!negotiated.config.server_no_context_takeover);
+        assert!(negotiated.config.client_no_context_takeover);
+        assert_eq!(
+            negotiated.config.client_max_window_bits,
+            DeflateWindowBits::Bits12
+        );
+        assert_eq!(
+            negotiated.to_response_header(),
+            "permessage-deflate; client_no_context_takeover; client_max_window_bits=12"
+        );
     }
 
     #[cfg(feature = "permessage-deflate")]
@@ -1103,59 +1369,52 @@ mod tests {
         let config = Compression::Dedicated.to_deflate_config();
         assert!(config.is_some());
         let config = config.unwrap();
-        assert_eq!(config.server_max_window_bits, 15);
+        assert_eq!(config.server_max_window_bits, DeflateWindowBits::Bits15);
         assert!(!config.server_no_context_takeover); // Context takeover enabled
 
         // Test Shared mode
         let config = Compression::Shared.to_deflate_config();
         assert!(config.is_some());
         let config = config.unwrap();
-        assert_eq!(config.server_max_window_bits, 15);
-
-        // Test Window256B mode (smallest window)
-        let config = Compression::Window256B.to_deflate_config();
-        assert!(config.is_some());
-        let config = config.unwrap();
-        assert_eq!(config.server_max_window_bits, 8);
-        assert!(config.server_no_context_takeover); // Context takeover disabled for small windows
+        assert_eq!(config.server_max_window_bits, DeflateWindowBits::Bits15);
 
         // Test Window1KB mode
         let config = Compression::Window1KB.to_deflate_config();
         assert!(config.is_some());
         let config = config.unwrap();
-        assert_eq!(config.server_max_window_bits, 10);
+        assert_eq!(config.server_max_window_bits, DeflateWindowBits::Bits10);
         assert!(config.server_no_context_takeover);
 
         // Test Window2KB mode
         let config = Compression::Window2KB.to_deflate_config();
         assert!(config.is_some());
         let config = config.unwrap();
-        assert_eq!(config.server_max_window_bits, 11);
+        assert_eq!(config.server_max_window_bits, DeflateWindowBits::Bits11);
         assert!(config.server_no_context_takeover);
 
         // Test Window4KB mode
         let config = Compression::Window4KB.to_deflate_config();
         assert!(config.is_some());
         let config = config.unwrap();
-        assert_eq!(config.server_max_window_bits, 12);
+        assert_eq!(config.server_max_window_bits, DeflateWindowBits::Bits12);
 
         // Test Window8KB mode
         let config = Compression::Window8KB.to_deflate_config();
         assert!(config.is_some());
         let config = config.unwrap();
-        assert_eq!(config.server_max_window_bits, 13);
+        assert_eq!(config.server_max_window_bits, DeflateWindowBits::Bits13);
 
         // Test Window16KB mode
         let config = Compression::Window16KB.to_deflate_config();
         assert!(config.is_some());
         let config = config.unwrap();
-        assert_eq!(config.server_max_window_bits, 14);
+        assert_eq!(config.server_max_window_bits, DeflateWindowBits::Bits14);
 
         // Test Window32KB mode (max per RFC 7692)
         let config = Compression::Window32KB.to_deflate_config();
         assert!(config.is_some());
         let config = config.unwrap();
-        assert_eq!(config.server_max_window_bits, 15);
+        assert_eq!(config.server_max_window_bits, DeflateWindowBits::Bits15);
     }
 
     #[cfg(feature = "permessage-deflate")]
@@ -1175,18 +1434,16 @@ mod tests {
             Compression::Window32KB,
         ] {
             let deflate_config = mode.to_deflate_config().unwrap();
+            // Negotiate and generate a response for each supported compression policy.
+            let negotiated =
+                crate::deflate::negotiate_server_deflate(client_offer, &deflate_config).unwrap();
 
-            // Parse client offer
-            let params = crate::deflate::parse_deflate_offer(client_offer);
-            assert!(params.is_some());
-
-            // Validate
-            let validated = crate::deflate::DeflateConfig::from_params(&params.unwrap());
-            assert!(validated.is_ok());
-
-            // Generate response
-            let response = deflate_config.to_response_header();
-            assert!(response.starts_with("permessage-deflate"));
+            assert_eq!(negotiated.config, deflate_config);
+            assert!(
+                negotiated
+                    .to_response_header()
+                    .starts_with("permessage-deflate")
+            );
         }
     }
 
@@ -1201,8 +1458,8 @@ mod tests {
         let config = Config {
             compression: Compression::Window4KB,
             deflate: Some(DeflateConfig {
-                server_max_window_bits: 15,
-                client_max_window_bits: 15,
+                server_max_window_bits: DeflateWindowBits::Bits15,
+                client_max_window_bits: DeflateWindowBits::Bits15,
                 server_no_context_takeover: false,
                 client_no_context_takeover: false,
                 compression_level: 9,
@@ -1221,7 +1478,10 @@ mod tests {
         let deflate_config = deflate_config.unwrap();
 
         // Should use explicit deflate config (15 bits), not Window4KB (12 bits)
-        assert_eq!(deflate_config.server_max_window_bits, 15);
+        assert_eq!(
+            deflate_config.server_max_window_bits,
+            DeflateWindowBits::Bits15
+        );
         assert_eq!(deflate_config.compression_level, 9);
     }
 }

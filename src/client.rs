@@ -42,6 +42,8 @@ use crate::transport::Http2;
 use crate::transport::Http3;
 
 #[cfg(any(feature = "http2", feature = "http3"))]
+use crate::extended_connect::validate_extended_connect_response;
+#[cfg(any(feature = "http2", feature = "http3"))]
 use crate::multiplex::MultiplexedConnection;
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -355,6 +357,8 @@ impl WebSocketClient<Http1> {
             return Err(Error::HandshakeFailed("URL missing host"));
         }
 
+        handshake::validate_client_handshake_inputs(host, path, protocol, extra_headers)?;
+
         // Connect to the server
         let addr = format!("{}:{}", host, port);
         let stream = TcpStream::connect(&addr).await.map_err(Error::Io)?;
@@ -521,6 +525,7 @@ impl WebSocketClient<Http2> {
         if response.status() != http::StatusCode::OK {
             return Err(Error::HandshakeFailed("server rejected WebSocket upgrade"));
         }
+        validate_extended_connect_response(response.headers(), protocol)?;
 
         // Get the receive stream from the response
         let recv_stream = response.into_body();
@@ -682,7 +687,10 @@ impl WebSocketClient<Http3> {
             .map_err(Error::from)?;
 
         // Create HTTP/3 connection using h3 crate
-        let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection))
+        let mut builder = h3::client::builder();
+        builder.enable_extended_connect(self.config.http3.enable_connect_protocol);
+        let (mut driver, mut send_request) = builder
+            .build(h3_quinn::Connection::new(connection))
             .await
             .map_err(Error::from)?;
 
@@ -724,6 +732,7 @@ impl WebSocketClient<Http3> {
         // Check response status per RFC 9220
         match response.status() {
             StatusCode::OK => {
+                validate_extended_connect_response(response.headers(), subprotocol)?;
                 let h3_stream = Stream::<Http3>::from_h3_client_with_handles(
                     stream,
                     Some(endpoint),
