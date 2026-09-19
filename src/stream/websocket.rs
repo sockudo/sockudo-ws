@@ -994,11 +994,31 @@ where
         cancel: &CancellationToken,
         encode: impl FnOnce(&mut E, &mut BytesMut) -> Result<()>,
     ) -> Result<()> {
+        // A control writer may have waited for a cancelled application send.
+        if cancel.is_cancelled() {
+            return Err(Error::ConnectionClosed);
+        }
         self.buf.clear();
         encode(&mut self.encoder, &mut self.buf)?;
         let result = write_split_bytes(&mut self.writer, &self.buf, cancel).await;
         self.buf.clear();
         result
+    }
+}
+
+/// A cancelled send may have written a frame prefix or advanced compression
+/// state. Close before releasing the sink so no subsequent frame can follow it.
+struct SplitSendGuard<'a> {
+    shared: &'a SplitShared,
+    completed: bool,
+}
+
+impl Drop for SplitSendGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.shared.terminate(TerminalCause::ConnectionClosed);
+            self.shared.cancel.cancel();
+        }
     }
 }
 
@@ -1023,6 +1043,10 @@ where
         if !self.shared.is_open() {
             return Err(self.current_error());
         }
+        let mut cancellation = SplitSendGuard {
+            shared: &self.shared,
+            completed: false,
+        };
         let is_close = msg.is_close();
         if is_close {
             self.shared.begin_closing();
@@ -1040,6 +1064,7 @@ where
         if is_close {
             let _ = self.control_tx.send(ControlRequest::LocalCloseSent).await;
         }
+        cancellation.completed = true;
         Ok(())
     }
 
@@ -1290,6 +1315,9 @@ where
     /// The frame is written directly to the transport; automatic Pong, Ping
     /// and Close frames from the connection driver interleave at frame
     /// boundaries.
+    ///
+    /// Cancelling after acquiring the write sink closes the connection: a
+    /// partially written frame cannot safely be followed by another frame.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
         self.core.send(msg).await
     }
@@ -2353,6 +2381,9 @@ where
     S: AsyncWrite + Unpin,
 {
     /// Send a message (compressed when the negotiated parameters say so).
+    ///
+    /// Cancelling after acquiring the write sink closes the connection, since
+    /// the frame or compression state may already have advanced.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
         self.core.send(msg).await
     }
