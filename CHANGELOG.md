@@ -98,6 +98,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Compatibility
 
+- Compio HTTP/2 entry points require `Splittable`; other transports can use
+  `compio::io::util::Split::new`. Custom reads used with automatic Ping must
+  cooperate with cancellation; only an existing idle/Pong deadline bounds recovery.
+
 - io_uring native read/write methods now require mutable access so they cannot
   bypass pending bridge operations. Shared handles remain for inspection and configuration.
 
