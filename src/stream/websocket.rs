@@ -339,8 +339,13 @@ where
         // Reuse the message Vec across reads (no allocation per read). Messages
         // are popped from the back, so store them in reverse order.
         debug_assert!(self.pending_messages.is_empty());
-        self.protocol
-            .process_into(&mut self.read_buf, &mut self.pending_messages)?;
+        let fragment_activity = self
+            .protocol
+            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)?;
+        if fragment_activity {
+            self.heartbeat
+                .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
+        }
         self.pending_messages.reverse();
 
         Ok(())
@@ -1186,9 +1191,12 @@ where
                 debug_assert!(self.pending_messages.is_empty());
                 match self
                     .protocol
-                    .process_into(&mut self.read_buf, &mut self.pending_messages)
+                    .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)
                 {
-                    Ok(()) => {
+                    Ok(fragment_activity) => {
+                        if fragment_activity {
+                            self.shared.note_inbound();
+                        }
                         self.pending_messages.reverse();
                         if !self.pending_messages.is_empty() {
                             continue;
@@ -1220,9 +1228,14 @@ where
                         }
                         Ok(_) => match self
                             .protocol
-                            .process_into(&mut self.read_buf, &mut self.pending_messages)
+                            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)
                         {
-                            Ok(()) => self.pending_messages.reverse(),
+                            Ok(fragment_activity) => {
+                                if fragment_activity {
+                                    self.shared.note_inbound();
+                                }
+                                self.pending_messages.reverse();
+                            },
                             Err(error) => {
                                 self.shared.terminate(TerminalCause::ConnectionClosed);
                                 return Some(Err(error));
@@ -1430,6 +1443,13 @@ async fn split_writer_driver<W, E>(
                 break;
             }
             _ = &mut heartbeat_sleep, if heartbeat_deadline.is_some() && shared.is_open() => {
+                // Activity may have arrived while the driver waited on this timer.
+                // Refresh it before deciding whether the old deadline expired.
+                let observed_inbound = shared.last_inbound_ms.load(Ordering::Relaxed);
+                if observed_inbound > last_synced_inbound_ms {
+                    last_synced_inbound_ms = observed_inbound;
+                    heartbeat.on_inbound(observed_inbound, None);
+                }
                 let now_ms = epoch.elapsed().as_millis() as u64;
                 match heartbeat.next_deadline() {
                     Some(Deadline::Ping(at)) if at <= now_ms => {
@@ -1724,8 +1744,13 @@ where
         // Reuse the message Vec across reads (no allocation per read). Messages
         // are popped from the back, so store them in reverse order.
         debug_assert!(self.pending_messages.is_empty());
-        self.protocol
-            .process_into(&mut self.read_buf, &mut self.pending_messages)?;
+        let fragment_activity = self
+            .protocol
+            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)?;
+        if fragment_activity {
+            self.heartbeat
+                .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
+        }
         self.pending_messages.reverse();
 
         Ok(())
@@ -2271,9 +2296,14 @@ where
                         }
                         Ok(_) => match self
                             .protocol
-                            .process_into(&mut self.read_buf, &mut self.pending_messages)
+                            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages)
                         {
-                            Ok(()) => self.pending_messages.reverse(),
+                            Ok(fragment_activity) => {
+                                if fragment_activity {
+                                    self.shared.note_inbound();
+                                }
+                                self.pending_messages.reverse();
+                            },
                             Err(error) => {
                                 self.shared.terminate(TerminalCause::ConnectionClosed);
                                 return Some(Err(error));
