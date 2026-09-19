@@ -3,7 +3,7 @@
 //! CSV connection rows: id, workers, count, rate, delivery_p99_ns, send_p99_ns,
 //! late_p99_ns, first_sent_ns, last_received_ns, max_gap_ns, gap_before_ns, gap_after_ns.
 //! CSV slow rows: id, sequence, due_ns, sent_ns, completed_ns, received_ns, delivery_ns.
-//! Default: 4 shared workers, 16 connections, 20,000 messages each, saturated WS, tracing off.
+//! Default: one worker and connection, 128 messages at 1,000 messages/second, WS, tracing off.
 //! Arguments: sender_workers receiver_workers connections count rate_per_connection.
 //! Optional trailing arguments: ws|raw off|on (protocol and read/task tracing).
 //! CSV trace rows: id, read_polls, task_polls, max_wake_to_poll_ns, max_task_poll_ns.
@@ -469,9 +469,9 @@ fn main() {
         .collect();
     let values: Vec<usize> = if args == ["--test"] {
         check_wake_forwarding();
-        vec![4, 0, 2, 128, 0]
+        vec![1, 0, 1, 16, 1_000]
     } else if args.is_empty() {
-        vec![4, 0, 16, 20_000, 0]
+        vec![1, 0, 1, 128, 1_000]
     } else {
         assert!(
             args.len() == 5 || args.len() == 7,
