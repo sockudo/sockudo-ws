@@ -79,6 +79,23 @@ impl Heartbeat {
         }
     }
 
+    /// Earliest hard timeout while a control write is in progress.
+    pub(crate) fn next_timeout(&self) -> Option<Deadline> {
+        if self.stopped {
+            return None;
+        }
+        let pong = self.outstanding.as_ref().and_then(|ping| ping.deadline_ms);
+        let idle = (self.idle_timeout_ms != 0)
+            .then(|| self.last_inbound_ms.saturating_add(self.idle_timeout_ms));
+        // A Pong timeout deliberately wins ties with the hard idle timeout.
+        match (pong, idle) {
+            (Some(pong), Some(idle)) if idle < pong => Some(Deadline::Idle(idle)),
+            (Some(pong), _) => Some(Deadline::Pong(pong)),
+            (None, Some(idle)) => Some(Deadline::Idle(idle)),
+            (None, None) => None,
+        }
+    }
+
     pub(crate) fn ping_due(&mut self, now_ms: u64) -> Option<Bytes> {
         if !matches!(self.next_deadline(), Some(Deadline::Ping(at)) if at <= now_ms) {
             return None;
@@ -113,7 +130,8 @@ impl Heartbeat {
             return false;
         }
 
-        self.last_inbound_ms = now_ms;
+        // Shared data activity and queued control frames can arrive out of order.
+        self.last_inbound_ms = self.last_inbound_ms.max(now_ms);
         let matched = self.outstanding.as_ref().is_some_and(|ping| {
             ping.flushed
                 && ping.deadline_ms.is_none_or(|deadline| now_ms < deadline)
