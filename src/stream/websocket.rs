@@ -1266,12 +1266,13 @@ where
 
             tokio::select! {
                 biased;
-                changed = self.terminal_rx.changed() => {
-                    if changed.is_err() {
-                        self.shared.terminate(TerminalCause::ConnectionClosed);
-                    }
-                }
                 result = self.reader.read_buf(&mut self.read_buf) => {
+                    // A terminal cause published while the read was pending wins
+                    // over newly received bytes without registering a terminal
+                    // waiter when the transport is immediately ready.
+                    if let Some(result) = self.take_terminal() {
+                        return result;
+                    }
                     match result {
                         Ok(0) => {
                             let _ = self.control_tx.send(ControlRequest::Eof).await;
@@ -1292,6 +1293,11 @@ where
                             self.shared.terminate(TerminalCause::ConnectionClosed);
                             return Some(Err(error.into()));
                         }
+                    }
+                }
+                changed = self.terminal_rx.changed() => {
+                    if changed.is_err() {
+                        self.shared.terminate(TerminalCause::ConnectionClosed);
                     }
                 }
             }
