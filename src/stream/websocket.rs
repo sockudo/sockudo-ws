@@ -988,6 +988,22 @@ where
         self.buf.clear();
         result
     }
+
+    async fn write_application_frame(
+        &mut self,
+        shared: &SplitShared,
+        encode: impl FnOnce(&mut E, &mut BytesMut) -> Result<()>,
+    ) -> Result<()> {
+        let mut cancellation = SplitSendGuard {
+            shared,
+            completed: false,
+        };
+        let result = self.write_frame(&shared.cancel, encode).await;
+        // The frame is fully flushed; cancelling a later control notification
+        // must not abort an otherwise complete write.
+        cancellation.completed = result.is_ok();
+        result
+    }
 }
 
 /// A cancelled send may have written a frame prefix or advanced compression
@@ -1027,16 +1043,12 @@ where
         if !self.shared.is_open() {
             return Err(self.current_error());
         }
-        let mut cancellation = SplitSendGuard {
-            shared: &self.shared,
-            completed: false,
-        };
         let is_close = msg.is_close();
         if is_close {
             self.shared.begin_closing();
         }
         let result = sink
-            .write_frame(&self.shared.cancel, |encoder, buf| {
+            .write_application_frame(&self.shared, |encoder, buf| {
                 encoder.encode_message(&msg, buf)
             })
             .await;
@@ -1048,9 +1060,6 @@ where
             self.shared.terminate(TerminalCause::ConnectionClosed);
             return result;
         }
-        // The frame is fully flushed; cancelling a later control notification
-        // must not abort an otherwise complete write.
-        cancellation.completed = true;
         if is_close {
             let _ = self.control_tx.send(ControlRequest::LocalCloseSent).await;
         }
