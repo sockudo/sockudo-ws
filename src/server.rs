@@ -619,17 +619,32 @@ impl WebSocketServer<Http3> {
     /// * `ws_config` - WebSocket configuration
     pub async fn bind(
         addr: SocketAddr,
-        tls_config: rustls::ServerConfig,
+        mut tls_config: rustls::ServerConfig,
         ws_config: Config,
     ) -> Result<Self> {
+        let transport_config = crate::http3::quic_transport_config(&ws_config.http3)?;
+        let endpoint_config = crate::http3::quic_endpoint_config(&ws_config.http3)?;
+
+        // HTTP/3 0-RTT is rejected by quic_transport_config. Keep caller-provided
+        // TLS settings from silently enabling early data through this API.
+        tls_config.max_early_data_size = 0;
+
         // Create QUIC server config from rustls config
         let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
             .map_err(|_| Error::HandshakeFailed("invalid TLS config"))?;
 
-        let server_config = ServerConfig::with_crypto(Arc::new(quic_config));
+        let mut server_config = ServerConfig::with_crypto(Arc::new(quic_config));
+        server_config.transport_config(transport_config);
 
         // Create QUIC endpoint
-        let endpoint = Endpoint::server(server_config, addr).map_err(Error::Io)?;
+        let socket = std::net::UdpSocket::bind(addr).map_err(Error::Io)?;
+        let endpoint = Endpoint::new(
+            endpoint_config,
+            Some(server_config),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(Error::Io)?;
 
         Ok(Self {
             config: ws_config,
@@ -642,8 +657,10 @@ impl WebSocketServer<Http3> {
     ///
     /// Use this when you need more control over the QUIC configuration,
     /// such as enabling BBR congestion control for better performance
-    /// in lossy networks. The endpoint's existing QUIC transport and UDP
-    /// settings take precedence over [`Config::http3`].
+    /// in lossy networks.
+    ///
+    /// Transport and TLS settings come from the supplied endpoint. HTTP/3
+    /// protocol settings still come from the WebSocket configuration.
     pub fn from_endpoint(endpoint: Endpoint, ws_config: Config) -> Self {
         Self {
             config: ws_config,
@@ -684,6 +701,7 @@ impl WebSocketServer<Http3> {
         Fut: Future<Output = ()> + Send + 'static,
     {
         let protocols = self.protocols.clone();
+        crate::http3::validate_config(&self.config.http3)?;
         let endpoint = match self.inner {
             ServerInner::Http3 { endpoint } => endpoint,
             _ => unreachable!(),
@@ -722,6 +740,7 @@ impl WebSocketServer<Http3> {
         Filter: Fn(&ExtendedConnectRequest) -> bool + Clone + Send + Sync + 'static,
     {
         let protocols = self.protocols.clone();
+        crate::http3::validate_config(&self.config.http3)?;
         let endpoint = match self.inner {
             ServerInner::Http3 { endpoint } => endpoint,
             _ => unreachable!(),
@@ -773,7 +792,7 @@ where
     let connection = incoming.await.map_err(Error::from)?;
 
     let mut builder = h3::server::builder();
-    builder.enable_extended_connect(true);
+    builder.enable_extended_connect(config.http3.enable_connect_protocol);
     let mut h3_conn: H3Connection<h3_quinn::Connection, Bytes> = builder
         .build(h3_quinn::Connection::new(connection))
         .await
@@ -826,7 +845,7 @@ where
     let connection = incoming.await.map_err(Error::from)?;
 
     let mut builder = h3::server::builder();
-    builder.enable_extended_connect(true);
+    builder.enable_extended_connect(config.http3.enable_connect_protocol);
     let mut h3_conn: H3Connection<h3_quinn::Connection, Bytes> = builder
         .build(h3_quinn::Connection::new(connection))
         .await
@@ -879,6 +898,15 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     use http::StatusCode;
+
+    if !config.http3.enable_connect_protocol {
+        let response = build_extended_connect_error(
+            StatusCode::NOT_IMPLEMENTED,
+            Some("Extended CONNECT is disabled"),
+        );
+        stream.send_response(response).await.ok();
+        return Ok(());
+    }
 
     if request.method() != Method::CONNECT {
         let response =
@@ -942,6 +970,15 @@ where
     Filter: Fn(&ExtendedConnectRequest) -> bool + Send + 'static,
 {
     use http::StatusCode;
+
+    if !config.http3.enable_connect_protocol {
+        let response = build_extended_connect_error(
+            StatusCode::NOT_IMPLEMENTED,
+            Some("Extended CONNECT is disabled"),
+        );
+        stream.send_response(response).await.ok();
+        return Ok(());
+    }
 
     if request.method() != Method::CONNECT {
         let response =
