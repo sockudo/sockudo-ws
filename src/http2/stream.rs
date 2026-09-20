@@ -8,7 +8,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use h2::{RecvStream, SendStream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -35,7 +35,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 pub struct Http2Stream {
     send: SendStream<Bytes>,
     recv: RecvStream,
-    recv_buf: BytesMut,
+    recv_buf: Bytes,
     /// Track if we've received END_STREAM
     recv_eof: bool,
     /// Track if we need to reserve capacity
@@ -48,7 +48,7 @@ impl Http2Stream {
         Self {
             send,
             recv,
-            recv_buf: BytesMut::with_capacity(64 * 1024),
+            recv_buf: Bytes::new(),
             recv_eof: false,
             capacity_needed: 0,
         }
@@ -84,7 +84,8 @@ impl AsyncRead for Http2Stream {
         // First, try to satisfy from the internal buffer
         if !self.recv_buf.is_empty() {
             let to_copy = std::cmp::min(buf.remaining(), self.recv_buf.len());
-            buf.put_slice(&self.recv_buf.split_to(to_copy));
+            buf.put_slice(&self.recv_buf[..to_copy]);
+            self.recv_buf.advance(to_copy);
             return Poll::Ready(Ok(()));
         }
 
@@ -102,12 +103,11 @@ impl AsyncRead for Http2Stream {
 
                 // Copy what we can to the output buffer
                 let to_copy = std::cmp::min(buf.remaining(), data.len());
-                buf.put_slice(&data.split_to(to_copy));
+                buf.put_slice(&data[..to_copy]);
+                data.advance(to_copy);
 
-                // Buffer any remainder
-                if data.has_remaining() {
-                    self.recv_buf.extend_from_slice(data.chunk());
-                }
+                // Retain the owned h2 DATA remainder for the next read.
+                self.recv_buf = data;
 
                 Poll::Ready(Ok(()))
             }
