@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use super::*;
+use crate::deflate::DeflateWindowBits;
 
 #[test]
 fn shared_pool_skips_selection_below_threshold() {
