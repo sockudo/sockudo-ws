@@ -11,6 +11,14 @@
 
 pub use crate::simd::{apply_mask, apply_mask_offset};
 
+#[cfg(not(any(feature = "fastrand", feature = "getrandom", feature = "rand_rng")))]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(not(any(feature = "fastrand", feature = "getrandom", feature = "rand_rng")))]
+static MASK_FALLBACK_STATE: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(any(feature = "fastrand", feature = "getrandom", feature = "rand_rng")))]
+static NONCE_FALLBACK_STATE: AtomicU64 = AtomicU64::new(0);
+
 /// Generate a random mask for WebSocket client frames.
 ///
 /// The RNG implementation is selected via feature flags:
@@ -73,7 +81,7 @@ fn generate_key_bytes_inner() -> [u8; 16] {
 fn generate_key_bytes_inner() -> [u8; 16] {
     let mut bytes = [0u8; 16];
     for chunk in bytes.chunks_exact_mut(4) {
-        chunk.copy_from_slice(&generate_mask_inner());
+        chunk.copy_from_slice(&generate_fallback(&NONCE_FALLBACK_STATE));
     }
     bytes
 }
@@ -106,27 +114,51 @@ fn generate_mask_inner() -> [u8; 4] {
 #[cfg(not(any(feature = "fastrand", feature = "getrandom", feature = "rand_rng")))]
 #[inline]
 fn generate_mask_inner() -> [u8; 4] {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    generate_fallback(&MASK_FALLBACK_STATE)
+}
+
+#[cfg(not(any(feature = "fastrand", feature = "getrandom", feature = "rand_rng")))]
+#[inline]
+fn generate_fallback(state: &AtomicU64) -> [u8; 4] {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    static STATE: AtomicU64 = AtomicU64::new(0);
-
-    let mut x = STATE.load(Ordering::Relaxed);
+    let mut x = state.load(Ordering::Relaxed);
     if x == 0 {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        let stack_addr = (&x as *const u64 as usize) as u64;
-        x = nanos ^ stack_addr.rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
+        let state_addr = (state as *const AtomicU64 as usize) as u64;
+        x = nanos ^ state_addr.rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
     }
 
     // xorshift64*: adequate for no-RNG test/server-only builds, not a CSPRNG.
     x ^= x >> 12;
     x ^= x << 25;
     x ^= x >> 27;
-    STATE.store(x, Ordering::Relaxed);
+    state.store(x, Ordering::Relaxed);
 
     let value = x.wrapping_mul(0x2545_f491_4f6c_dd1d);
     (value as u32).to_ne_bytes()
+}
+
+#[cfg(all(
+    test,
+    not(any(feature = "fastrand", feature = "getrandom", feature = "rand_rng"))
+))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handshake_nonce_does_not_advance_the_fallback_mask_stream() {
+        MASK_FALLBACK_STATE.store(42, Ordering::Relaxed);
+        let expected = generate_mask();
+
+        MASK_FALLBACK_STATE.store(42, Ordering::Relaxed);
+        NONCE_FALLBACK_STATE.store(42, Ordering::Relaxed);
+        let _ = generate_key_bytes();
+        let actual = generate_mask();
+
+        assert_eq!(actual, expected);
+    }
 }
