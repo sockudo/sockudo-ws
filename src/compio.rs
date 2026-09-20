@@ -29,7 +29,7 @@ use crate::Config;
 use crate::error::{CloseReason, Error, Result};
 use crate::handshake::{
     HandshakeResult, build_request_with_headers, build_response, generate_accept_key, generate_key,
-    parse_request, parse_response, validate_accept_key,
+    parse_request, parse_response, select_default_subprotocol, validate_accept_key,
 };
 use crate::heartbeat::{Deadline, Heartbeat, bounded_close_reason};
 use crate::protocol::{Message, Protocol, Role};
@@ -239,10 +239,10 @@ where
 
         if let Some((req, consumed)) = parse_request(&buf)? {
             let path = req.path.to_string();
-            let protocol = req.protocol.map(String::from);
+            let protocol = select_default_subprotocol(req.protocol).map(str::to_owned);
             let extensions = req.extensions.map(String::from);
             let accept_key = generate_accept_key(req.key);
-            let response = build_response(&accept_key, req.protocol, response_extensions);
+            let response = build_response(&accept_key, protocol.as_deref(), response_extensions);
 
             write_all_owned(stream, response).await?;
             stream.flush().await?;
@@ -2733,6 +2733,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let (mut ws, handshake) = accept_async(stream, Config::default()).await.unwrap();
             assert_eq!(handshake.path, "/chat");
+            assert_eq!(handshake.protocol.as_deref(), Some("chat"));
 
             let msg = ws.next().await.unwrap().unwrap();
             assert!(matches!(&msg, Message::Text(text) if text == "hello"));
@@ -2740,12 +2741,18 @@ mod tests {
         });
 
         let stream = TcpStream::connect(addr).await.unwrap();
-        let (mut client, handshake) =
-            connect_async(stream, &addr.to_string(), "/chat", None, Config::default())
-                .await
-                .unwrap();
+        let (mut client, handshake) = connect_async(
+            stream,
+            &addr.to_string(),
+            "/chat",
+            Some("chat, superchat"),
+            Config::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(handshake.path, "/chat");
+        assert_eq!(handshake.protocol.as_deref(), Some("chat"));
         client.send_text("hello").await.unwrap();
 
         let echoed = client.next().await.unwrap().unwrap();
