@@ -3118,6 +3118,31 @@ mod tests {
 
     #[cfg(feature = "permessage-deflate")]
     #[compio::test]
+    async fn compio_compressed_stream_routes_shared_compression() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_io = TcpStream::connect(addr).await.unwrap();
+        let (server_io, _) = listener.accept().await.unwrap();
+        let shared_config = Config::builder()
+            .compression(crate::Compression::Shared)
+            .build();
+        let shared = CompioCompressedWebSocketStream::server(
+            server_io,
+            shared_config,
+            crate::Compression::Shared.to_deflate_config().unwrap(),
+        );
+        assert!(shared.protocol.uses_shared_compression());
+
+        let dedicated = CompioCompressedWebSocketStream::client(
+            client_io,
+            Config::default(),
+            DeflateConfig::default(),
+        );
+        assert!(!dedicated.protocol.uses_shared_compression());
+    }
+
+    #[cfg(feature = "permessage-deflate")]
+    #[compio::test]
     async fn compio_compressed_split_driver_replies_to_ping() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

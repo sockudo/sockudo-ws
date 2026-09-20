@@ -861,6 +861,11 @@ impl CompressedProtocol {
         Self::new(Role::Client, max_frame_size, max_message_size, deflate)
     }
 
+    #[cfg(test)]
+    pub(crate) fn uses_shared_compression(&self) -> bool {
+        matches!(self.deflate, CompressionContext::Shared { .. })
+    }
+
     /// Check if connection is closed
     #[inline]
     pub fn is_closed(&self) -> bool {
@@ -1588,10 +1593,7 @@ mod tests {
             config,
         );
 
-        assert!(matches!(
-            protocol.deflate,
-            CompressionContext::Shared { .. }
-        ));
+        assert!(protocol.uses_shared_compression());
         let (_reader, writer) = protocol.split(1024 * 1024, 64 * 1024 * 1024);
         assert!(matches!(writer.encoder, CompressionEncoder::Shared(_)));
     }

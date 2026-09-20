@@ -2422,6 +2422,29 @@ mod tests {
             .max_frame_size(64 * 1024);
     }
 
+    #[cfg(feature = "permessage-deflate")]
+    #[test]
+    fn tokio_compressed_stream_routes_shared_compression() {
+        let (shared_io, _) = tokio::io::duplex(1024);
+        let shared_config = Config::builder()
+            .compression(crate::Compression::Shared)
+            .build();
+        let shared = CompressedWebSocketStream::server(
+            shared_io,
+            shared_config,
+            crate::Compression::Shared.to_deflate_config().unwrap(),
+        );
+        assert!(shared.protocol.uses_shared_compression());
+
+        let (dedicated_io, _) = tokio::io::duplex(1024);
+        let dedicated = CompressedWebSocketStream::server(
+            dedicated_io,
+            Config::default(),
+            crate::deflate::DeflateConfig::default(),
+        );
+        assert!(!dedicated.protocol.uses_shared_compression());
+    }
+
     #[tokio::test]
     async fn read_only_stream_flushes_automatic_pong() {
         let (client_io, mut server_io) = tokio::io::duplex(1024);
