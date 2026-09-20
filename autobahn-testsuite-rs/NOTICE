@@ -1,0 +1,17 @@
+Autobahn Testsuite Rust port
+
+The case catalog, descriptions, expectations, and compression test data derive
+from crossbario/autobahn-testsuite, commit
+b8a5120d905e30470e4475785c48e4cedc35f6cd.
+Copyright (c) typedef int GmbH. Licensed under Apache License 2.0.
+The original license is reproduced in LICENSE.
+
+The WAMP serializer fixture definitions in tools/reference and their derived
+catalog/serializer.json come from crossbario/autobahn-python tag v0.10.9.
+Copyright (c) Tavendo GmbH. Licensed under the MIT License, reproduced in the
+headers of both reference files and LICENSE-SERIALIZER. Source URLs:
+https://github.com/crossbario/autobahn-python/blob/v0.10.9/autobahn/wamp/message.py
+https://github.com/crossbario/autobahn-python/blob/v0.10.9/autobahn/wamp/test/test_serializer.py
+
+Compression corpus files retain their upstream contents and provenance described
+in upstream case12_x_x.py and catalog/provenance.json.

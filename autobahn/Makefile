@@ -1,28 +1,19 @@
-.PHONY: all build run test clean
+.PHONY: all build build-runner run test clean
 
 # Build the autobahn test server
 build:
-	cd .. && cargo build --release --bin autobahn-server --features permessage-deflate
+	cargo build --release --locked --manifest-path ../Cargo.toml --bin autobahn-server --features permessage-deflate
+
+build-runner:
+	cargo build --release --locked --manifest-path ../autobahn-testsuite-rs/Cargo.toml --bin wstest
 
 # Run the autobahn test server
 run: build
 	cd .. && ./target/release/autobahn-server
 
-# Run the Autobahn test suite (requires Docker)
-test: build
-	@echo "Starting autobahn server..."
-	@cd .. && ./target/release/autobahn-server &
-	@sleep 2
-	@echo "Running Autobahn test suite..."
-	docker run -it --rm \
-		--network host \
-		-v $(PWD):/config \
-		-v $(PWD)/reports:/reports \
-		crossbario/autobahn-testsuite \
-		wstest -m fuzzingclient -s /config/fuzzingclient.json
-	@echo "Stopping server..."
-	@pkill -f autobahn-server || true
-	@echo "Results available in reports/index.html"
+# Run every case with its full workload using the bundled Rust port.
+test: build build-runner
+	python3 run.py
 
 # Clean build artifacts
 clean:

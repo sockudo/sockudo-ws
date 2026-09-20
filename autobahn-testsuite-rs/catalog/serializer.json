@@ -1,0 +1,454 @@
+[
+  {
+    "name": "WAMP HELLO Message (realm = realm1, roles = {'subscriber': RoleSubscriberFeatures()}, authmethods = None, authid = None)",
+    "rmsg": [
+      1,
+      "realm1",
+      {
+        "roles": {
+          "subscriber": {}
+        }
+      }
+    ]
+  },
+  {
+    "name": "WAMP GOODBYE Message (message = None, reason = wamp.close.normal)",
+    "rmsg": [
+      6,
+      {},
+      "wamp.close.normal"
+    ]
+  },
+  {
+    "name": "WAMP YIELD Message (request = 123456, args = None, kwargs = None, progress = None)",
+    "rmsg": [
+      70,
+      123456,
+      {}
+    ]
+  },
+  {
+    "name": "WAMP YIELD Message (request = 123456, args = [1, 2, 3], kwargs = {'foo': 23, 'bar': 'hello'}, progress = None)",
+    "rmsg": [
+      70,
+      123456,
+      {},
+      [
+        1,
+        2,
+        3
+      ],
+      {
+        "foo": 23,
+        "bar": "hello"
+      }
+    ]
+  },
+  {
+    "name": "WAMP YIELD Message (request = 123456, args = None, kwargs = None, progress = True)",
+    "rmsg": [
+      70,
+      123456,
+      {
+        "progress": true
+      }
+    ]
+  },
+  {
+    "name": "WAMP INTERRUPT Message (request = 123456, mode = 'None')",
+    "rmsg": [
+      69,
+      123456,
+      {}
+    ]
+  },
+  {
+    "name": "WAMP INTERRUPT Message (request = 123456, mode = 'kill')",
+    "rmsg": [
+      69,
+      123456,
+      {
+        "mode": "kill"
+      }
+    ]
+  },
+  {
+    "name": "WAMP INVOCATION Message (request = 123456, registration = 789123, args = None, kwargs = None, timeout = None, receive_progress = None, caller = None, procedure = None)",
+    "rmsg": [
+      68,
+      123456,
+      789123,
+      {}
+    ]
+  },
+  {
+    "name": "WAMP INVOCATION Message (request = 123456, registration = 789123, args = [1, 2, 3], kwargs = {'foo': 23, 'bar': 'hello'}, timeout = None, receive_progress = None, caller = None, procedure = None)",
+    "rmsg": [
+      68,
+      123456,
+      789123,
+      {},
+      [
+        1,
+        2,
+        3
+      ],
+      {
+        "foo": 23,
+        "bar": "hello"
+      }
+    ]
+  },
+  {
+    "name": "WAMP INVOCATION Message (request = 123456, registration = 789123, args = None, kwargs = None, timeout = 10000, receive_progress = None, caller = None, procedure = None)",
+    "rmsg": [
+      68,
+      123456,
+      789123,
+      {
+        "timeout": 10000
+      }
+    ]
+  },
+  {
+    "name": "WAMP RESULT Message (request = 123456, args = None, kwargs = None, progress = None)",
+    "rmsg": [
+      50,
+      123456,
+      {}
+    ]
+  },
+  {
+    "name": "WAMP RESULT Message (request = 123456, args = [1, 2, 3], kwargs = {'foo': 23, 'bar': 'hello'}, progress = None)",
+    "rmsg": [
+      50,
+      123456,
+      {},
+      [
+        1,
+        2,
+        3
+      ],
+      {
+        "foo": 23,
+        "bar": "hello"
+      }
+    ]
+  },
+  {
+    "name": "WAMP RESULT Message (request = 123456, args = None, kwargs = None, progress = True)",
+    "rmsg": [
+      50,
+      123456,
+      {
+        "progress": true
+      }
+    ]
+  },
+  {
+    "name": "WAMP CANCEL Message (request = 123456, mode = 'None'')",
+    "rmsg": [
+      49,
+      123456,
+      {}
+    ]
+  },
+  {
+    "name": "WAMP CANCEL Message (request = 123456, mode = 'kill'')",
+    "rmsg": [
+      49,
+      123456,
+      {
+        "mode": "kill"
+      }
+    ]
+  },
+  {
+    "name": "WAMP CALL Message (request = 123456, procedure = com.myapp.procedure1, args = None, kwargs = None, timeout = None, receive_progress = None, disclose_me = None)",
+    "rmsg": [
+      48,
+      123456,
+      {},
+      "com.myapp.procedure1"
+    ]
+  },
+  {
+    "name": "WAMP CALL Message (request = 123456, procedure = com.myapp.procedure1, args = [1, 2, 3], kwargs = {'foo': 23, 'bar': 'hello'}, timeout = None, receive_progress = None, disclose_me = None)",
+    "rmsg": [
+      48,
+      123456,
+      {},
+      "com.myapp.procedure1",
+      [
+        1,
+        2,
+        3
+      ],
+      {
+        "foo": 23,
+        "bar": "hello"
+      }
+    ]
+  },
+  {
+    "name": "WAMP CALL Message (request = 123456, procedure = com.myapp.procedure1, args = None, kwargs = None, timeout = 10000, receive_progress = None, disclose_me = None)",
+    "rmsg": [
+      48,
+      123456,
+      {
+        "timeout": 10000
+      },
+      "com.myapp.procedure1"
+    ]
+  },
+  {
+    "name": "WAMP UNREGISTERED Message (request = 123456, reason = None, registration = None)",
+    "rmsg": [
+      67,
+      123456
+    ]
+  },
+  {
+    "name": "WAMP UNREGISTER Message (request = 123456, registration = 789123)",
+    "rmsg": [
+      66,
+      123456,
+      789123
+    ]
+  },
+  {
+    "name": "WAMP REGISTERED Message (request = 123456, registration = 789123)",
+    "rmsg": [
+      65,
+      123456,
+      789123
+    ]
+  },
+  {
+    "name": "WAMP REGISTER Message (request = 123456, procedure = com.myapp.procedure1, match = exact, invoke = single)",
+    "rmsg": [
+      64,
+      123456,
+      {},
+      "com.myapp.procedure1"
+    ]
+  },
+  {
+    "name": "WAMP REGISTER Message (request = 123456, procedure = com.myapp.procedure1, match = prefix, invoke = single)",
+    "rmsg": [
+      64,
+      123456,
+      {
+        "match": "prefix"
+      },
+      "com.myapp.procedure1"
+    ]
+  },
+  {
+    "name": "WAMP REGISTER Message (request = 123456, procedure = com.myapp.procedure1, match = exact, invoke = roundrobin)",
+    "rmsg": [
+      64,
+      123456,
+      {
+        "invoke": "roundrobin"
+      },
+      "com.myapp.procedure1"
+    ]
+  },
+  {
+    "name": "WAMP EVENT Message (subscription = 123456, publication = 789123, args = None, kwargs = None, publisher = None, topic = None)",
+    "rmsg": [
+      36,
+      123456,
+      789123,
+      {}
+    ]
+  },
+  {
+    "name": "WAMP EVENT Message (subscription = 123456, publication = 789123, args = [1, 2, 3], kwargs = {'foo': 23, 'bar': 'hello'}, publisher = None, topic = None)",
+    "rmsg": [
+      36,
+      123456,
+      789123,
+      {},
+      [
+        1,
+        2,
+        3
+      ],
+      {
+        "foo": 23,
+        "bar": "hello"
+      }
+    ]
+  },
+  {
+    "name": "WAMP EVENT Message (subscription = 123456, publication = 789123, args = None, kwargs = None, publisher = 300, topic = None)",
+    "rmsg": [
+      36,
+      123456,
+      789123,
+      {
+        "publisher": 300
+      }
+    ]
+  },
+  {
+    "name": "WAMP PUBLISHED Message (request = 123456, publication = 789123)",
+    "rmsg": [
+      17,
+      123456,
+      789123
+    ]
+  },
+  {
+    "name": "WAMP PUBLISH Message (request = 123456, topic = com.myapp.topic1, args = None, kwargs = None, acknowledge = None, exclude_me = None, exclude = None, eligible = None, disclose_me = None)",
+    "rmsg": [
+      16,
+      123456,
+      {},
+      "com.myapp.topic1"
+    ]
+  },
+  {
+    "name": "WAMP PUBLISH Message (request = 123456, topic = com.myapp.topic1, args = [1, 2, 3], kwargs = {'foo': 23, 'bar': 'hello'}, acknowledge = None, exclude_me = None, exclude = None, eligible = None, disclose_me = None)",
+    "rmsg": [
+      16,
+      123456,
+      {},
+      "com.myapp.topic1",
+      [
+        1,
+        2,
+        3
+      ],
+      {
+        "foo": 23,
+        "bar": "hello"
+      }
+    ]
+  },
+  {
+    "name": "WAMP PUBLISH Message (request = 123456, topic = com.myapp.topic1, args = None, kwargs = None, acknowledge = None, exclude_me = False, exclude = [300], eligible = [100, 200, 300], disclose_me = True)",
+    "rmsg": [
+      16,
+      123456,
+      {
+        "exclude_me": false,
+        "exclude": [
+          300
+        ],
+        "eligible": [
+          100,
+          200,
+          300
+        ],
+        "disclose_me": true
+      },
+      "com.myapp.topic1"
+    ]
+  },
+  {
+    "name": "WAMP UNSUBSCRIBED Message (request = 123456, reason = None, subscription = None)",
+    "rmsg": [
+      35,
+      123456
+    ]
+  },
+  {
+    "name": "WAMP UNSUBSCRIBE Message (request = 123456, subscription = 789123)",
+    "rmsg": [
+      34,
+      123456,
+      789123
+    ]
+  },
+  {
+    "name": "WAMP SUBSCRIBED Message (request = 123456, subscription = 789123)",
+    "rmsg": [
+      33,
+      123456,
+      789123
+    ]
+  },
+  {
+    "name": "WAMP SUBSCRIBE Message (request = 123456, topic = com.myapp.topic1, match = exact)",
+    "rmsg": [
+      32,
+      123456,
+      {},
+      "com.myapp.topic1"
+    ]
+  },
+  {
+    "name": "WAMP SUBSCRIBE Message (request = 123456, topic = com.myapp.topic1, match = prefix)",
+    "rmsg": [
+      32,
+      123456,
+      {
+        "match": "prefix"
+      },
+      "com.myapp.topic1"
+    ]
+  },
+  {
+    "name": "WAMP Error Message (request_type = 48, request = 123456, error = com.myapp.error1, args = None, kwargs = None)",
+    "rmsg": [
+      8,
+      48,
+      123456,
+      {},
+      "com.myapp.error1"
+    ]
+  },
+  {
+    "name": "WAMP Error Message (request_type = 48, request = 123456, error = com.myapp.error1, args = [1, 2, 3], kwargs = {'foo': 23, 'bar': 'hello'})",
+    "rmsg": [
+      8,
+      48,
+      123456,
+      {},
+      "com.myapp.error1",
+      [
+        1,
+        2,
+        3
+      ],
+      {
+        "foo": 23,
+        "bar": "hello"
+      }
+    ]
+  },
+  {
+    "name": "WAMP CALL Message (request = 123456, procedure = com.myapp.你好世界, args = [1, 2, 3], kwargs = None, timeout = None, receive_progress = None, disclose_me = None)",
+    "rmsg": [
+      48,
+      123456,
+      {},
+      "com.myapp.你好世界",
+      [
+        1,
+        2,
+        3
+      ]
+    ]
+  },
+  {
+    "name": "WAMP RESULT Message (request = 123456, args = [1, 2, 3], kwargs = {'en': 'Hello World', 'jp': 'こんにちは世界'}, progress = None)",
+    "rmsg": [
+      50,
+      123456,
+      {},
+      [
+        1,
+        2,
+        3
+      ],
+      {
+        "en": "Hello World",
+        "jp": "こんにちは世界"
+      }
+    ]
+  }
+]
