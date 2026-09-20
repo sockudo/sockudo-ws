@@ -173,7 +173,14 @@ impl SharedEncoderPool {
             .next_encoder
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             % SHARED_POOL_SIZE;
-        self.encoders[index].lock().compress(data)
+        let mut encoder = self.encoders[index].lock();
+        let result = encoder.compress(data);
+        // A failed shared encoder must not expose its pending bytes or history
+        // to the next connection that acquires this slot.
+        if result.is_err() {
+            encoder.reset();
+        }
+        result
     }
 }
 
