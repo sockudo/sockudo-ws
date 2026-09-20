@@ -216,6 +216,7 @@ pub fn global_shared_pool() -> Arc<SharedCompressorPool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DeflateWindowBits;
 
     #[test]
     fn test_compression_context_disabled() {
@@ -272,7 +273,6 @@ mod tests {
             Compression::Disabled,
             Compression::Dedicated,
             Compression::Shared,
-            Compression::Window256B,
             Compression::Window1KB,
             Compression::Window2KB,
             Compression::Window4KB,
@@ -285,25 +285,44 @@ mod tests {
             } else {
                 let config = mode.to_deflate_config();
                 assert!(config.is_some(), "Mode {:?} should have config", mode);
-
-                let config = config.unwrap();
-                assert!(config.server_max_window_bits >= 8);
-                assert!(config.server_max_window_bits <= 15);
             }
         }
     }
 
     #[test]
     fn test_window_sizes() {
-        assert_eq!(Compression::Disabled.window_bits(), 0);
-        assert_eq!(Compression::Window256B.window_bits(), 8);
-        assert_eq!(Compression::Window1KB.window_bits(), 10);
-        assert_eq!(Compression::Window2KB.window_bits(), 11);
-        assert_eq!(Compression::Window4KB.window_bits(), 12);
-        assert_eq!(Compression::Window8KB.window_bits(), 13);
-        assert_eq!(Compression::Window16KB.window_bits(), 14);
-        assert_eq!(Compression::Window32KB.window_bits(), 15);
-        assert_eq!(Compression::Dedicated.window_bits(), 15);
-        assert_eq!(Compression::Shared.window_bits(), 15);
+        assert_eq!(Compression::Disabled.window_bits(), None);
+        assert_eq!(
+            Compression::Window1KB.window_bits(),
+            Some(DeflateWindowBits::Bits10)
+        );
+        assert_eq!(
+            Compression::Window2KB.window_bits(),
+            Some(DeflateWindowBits::Bits11)
+        );
+        assert_eq!(
+            Compression::Window4KB.window_bits(),
+            Some(DeflateWindowBits::Bits12)
+        );
+        assert_eq!(
+            Compression::Window8KB.window_bits(),
+            Some(DeflateWindowBits::Bits13)
+        );
+        assert_eq!(
+            Compression::Window16KB.window_bits(),
+            Some(DeflateWindowBits::Bits14)
+        );
+        assert_eq!(
+            Compression::Window32KB.window_bits(),
+            Some(DeflateWindowBits::Bits15)
+        );
+        assert_eq!(
+            Compression::Dedicated.window_bits(),
+            Some(DeflateWindowBits::Bits15)
+        );
+        assert_eq!(
+            Compression::Shared.window_bits(),
+            Some(DeflateWindowBits::Bits15)
+        );
     }
 }
