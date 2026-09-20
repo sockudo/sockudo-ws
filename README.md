@@ -1024,16 +1024,25 @@ cargo test --no-default-features --features compio-runtime,http2,http3 --test e2
 
 ### Autobahn Test Suite
 
+The bundled [Rust Autobahn port](autobahn-testsuite-rs/README.md) runs all 517
+WebSocket cases against the `sockudo-ws` echo server, including compression, with
+the full message counts and no case exclusions. Requires Rust 1.88+ and Python 3
+for process management.
+
 ```bash
-cd autobahn
-
-# Build and run server + tests
-make test
-
-# Or manually:
-make run  # Start server
-# Then run Autobahn client in another terminal
+make -C autobahn test
 ```
+
+The command builds both binaries, waits for the server, runs four cases at a
+time, and stops the server on completion or failure. Reports and logs are saved
+in `autobahn/reports/`; open `index.html` for case details. A failing case or close
+handshake makes the command fail. Concurrent runs are for conformance checking;
+their timings should not be treated as isolated latency measurements.
+
+GitHub Actions runs the same command on pull requests and pushes to `master` or
+`main`, and requires it to pass before publishing a release to crates.io. The
+`autobahn-reports` artifact retains reports and logs for 14 days, including failed
+runs. The Autobahn workflow can also be started manually.
 
 ## Fuzzing
 

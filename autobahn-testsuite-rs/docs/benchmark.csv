@@ -1,0 +1,10 @@
+operation,bytes,iterations,seconds,gib_per_second
+mask,125,53445632,0.250002,24.887
+decode_with_input_copy,125,7396352,0.250021,3.444
+mask,4096,6867968,0.250005,104.795
+decode_with_input_copy,4096,2562048,0.250034,39.088
+mask,65536,487424,0.250365,118.827
+decode_with_input_copy,65536,348160,0.250624,84.788
+mask,1048576,17408,0.254309,66.848
+decode_with_input_copy,1048576,20480,0.257662,77.621
+deflate_repetitive_context_takeover,40960,29696,0.258062,4.390

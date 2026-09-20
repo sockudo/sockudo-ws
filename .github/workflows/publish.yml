@@ -8,8 +8,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  autobahn:
+    name: Autobahn
+    uses: ./.github/workflows/autobahn.yml
+
   publish:
     name: Publish
+    needs: autobahn
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

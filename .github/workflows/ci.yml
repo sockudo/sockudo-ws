@@ -10,6 +10,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  autobahn:
+    name: Autobahn
+    uses: ./.github/workflows/autobahn.yml
+
   test:
     name: Test
     runs-on: ubuntu-latest

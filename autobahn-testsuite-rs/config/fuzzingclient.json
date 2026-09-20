@@ -1,0 +1,8 @@
+{
+  "outdir": "reports/servers",
+  "servers": [{"agent": "server-under-test", "url": "ws://127.0.0.1:9001"}],
+  "cases": ["*"],
+  "exclude-cases": [],
+  "exclude-agent-cases": {},
+  "concurrency": 1
+}
