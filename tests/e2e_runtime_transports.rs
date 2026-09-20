@@ -256,6 +256,8 @@ mod compio_http2_e2e {
     use sockudo_ws::compio::{connect_http2, connect_http2_multiplexed, runtime, serve_http2};
     use sockudo_ws::{Config, Message};
 
+    const LARGE_PAYLOAD_SIZE: usize = 128 * 1024 + 1;
+
     #[compio::test]
     async fn websocket_over_http2_tcp_e2e() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -267,6 +269,9 @@ mod compio_http2_e2e {
                 assert_eq!(req.path, "/compio-h2");
                 let msg = ws.next().await.unwrap().unwrap();
                 assert!(matches!(&msg, Message::Text(text) if text == "compio-h2"));
+                ws.send(msg).await.unwrap();
+                let msg = ws.next().await.unwrap().unwrap();
+                assert!(matches!(&msg, Message::Binary(data) if data.len() == LARGE_PAYLOAD_SIZE));
                 ws.send(msg).await.unwrap();
             })
             .await
@@ -286,6 +291,12 @@ mod compio_http2_e2e {
         ws.send_text("compio-h2").await.unwrap();
         let echoed = ws.next().await.unwrap().unwrap();
         assert!(matches!(echoed, Message::Text(text) if text == "compio-h2"));
+        let payload = (0..LARGE_PAYLOAD_SIZE)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        ws.send(Message::binary(payload.clone())).await.unwrap();
+        let echoed = ws.next().await.unwrap().unwrap();
+        assert!(matches!(echoed, Message::Binary(data) if data.as_ref() == payload));
 
         drop(ws);
         server_task.await.unwrap();
@@ -343,6 +354,8 @@ mod compio_http3_e2e {
     };
     use sockudo_ws::{Config, Message};
 
+    const LARGE_PAYLOAD_SIZE: usize = 128 * 1024 + 1;
+
     async fn server_endpoint(server_tls: rustls::ServerConfig) -> compio::quic::Endpoint {
         compio::quic::ServerBuilder::new_with_rustls_server_config(server_tls)
             .with_alpn_protocols(&["h3"])
@@ -365,6 +378,11 @@ mod compio_http3_e2e {
                     let msg = ws.next().await.unwrap().unwrap();
                     assert!(matches!(&msg, Message::Text(text) if text == "compio-h3"));
                     ws.send(msg).await.unwrap();
+                    let msg = ws.next().await.unwrap().unwrap();
+                    assert!(
+                        matches!(&msg, Message::Binary(data) if data.len() == LARGE_PAYLOAD_SIZE)
+                    );
+                    ws.send(msg).await.unwrap();
                 })
                 .await
                 .unwrap();
@@ -384,6 +402,12 @@ mod compio_http3_e2e {
         ws.send_text("compio-h3").await.unwrap();
         let echoed = ws.next().await.unwrap().unwrap();
         assert!(matches!(echoed, Message::Text(text) if text == "compio-h3"));
+        let payload = (0..LARGE_PAYLOAD_SIZE)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        ws.send(Message::binary(payload.clone())).await.unwrap();
+        let echoed = ws.next().await.unwrap().unwrap();
+        assert!(matches!(echoed, Message::Binary(data) if data.as_ref() == payload));
 
         drop(ws);
         endpoint.close(compio::quic::VarInt::from_u32(0x100), b"done");
