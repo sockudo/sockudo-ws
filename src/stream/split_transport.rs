@@ -31,6 +31,39 @@ impl<S> SplitTransport<S> {
     }
 }
 
+impl<S: AsyncWrite + Unpin> SplitTransport<S> {
+    pub(super) async fn write_all_and_flush(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let mut written = 0;
+        std::future::poll_fn(|cx| {
+            loop {
+                let mut stream = self.stream.lock().unwrap();
+                let stream = stream
+                    .as_mut()
+                    .expect("write after split transport release");
+                if written == bytes.len() {
+                    return Pin::new(stream).poll_flush(cx);
+                }
+                match Pin::new(&mut *stream).poll_write(cx, &bytes[written..]) {
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+                    }
+                    Poll::Ready(Ok(count)) => {
+                        written += count;
+                        if written == bytes.len() {
+                            return Pin::new(stream).poll_flush(cx);
+                        }
+                        // Match write_all's lock boundary so a reader can make
+                        // progress between immediately ready partial writes.
+                    }
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        })
+        .await
+    }
+}
+
 impl<S> Clone for SplitTransport<S> {
     fn clone(&self) -> Self {
         Self {
@@ -58,25 +91,34 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for SplitTransport<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match self.stream.lock().unwrap().as_mut() {
-            Some(stream) => Pin::new(stream).poll_write(cx, buf),
-            // A direct application writer may be polled again after the driver
-            // releases the transport. Its shared state supplies the typed cause.
-            None => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
-        }
+        let mut stream = self.stream.lock().unwrap();
+        // The driver drops each write future before starting another operation
+        // after termination; writing a released transport is a driver bug.
+        Pin::new(
+            stream
+                .as_mut()
+                .expect("write after split transport release"),
+        )
+        .poll_write(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.stream.lock().unwrap().as_mut() {
-            Some(stream) => Pin::new(stream).poll_flush(cx),
-            None => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
-        }
+        let mut stream = self.stream.lock().unwrap();
+        Pin::new(
+            stream
+                .as_mut()
+                .expect("flush after split transport release"),
+        )
+        .poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.stream.lock().unwrap().as_mut() {
-            Some(stream) => Pin::new(stream).poll_shutdown(cx),
-            None => Poll::Ready(Ok(())),
-        }
+        let mut stream = self.stream.lock().unwrap();
+        Pin::new(
+            stream
+                .as_mut()
+                .expect("shutdown after split transport release"),
+        )
+        .poll_shutdown(cx)
     }
 }

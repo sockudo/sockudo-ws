@@ -21,8 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Compio HTTP/2 entry points require `Splittable`; other transports can use
   `compio::io::util::Split::new`. Custom reads must cooperate with cancellation
   for prompt automatic Ping; only an existing idle/Pong deadline bounds recovery.
-- Cancelling an accepted split send terminates the connection even before transport
-  progress. Retain the future across timeout/select boundaries to keep it usable.
+- Cancelling a queued split send before the driver starts it drops that request
+  and keeps the connection usable. Cancellation after encoding or writing starts
+  terminates the connection unless the frame has fully flushed. An accepted Close
+  continues independently of its caller; a zero Close timeout still makes one
+  immediately ready write/flush attempt.
 
 - Explicit `send_coalesced()` calls can coalesce outbound frames while parsed
   inbound messages remain queued (`Config::write_coalescing`, default on).

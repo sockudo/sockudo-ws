@@ -395,12 +395,22 @@ impl Protocol {
     /// This variant allows reusing a Vec<Message> across calls to avoid allocations.
     #[inline]
     pub fn process_into(&mut self, buf: &mut BytesMut, messages: &mut Vec<Message>) -> Result<()> {
-        self.process_into_with_activity(buf, messages).map(|_| ())
+        self.process_frames::<false>(buf, messages).map(|_| ())
     }
 
     /// Report accepted non-final data frames, which do not yield a message.
     /// Complete messages and control frames retain stream-level activity handling.
     pub(crate) fn process_into_with_activity(
+        &mut self,
+        buf: &mut BytesMut,
+        messages: &mut Vec<Message>,
+    ) -> Result<bool> {
+        self.process_frames::<true>(buf, messages)
+    }
+
+    // Public message-only callers do not need fragment activity bookkeeping.
+    #[inline]
+    fn process_frames<const TRACK_ACTIVITY: bool>(
         &mut self,
         buf: &mut BytesMut,
         messages: &mut Vec<Message>,
@@ -411,7 +421,8 @@ impl Protocol {
         while !buf.is_empty() {
             match self.parser.parse(buf)? {
                 Some(frame) => {
-                    let is_fragment = frame.header.opcode.is_data() && !frame.header.fin;
+                    let is_fragment =
+                        TRACK_ACTIVITY && frame.header.opcode.is_data() && !frame.header.fin;
                     let prevalidated = std::mem::take(&mut self.partial_checked);
                     if let Some(msg) = self.handle_frame(frame, prevalidated)? {
                         messages.push(msg);
