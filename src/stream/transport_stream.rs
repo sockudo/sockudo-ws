@@ -37,6 +37,8 @@ use crate::transport::{Http1, Transport};
 use crate::transport::Http2;
 
 #[cfg(feature = "http3")]
+use crate::http3::stream::{Http3ClientStream, Http3ServerStream};
+#[cfg(feature = "http3")]
 use crate::transport::Http3;
 
 #[cfg(feature = "http3")]
@@ -363,14 +365,10 @@ enum Http3StreamInner {
         recv_finished: bool,
     },
     /// Server-side h3 request stream
-    Server {
-        stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-        read_buf: BytesMut,
-    },
+    Server { stream: Http3ServerStream },
     /// Client-side h3 request stream
     Client {
-        stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-        read_buf: BytesMut,
+        stream: Http3ClientStream,
         _endpoint: Option<quinn::Endpoint>,
         _send_request: Option<H3ClientSendRequest>,
     },
@@ -406,8 +404,7 @@ impl Stream<Http3> {
     ) -> Self {
         Self {
             inner: StreamInner::Http3(Http3StreamInner::Server {
-                stream,
-                read_buf: BytesMut::with_capacity(64 * 1024),
+                stream: Http3ServerStream::new(stream),
             }),
             _marker: PhantomData,
         }
@@ -434,8 +431,7 @@ impl Stream<Http3> {
     ) -> Self {
         Self {
             inner: StreamInner::Http3(Http3StreamInner::Client {
-                stream,
-                read_buf: BytesMut::with_capacity(64 * 1024),
+                stream: Http3ClientStream::new(stream),
                 _endpoint: endpoint,
                 _send_request: send_request,
             }),
@@ -469,7 +465,8 @@ impl AsyncRead for Stream<Http3> {
                 // First drain buffered data
                 if !recv_buf.is_empty() {
                     let to_copy = std::cmp::min(buf.remaining(), recv_buf.len());
-                    buf.put_slice(&recv_buf.split_to(to_copy));
+                    buf.put_slice(&recv_buf[..to_copy]);
+                    recv_buf.advance(to_copy);
                     return Poll::Ready(Ok(()));
                 }
 
@@ -489,71 +486,11 @@ impl AsyncRead for Stream<Http3> {
                     Poll::Pending => Poll::Pending,
                 }
             }
-            StreamInner::Http3(Http3StreamInner::Server { stream, read_buf }) => {
-                // First drain buffered data
-                if !read_buf.is_empty() {
-                    let to_copy = std::cmp::min(buf.remaining(), read_buf.len());
-                    buf.put_slice(&read_buf.split_to(to_copy));
-                    return Poll::Ready(Ok(()));
-                }
-
-                // Poll h3 server stream
-                let mut fut = Box::pin(stream.recv_data());
-                match fut.as_mut().poll(cx) {
-                    Poll::Ready(Ok(Some(mut data))) => {
-                        let data_len = data.remaining();
-                        let to_copy = std::cmp::min(buf.remaining(), data_len);
-                        let chunk = data.copy_to_bytes(to_copy);
-                        buf.put_slice(&chunk);
-
-                        // Buffer remainder
-                        if data.has_remaining() {
-                            while data.has_remaining() {
-                                read_buf.extend_from_slice(data.chunk());
-                                let len = data.chunk().len();
-                                data.advance(len);
-                            }
-                        }
-                        Poll::Ready(Ok(()))
-                    }
-                    Poll::Ready(Ok(None)) => Poll::Ready(Ok(())),
-                    Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e.to_string()))),
-                    Poll::Pending => Poll::Pending,
-                }
+            StreamInner::Http3(Http3StreamInner::Server { stream }) => {
+                Pin::new(stream).poll_read(cx, buf)
             }
-            StreamInner::Http3(Http3StreamInner::Client {
-                stream, read_buf, ..
-            }) => {
-                // First drain buffered data
-                if !read_buf.is_empty() {
-                    let to_copy = std::cmp::min(buf.remaining(), read_buf.len());
-                    buf.put_slice(&read_buf.split_to(to_copy));
-                    return Poll::Ready(Ok(()));
-                }
-
-                // Poll h3 client stream
-                let mut fut = Box::pin(stream.recv_data());
-                match fut.as_mut().poll(cx) {
-                    Poll::Ready(Ok(Some(mut data))) => {
-                        let data_len = data.remaining();
-                        let to_copy = std::cmp::min(buf.remaining(), data_len);
-                        let chunk = data.copy_to_bytes(to_copy);
-                        buf.put_slice(&chunk);
-
-                        // Buffer remainder
-                        if data.has_remaining() {
-                            while data.has_remaining() {
-                                read_buf.extend_from_slice(data.chunk());
-                                let len = data.chunk().len();
-                                data.advance(len);
-                            }
-                        }
-                        Poll::Ready(Ok(()))
-                    }
-                    Poll::Ready(Ok(None)) => Poll::Ready(Ok(())),
-                    Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e.to_string()))),
-                    Poll::Pending => Poll::Pending,
-                }
+            StreamInner::Http3(Http3StreamInner::Client { stream, .. }) => {
+                Pin::new(stream).poll_read(cx, buf)
             }
             _ => unreachable!(),
         }
@@ -579,35 +516,27 @@ impl AsyncWrite for Stream<Http3> {
                     Poll::Pending => Poll::Pending,
                 }
             }
-            StreamInner::Http3(Http3StreamInner::Server { stream, .. }) => {
-                let data = Bytes::copy_from_slice(buf);
-                let fut = stream.send_data(data);
-                tokio::pin!(fut);
-
-                match fut.poll(cx) {
-                    Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
-                    Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e.to_string()))),
-                    Poll::Pending => Poll::Pending,
-                }
+            StreamInner::Http3(Http3StreamInner::Server { stream }) => {
+                Pin::new(stream).poll_write(cx, buf)
             }
             StreamInner::Http3(Http3StreamInner::Client { stream, .. }) => {
-                let data = Bytes::copy_from_slice(buf);
-                let fut = stream.send_data(data);
-                tokio::pin!(fut);
-
-                match fut.poll(cx) {
-                    Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
-                    Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e.to_string()))),
-                    Poll::Pending => Poll::Pending,
-                }
+                Pin::new(stream).poll_write(cx, buf)
             }
             _ => unreachable!(),
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // QUIC/h3 handles flushing internally
-        Poll::Ready(Ok(()))
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &mut self.inner {
+            StreamInner::Http3(Http3StreamInner::Raw { .. }) => Poll::Ready(Ok(())),
+            StreamInner::Http3(Http3StreamInner::Server { stream }) => {
+                Pin::new(stream).poll_flush(cx)
+            }
+            StreamInner::Http3(Http3StreamInner::Client { stream, .. }) => {
+                Pin::new(stream).poll_flush(cx)
+            }
+            _ => unreachable!(),
+        }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -616,25 +545,11 @@ impl AsyncWrite for Stream<Http3> {
                 Ok(()) => Poll::Ready(Ok(())),
                 Err(e) => Poll::Ready(Err(io::Error::other(e))),
             },
-            StreamInner::Http3(Http3StreamInner::Server { stream, .. }) => {
-                let fut = stream.finish();
-                tokio::pin!(fut);
-
-                match fut.poll(cx) {
-                    Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-                    Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e.to_string()))),
-                    Poll::Pending => Poll::Pending,
-                }
+            StreamInner::Http3(Http3StreamInner::Server { stream }) => {
+                Pin::new(stream).poll_shutdown(cx)
             }
             StreamInner::Http3(Http3StreamInner::Client { stream, .. }) => {
-                let fut = stream.finish();
-                tokio::pin!(fut);
-
-                match fut.poll(cx) {
-                    Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-                    Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e.to_string()))),
-                    Poll::Pending => Poll::Pending,
-                }
+                Pin::new(stream).poll_shutdown(cx)
             }
             _ => unreachable!(),
         }
@@ -655,15 +570,15 @@ impl fmt::Debug for Stream<Http3> {
                 .field("recv_buf_len", &recv_buf.len())
                 .field("recv_finished", recv_finished)
                 .finish(),
-            StreamInner::Http3(Http3StreamInner::Server { read_buf, .. }) => f
+            StreamInner::Http3(Http3StreamInner::Server { stream }) => f
                 .debug_struct("Stream<Http3>")
                 .field("variant", &"Server")
-                .field("read_buf_len", &read_buf.len())
+                .field("read_buf_len", &stream.read_buf_len())
                 .finish(),
-            StreamInner::Http3(Http3StreamInner::Client { read_buf, .. }) => f
+            StreamInner::Http3(Http3StreamInner::Client { stream, .. }) => f
                 .debug_struct("Stream<Http3>")
                 .field("variant", &"Client")
-                .field("read_buf_len", &read_buf.len())
+                .field("read_buf_len", &stream.read_buf_len())
                 .finish(),
             _ => unreachable!(),
         }

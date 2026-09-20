@@ -4,6 +4,7 @@
 //! that implement tokio's `AsyncRead` and `AsyncWrite` traits for use with
 //! `WebSocketStream`.
 
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -105,7 +106,8 @@ impl AsyncRead for Http3Stream {
         // First, drain any pending bytes from h3 layer
         if let Some(pending) = this.pending_bytes {
             let to_copy = std::cmp::min(buf.remaining(), pending.len());
-            buf.put_slice(&pending.split_to(to_copy));
+            buf.put_slice(&pending[..to_copy]);
+            pending.advance(to_copy);
             if pending.is_empty() {
                 *this.pending_bytes = None;
             }
@@ -115,7 +117,8 @@ impl AsyncRead for Http3Stream {
         // Then try internal buffer
         if !this.recv_buf.is_empty() {
             let to_copy = std::cmp::min(buf.remaining(), this.recv_buf.len());
-            buf.put_slice(&this.recv_buf.split_to(to_copy));
+            buf.put_slice(&this.recv_buf[..to_copy]);
+            this.recv_buf.advance(to_copy);
             return Poll::Ready(Ok(()));
         }
 
@@ -187,22 +190,119 @@ impl std::fmt::Debug for Http3Stream {
 // Http3ServerStream - For server-side h3 request streams
 // ============================================================================
 
+type H3WriteFuture<S> =
+    Pin<Box<dyn Future<Output = (S, Result<(), h3::error::StreamError>)> + Send + 'static>>;
+
+trait H3SendStream: Send + Sized + 'static {
+    fn send_data(self, data: Bytes) -> H3WriteFuture<Self>;
+}
+
+impl H3SendStream for h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes> {
+    fn send_data(mut self, data: Bytes) -> H3WriteFuture<Self> {
+        Box::pin(async move {
+            let result = h3::server::RequestStream::send_data(&mut self, data).await;
+            (self, result)
+        })
+    }
+}
+
+impl H3SendStream for h3::client::RequestStream<h3_quinn::SendStream<Bytes>, Bytes> {
+    fn send_data(mut self, data: Bytes) -> H3WriteFuture<Self> {
+        Box::pin(async move {
+            let result = h3::client::RequestStream::send_data(&mut self, data).await;
+            (self, result)
+        })
+    }
+}
+
+// h3-quinn keeps a DATA write in the send stream while `send_data` is pending.
+// Keep that future alive and return the stream only after the write completes;
+// recreating the future would start a second write and close the connection.
+struct H3Writer<S> {
+    stream: Option<S>,
+    pending_write: Option<H3WriteFuture<S>>,
+}
+
+impl<S: H3SendStream> H3Writer<S> {
+    fn new(stream: S) -> Self {
+        Self {
+            stream: Some(stream),
+            pending_write: None,
+        }
+    }
+
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        match self.poll_pending_write(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
+
+        let stream = self
+            .stream
+            .take()
+            .expect("HTTP/3 send stream missing without a pending write");
+        // Accept owned bytes synchronously. A cancelled caller must never have
+        // its old byte count reported against a different buffer on the next poll.
+        self.pending_write = Some(stream.send_data(Bytes::copy_from_slice(buf)));
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_pending_write(cx)
+    }
+
+    fn stream_mut(&mut self) -> &mut S {
+        self.stream
+            .as_mut()
+            .expect("HTTP/3 send stream missing after flushing pending writes")
+    }
+
+    fn poll_pending_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Some(write) = self.pending_write.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+
+        match write.as_mut().poll(cx) {
+            Poll::Ready((stream, result)) => {
+                self.stream = Some(stream);
+                self.pending_write = None;
+                Poll::Ready(result.map_err(|error| io::Error::other(error.to_string())))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+type H3ServerSendStream = h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
+type H3ServerRecvStream = h3::server::RequestStream<h3_quinn::RecvStream, Bytes>;
+
 /// Wrapper around h3 server request stream that implements AsyncRead + AsyncWrite
 ///
 /// After the HTTP/3 CONNECT handshake, this stream is used for raw
 /// WebSocket frame data exchange on the server side.
 pub struct Http3ServerStream {
-    stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    read_buf: BytesMut,
+    writer: H3Writer<H3ServerSendStream>,
+    recv: H3ServerRecvStream,
+    read_buf: Bytes,
 }
 
 impl Http3ServerStream {
     /// Create a new Http3ServerStream
     pub fn new(stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>) -> Self {
+        let (send, recv) = stream.split();
         Self {
-            stream,
-            read_buf: BytesMut::with_capacity(64 * 1024),
+            writer: H3Writer::new(send),
+            recv,
+            read_buf: Bytes::new(),
         }
+    }
+
+    pub(crate) fn read_buf_len(&self) -> usize {
+        self.read_buf.len()
     }
 }
 
@@ -217,14 +317,13 @@ impl AsyncRead for Http3ServerStream {
         // First drain any buffered data
         if !this.read_buf.is_empty() {
             let to_copy = std::cmp::min(buf.remaining(), this.read_buf.len());
-            buf.put_slice(&this.read_buf.split_to(to_copy));
+            buf.put_slice(&this.read_buf[..to_copy]);
+            this.read_buf.advance(to_copy);
             return Poll::Ready(Ok(()));
         }
 
-        // Use a boxed future to work around borrow checker limitations
-        let mut fut = Box::pin(this.stream.recv_data());
-
-        match fut.as_mut().poll(cx) {
+        // Poll the receive stream directly; no temporary future needs ownership.
+        match this.recv.poll_recv_data(cx) {
             Poll::Ready(Ok(Some(mut data))) => {
                 // data is impl Buf, use Buf trait methods
                 let data_len = data.remaining();
@@ -234,14 +333,8 @@ impl AsyncRead for Http3ServerStream {
                 let chunk = data.copy_to_bytes(to_copy);
                 buf.put_slice(&chunk);
 
-                // Buffer any remaining data
-                if data.has_remaining() {
-                    while data.has_remaining() {
-                        this.read_buf.extend_from_slice(data.chunk());
-                        let len = data.chunk().len();
-                        data.advance(len);
-                    }
-                }
+                // Retain the owned DATA remainder for the next read.
+                this.read_buf = data.copy_to_bytes(data.remaining());
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Ok(None)) => {
@@ -256,33 +349,25 @@ impl AsyncRead for Http3ServerStream {
 
 impl AsyncWrite for Http3ServerStream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-
-        // h3's send_data takes Bytes
-        let data = Bytes::copy_from_slice(buf);
-        let fut = self.stream.send_data(data);
-        tokio::pin!(fut);
-
-        match fut.poll(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e.to_string()))),
-            Poll::Pending => Poll::Pending,
-        }
+        self.get_mut().writer.poll_write(cx, buf)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // h3/QUIC handles flushing internally
-        Poll::Ready(Ok(()))
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().writer.poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let fut = self.stream.finish();
+        match self.as_mut().poll_flush(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
+
+        let fut = self.writer.stream_mut().finish();
         tokio::pin!(fut);
 
         match fut.poll(cx) {
@@ -308,19 +393,29 @@ unsafe impl Send for Http3ServerStream {}
 // Http3ClientStream - For client-side h3 request streams
 // ============================================================================
 
+type H3ClientSendStream = h3::client::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
+type H3ClientRecvStream = h3::client::RequestStream<h3_quinn::RecvStream, Bytes>;
+
 /// Wrapper around h3 client request stream that implements AsyncRead + AsyncWrite
 pub struct Http3ClientStream {
-    stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    read_buf: BytesMut,
+    writer: H3Writer<H3ClientSendStream>,
+    recv: H3ClientRecvStream,
+    read_buf: Bytes,
 }
 
 impl Http3ClientStream {
     /// Create a new Http3ClientStream
     pub fn new(stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>) -> Self {
+        let (send, recv) = stream.split();
         Self {
-            stream,
-            read_buf: BytesMut::with_capacity(64 * 1024),
+            writer: H3Writer::new(send),
+            recv,
+            read_buf: Bytes::new(),
         }
+    }
+
+    pub(crate) fn read_buf_len(&self) -> usize {
+        self.read_buf.len()
     }
 }
 
@@ -335,14 +430,13 @@ impl AsyncRead for Http3ClientStream {
         // First drain any buffered data
         if !this.read_buf.is_empty() {
             let to_copy = std::cmp::min(buf.remaining(), this.read_buf.len());
-            buf.put_slice(&this.read_buf.split_to(to_copy));
+            buf.put_slice(&this.read_buf[..to_copy]);
+            this.read_buf.advance(to_copy);
             return Poll::Ready(Ok(()));
         }
 
-        // Use a boxed future to work around borrow checker limitations
-        let mut fut = Box::pin(this.stream.recv_data());
-
-        match fut.as_mut().poll(cx) {
+        // Poll the receive stream directly; no temporary future needs ownership.
+        match this.recv.poll_recv_data(cx) {
             Poll::Ready(Ok(Some(mut data))) => {
                 // data is impl Buf, use Buf trait methods
                 let data_len = data.remaining();
@@ -352,14 +446,8 @@ impl AsyncRead for Http3ClientStream {
                 let chunk = data.copy_to_bytes(to_copy);
                 buf.put_slice(&chunk);
 
-                // Buffer any remaining data
-                if data.has_remaining() {
-                    while data.has_remaining() {
-                        this.read_buf.extend_from_slice(data.chunk());
-                        let len = data.chunk().len();
-                        data.advance(len);
-                    }
-                }
+                // Retain the owned DATA remainder for the next read.
+                this.read_buf = data.copy_to_bytes(data.remaining());
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Ok(None)) => {
@@ -374,31 +462,25 @@ impl AsyncRead for Http3ClientStream {
 
 impl AsyncWrite for Http3ClientStream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-
-        let data = Bytes::copy_from_slice(buf);
-        let fut = self.stream.send_data(data);
-        tokio::pin!(fut);
-
-        match fut.poll(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e.to_string()))),
-            Poll::Pending => Poll::Pending,
-        }
+        self.get_mut().writer.poll_write(cx, buf)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().writer.poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let fut = self.stream.finish();
+        match self.as_mut().poll_flush(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
+
+        let fut = self.writer.stream_mut().finish();
         tokio::pin!(fut);
 
         match fut.poll(cx) {
@@ -430,3 +512,7 @@ mod tests {
         assert_send::<super::Http3ClientStream>();
     }
 }
+
+#[cfg(test)]
+#[path = "stream/write_tests.rs"]
+mod write_tests;
