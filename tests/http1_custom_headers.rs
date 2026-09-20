@@ -266,6 +266,33 @@ async fn http1_client_rejects_invalid_headers_before_writing() {
 }
 
 #[tokio::test]
+async fn http1_client_rejects_injected_host_before_writing() {
+    let (client_io, mut server_io) = tokio::io::duplex(4096);
+    let server = tokio::spawn(async move {
+        let mut received = [0u8; 1];
+        server_io.read(&mut received).await.unwrap()
+    });
+    let client = WebSocketClient::<Http1>::new(Config::default());
+
+    let error = match client
+        .connect_with_headers(
+            client_io,
+            "example.com\r\nX-Injected: true",
+            "/ws",
+            None,
+            None,
+        )
+        .await
+    {
+        Ok(_) => panic!("injected host should be rejected"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, Error::InvalidHttp("invalid Host")));
+    assert_eq!(server.await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn http1_handshake_with_headers_rejects_missing_accept() {
     let (mut client_io, mut server_io) = tokio::io::duplex(4096);
     let server = tokio::spawn(async move {

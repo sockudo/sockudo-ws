@@ -242,7 +242,7 @@ where
             let protocol = req.protocol.map(String::from);
             let extensions = req.extensions.map(String::from);
             let accept_key = generate_accept_key(req.key);
-            let response = build_response(&accept_key, req.protocol, response_extensions)?;
+            let response = build_response(&accept_key, req.protocol, response_extensions);
 
             write_all_owned(stream, response).await?;
             stream.flush().await?;
@@ -2776,7 +2776,7 @@ mod tests {
                         .then(|| value.trim())
                 })
                 .unwrap();
-            let response = build_response(&generate_accept_key(key), None, None).unwrap();
+            let response = build_response(&generate_accept_key(key), None, None);
             write_all_owned(&mut stream, response).await.unwrap();
             stream.flush().await.unwrap();
         });
