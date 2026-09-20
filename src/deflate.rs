@@ -221,6 +221,11 @@ impl DeflateEncoder {
         loop {
             iterations += 1;
             if iterations > 100_000 {
+                // Full flush replaces the reset at the next message boundary,
+                // so a failed no-takeover message must restore that boundary.
+                if self.no_context_takeover {
+                    self.compress.reset();
+                }
                 return Err(Error::Compression(
                     "compression took too many iterations".into(),
                 ));
@@ -242,10 +247,15 @@ impl DeflateEncoder {
             let spare = output.spare_capacity_mut();
             let spare_len = spare.len();
 
-            let status = self
-                .compress
-                .compress_uninit(input, spare, flush)
-                .map_err(|e| Error::Compression(format!("deflate error: {}", e)))?;
+            let status = match self.compress.compress_uninit(input, spare, flush) {
+                Ok(status) => status,
+                Err(error) => {
+                    if self.no_context_takeover {
+                        self.compress.reset();
+                    }
+                    return Err(Error::Compression(format!("deflate error: {error}")));
+                }
+            };
 
             let consumed = (self.compress.total_in() - before_in) as usize;
             let produced = (self.compress.total_out() - before_out) as usize;
