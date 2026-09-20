@@ -216,6 +216,7 @@ fn main() {
         trace: args.len() == 10,
         barrier: Arc::new(Barrier::new(connections * 2)),
     };
+    sockudo_ws::stream::init_clock();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()

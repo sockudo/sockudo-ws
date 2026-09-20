@@ -68,6 +68,7 @@ fn main() {
     let count = burst.checked_mul(groups).unwrap();
     let warmup = burst.checked_mul(16).unwrap();
     let total = count.checked_add(warmup).unwrap();
+    sockudo_ws::init_clock();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let sender = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (peer, _) = listener.accept().unwrap();

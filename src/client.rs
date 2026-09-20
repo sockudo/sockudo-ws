@@ -673,6 +673,7 @@ impl WebSocketClient<Http3> {
     ) -> Result<WebSocketStream<Stream<Http3>>> {
         use http::{Method, Request};
 
+        crate::http3::validate_config(&self.config.http3)?;
         if !self.config.http3.enable_connect_protocol {
             return Err(Error::ExtendedConnectNotSupported);
         }
@@ -779,6 +780,7 @@ impl WebSocketClient<Http3> {
         server_name: &str,
         mut tls_config: rustls::ClientConfig,
     ) -> Result<MultiplexedConnection<Http3>> {
+        crate::http3::validate_config(&self.config.http3)?;
         if !self.config.http3.enable_connect_protocol {
             return Err(Error::ExtendedConnectNotSupported);
         }

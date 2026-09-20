@@ -90,6 +90,19 @@ async fn oversized_compressed_split_frame_is_rejected() {
     assert!(writer.is_closed());
 }
 
+#[tokio::test]
+async fn explicit_close_counts_toward_pending_byte_limit() {
+    let (io, _peer) = tokio::io::duplex(128);
+    let config = Config::builder().max_backpressure(1).build();
+    let mut ws = WebSocketStream::server(io, config);
+
+    assert!(matches!(
+        ws.close(1000, "done").await,
+        Err(Error::BufferFull)
+    ));
+    assert!(ws.is_closed());
+}
+
 #[test]
 fn encoded_buffer_limit_is_a_terminal_error() {
     assert!(Error::BufferFull.is_fatal());

@@ -38,7 +38,7 @@ jobs:
         run: cargo build --all-features
 
       - name: Run tests with quanta clock
-        run: cargo test
+        run: cargo test --features axum-integration
 
       - name: Run production feature tests with quanta clock
         run: cargo test --features full

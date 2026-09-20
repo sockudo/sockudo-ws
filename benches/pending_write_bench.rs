@@ -70,6 +70,7 @@ fn main() {
         "number of peer Pings per pending send; zero selects Ready"
     );
     let pings: usize = args[1].parse().unwrap();
+    sockudo_ws::stream::init_clock();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

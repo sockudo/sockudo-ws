@@ -57,7 +57,7 @@ fn driver(
     let (application, application_rx) = mpsc::channel(SPLIT_APPLICATION_CAPACITY);
     let (cancel, cancel_rx) = mpsc::unbounded();
     let (terminal_tx, _) = mpsc::unbounded();
-    let shared = CompioSplitShared::new(false);
+    let shared = CompioSplitShared::new(false, &config);
     let bytes = Rc::new(RefCell::new(Vec::new()));
     let flush_blocked = Rc::new(Cell::new(false));
     let task = compio_split_writer_driver(
@@ -282,4 +282,16 @@ async fn pong_received_during_ping_flush_prevents_false_timeout() {
     ::compio::time::sleep(Duration::from_millis(1100)).await;
     assert!(futures_util::poll!(task.as_mut()).is_pending());
     assert!(peer.shared.terminal.get().is_none());
+}
+
+#[test]
+fn first_terminal_cause_survives_later_cleanup() {
+    let shared = CompioSplitShared::new(false, &Config::default());
+    shared.terminate(CompioTerminalCause::IdleTimeout);
+    shared.terminate(CompioTerminalCause::ConnectionClosed);
+
+    assert!(matches!(
+        shared.read_terminal(),
+        Some(Err(Error::IdleTimeout))
+    ));
 }

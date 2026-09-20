@@ -289,6 +289,8 @@ fn format_percentile(sorted: &[u64], percent: usize) -> String {
 }
 
 fn main() {
+    sockudo_ws::init_clock();
+
     // Cargo passes --bench to harness-free benchmark executables.
     let args: Vec<_> = std::env::args()
         .skip(1)

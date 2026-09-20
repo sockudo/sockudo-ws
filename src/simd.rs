@@ -119,16 +119,13 @@ pub fn apply_mask(data: &mut [u8], mask: [u8; 4]) {
     apply_mask_blocks(data, mask);
 }
 
-/// Below this length the unaligned block loop wins; above it, aligning the
-/// stores first is worth a short byte prefix.
+/// Alignment threshold used by the portable fallback.
 const ALIGNED_BLOCKS_MIN_LEN: usize = 2048;
 
 /// Portable masking over 64-byte blocks of `u64` words.
 ///
-/// LLVM turns the inner loop into full-width vector XORs on every target and
-/// unrolls it further than a hand-written 16-byte SIMD loop. Measured on an
-/// Apple M5 Pro against the previous NEON loop: 64 B 12 -> 19 GB/s, 1 KiB
-/// 53 -> 84 GB/s, 16 KiB 67 -> 127 GB/s, 256 KiB 70 -> 79 GB/s.
+/// The fixed-size word loop allows LLVM to vectorize without target intrinsics.
+/// Code generation and performance depend on the target and compiler.
 #[inline]
 fn apply_mask_blocks(data: &mut [u8], mask: [u8; 4]) {
     if data.len() < ALIGNED_BLOCKS_MIN_LEN {
@@ -136,8 +133,7 @@ fn apply_mask_blocks(data: &mut [u8], mask: [u8; 4]) {
         return;
     }
 
-    // Align the block loop to 16 bytes so the vector stores never straddle
-    // cache lines; this is what lifts the large sizes above the plain loop.
+    // Align the body to 16 bytes and preserve mask phase across the prefix.
     let misalign = (data.as_ptr() as usize) & 15;
     let prefix_len = if misalign == 0 {
         0
@@ -790,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_mask_matches_naive_for_all_lengths_and_alignments() {
+    fn portable_mask_matches_naive_for_lengths_and_alignments() {
         let mask = [0x37, 0xfa, 0x21, 0x3d];
         for len in (0..300).chain([2047, 2048, 2049, 4096, 4099, 65_536 + 7]) {
             for offset in 0..16 {
@@ -800,7 +796,7 @@ mod tests {
                     .enumerate()
                     .map(|(i, b)| b ^ mask[i & 3])
                     .collect();
-                apply_mask(&mut backing[offset..offset + len], mask);
+                apply_mask_blocks(&mut backing[offset..offset + len], mask);
                 assert_eq!(
                     &backing[offset..offset + len],
                     &expected[..],
