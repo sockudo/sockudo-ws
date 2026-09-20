@@ -60,13 +60,15 @@ impl Heartbeat {
             return None;
         }
 
-        // A Pong timeout deliberately wins ties with the hard idle timeout.
-        if let Some(deadline) = self.outstanding.as_ref().and_then(|ping| ping.deadline_ms) {
-            return Some(Deadline::Pong(deadline));
-        }
-
         let idle = (self.idle_timeout_ms != 0)
             .then(|| self.last_inbound_ms.saturating_add(self.idle_timeout_ms));
+        // A Pong timeout deliberately wins ties with the hard idle timeout.
+        if let Some(pong) = self.outstanding.as_ref().and_then(|ping| ping.deadline_ms) {
+            return Some(match idle {
+                Some(idle) if idle < pong => Deadline::Idle(idle),
+                _ => Deadline::Pong(pong),
+            });
+        }
         let ping = (self.auto_ping && self.outstanding.is_none())
             .then(|| self.last_inbound_ms.saturating_add(self.ping_interval_ms));
 
@@ -217,6 +219,20 @@ mod tests {
         let _ = heartbeat.ping_due(1_000).unwrap();
         heartbeat.ping_flushed(1_000);
         assert_eq!(heartbeat.next_deadline(), Some(Deadline::Pong(3_000)));
+    }
+
+    #[test]
+    fn earlier_idle_timeout_is_not_hidden_by_outstanding_pong() {
+        let config = Config::builder()
+            .ping_interval(1)
+            .pong_timeout(5)
+            .idle_timeout(2)
+            .build();
+        let mut heartbeat = Heartbeat::new(&config, 0);
+        assert!(heartbeat.ping_due(1_000).is_some());
+        heartbeat.ping_flushed(1_000);
+
+        assert_eq!(heartbeat.next_deadline(), Some(Deadline::Idle(2_000)));
     }
 
     #[test]
