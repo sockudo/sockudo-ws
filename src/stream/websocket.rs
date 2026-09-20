@@ -1304,6 +1304,9 @@ where
     }
 
     /// Send a local Close frame.
+    ///
+    /// Once this starts the closing budget, cancelling the future does not
+    /// reopen the connection.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         self.send(Message::Close(Some(CloseReason::new(code, reason))))
             .await
@@ -2423,6 +2426,9 @@ where
     }
 
     /// Send a close frame
+    ///
+    /// Once this starts the closing budget, cancelling the future does not
+    /// reopen the connection.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         self.send(Message::Close(Some(CloseReason::new(code, reason))))
             .await
