@@ -387,6 +387,7 @@ impl Drop for RawDeflateDecoder {
 pub struct DeflateDecoder {
     decompress: RawDeflateDecoder,
     no_context_takeover: bool,
+    input: Vec<u8>,
 }
 
 impl DeflateDecoder {
@@ -398,6 +399,7 @@ impl DeflateDecoder {
         Self {
             decompress,
             no_context_takeover,
+            input: Vec::new(),
         }
     }
 
@@ -408,10 +410,15 @@ impl DeflateDecoder {
             self.decompress.reset(false)?;
         }
 
-        // Per RFC 7692: Append 0x00 0x00 0xff 0xff before decompressing
-        let mut input = BytesMut::with_capacity(data.len() + 4);
-        input.extend_from_slice(data);
-        input.extend_from_slice(&DEFLATE_TRAILER);
+        // Per RFC 7692: Append 0x00 0x00 0xff 0xff before decompressing.
+        // Retain the allocation because each decoder processes one message at
+        // a time and later messages can reuse the same input workspace.
+        self.input.clear();
+        self.input
+            .reserve(data.len().saturating_add(DEFLATE_TRAILER.len()));
+        self.input.extend_from_slice(data);
+        self.input.extend_from_slice(&DEFLATE_TRAILER);
+        let input = &self.input;
 
         // Start with reasonable output buffer (at least 1KB or 4x input), but
         // never expose writable output beyond the configured message limit.
