@@ -57,6 +57,11 @@ impl Heartbeat {
         }
     }
 
+    /// Avoid reading the clock for data activity when both timers are disabled.
+    pub(crate) fn tracks_activity(&self) -> bool {
+        self.auto_ping || self.idle_timeout_ms != 0
+    }
+
     pub(crate) fn next_deadline(&self) -> Option<Deadline> {
         if self.stopped {
             return None;
