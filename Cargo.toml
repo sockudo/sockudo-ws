@@ -173,7 +173,7 @@ futures-channel = { version = "^0.3", features = ["sink"], optional = true }
 futures-util = { version = "^0.3", default-features = false, features = ["async-await", "sink"], optional = true }
 
 # Compression (permessage-deflate, RFC 7692)
-flate2 = { version = "^1.0", default-features = false, features = ["zlib-rs"], optional = true }
+flate2 = { version = "^1.1.3", default-features = false, features = ["zlib-rs"], optional = true }
 
 # Socket options (SO_REUSEPORT, TCP_NODELAY)
 socket2 = { version = "^0.5", features = ["all"] }
