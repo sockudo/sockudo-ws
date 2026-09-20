@@ -49,7 +49,7 @@ pub use ::compio::runtime;
 // Compio has no task-wide cooperative budget. Bound each reader's ready burst.
 const READ_BURST_LIMIT: usize = 32;
 
-async fn consume_read_budget(budget: &mut usize) {
+async fn consume_buffered_read_budget(budget: &mut usize) {
     if *budget == 0 {
         // Reset before yielding so cancelling next() does not repeatedly stall
         // delivery of the same buffered message.
@@ -1311,7 +1311,9 @@ where
 
     /// Receive the next WebSocket message.
     pub async fn next(&mut self) -> Option<Result<Message>> {
-        consume_read_budget(&mut self.read_budget).await;
+        if !self.pending_messages.is_empty() {
+            consume_buffered_read_budget(&mut self.read_budget).await;
+        }
         loop {
             if self.state == CompioStreamState::Closed {
                 return None;
@@ -1680,7 +1682,9 @@ where
 {
     /// Receive the next message, including Ping and Pong control frames.
     pub async fn next(&mut self) -> Option<Result<Message>> {
-        consume_read_budget(&mut self.read_budget).await;
+        if !self.pending_messages.is_empty() {
+            consume_buffered_read_budget(&mut self.read_budget).await;
+        }
         loop {
             if self.shared.status.get() == SPLIT_CLOSED {
                 if self.terminal_reported {
@@ -2259,7 +2263,9 @@ where
 
     /// Receive the next WebSocket message.
     pub async fn next(&mut self) -> Option<Result<Message>> {
-        consume_read_budget(&mut self.read_budget).await;
+        if !self.pending_messages.is_empty() {
+            consume_buffered_read_budget(&mut self.read_budget).await;
+        }
         loop {
             if self.state == CompioStreamState::Closed {
                 return None;
@@ -2580,7 +2586,9 @@ where
 {
     /// Receive the next non-control message.
     pub async fn next(&mut self) -> Option<Result<Message>> {
-        consume_read_budget(&mut self.read_budget).await;
+        if !self.pending_messages.is_empty() {
+            consume_buffered_read_budget(&mut self.read_budget).await;
+        }
         loop {
             if self.shared.status.get() == SPLIT_CLOSED {
                 if self.terminal_reported {

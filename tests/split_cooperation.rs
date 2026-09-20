@@ -72,3 +72,26 @@ async fn buffered_compressed_unified_reads_yield_before_draining_a_large_batch()
     assert!(poll!(drain.as_mut()).is_pending());
     drain.await;
 }
+
+#[cfg(feature = "permessage-deflate")]
+#[tokio::test]
+async fn buffered_compressed_split_reads_yield_before_draining_a_large_batch() {
+    let (io, mut peer) = tokio::io::duplex(4096);
+    let wire: Vec<u8> = (0..256)
+        .flat_map(|sequence| [0x82, 1, sequence as u8])
+        .collect();
+    peer.write_all(&wire).await.unwrap();
+    let stream =
+        sockudo_ws::CompressedWebSocketStream::client(io, Config::default(), Default::default());
+    let (mut reader, _writer) = stream.split();
+    let mut drain = std::pin::pin!(async {
+        for sequence in 0..256 {
+            assert_eq!(
+                reader.next().await.unwrap().unwrap().as_bytes(),
+                &[sequence as u8]
+            );
+        }
+    });
+    assert!(poll!(drain.as_mut()).is_pending());
+    drain.await;
+}
