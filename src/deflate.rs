@@ -4,7 +4,12 @@
 //! which compresses message payloads using the DEFLATE algorithm.
 
 use bytes::{Bytes, BytesMut};
-use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
+use flate2::{Compress, Compression, FlushCompress, Status};
+use libz_rs_sys::{
+    Z_BUF_ERROR, Z_OK, Z_STREAM_END, Z_SYNC_FLUSH, inflate, inflateEnd, inflateInit2_,
+    inflateReset, inflateResetKeep, z_stream, zlibVersion,
+};
+use std::mem::MaybeUninit;
 
 use crate::error::{Error, Result};
 
@@ -286,24 +291,113 @@ impl DeflateEncoder {
     }
 }
 
+struct RawDeflateDecoder {
+    // Keep the stream at a stable address for the lifetime required by the C API.
+    stream: Box<z_stream>,
+}
+
+// SAFETY: calls require exclusive access, borrowed buffers are cleared after
+// each call, and the decoder owns the remaining zlib-rs state.
+unsafe impl Send for RawDeflateDecoder {}
+// SAFETY: shared access cannot call the mutable C API or expose its pointers.
+unsafe impl Sync for RawDeflateDecoder {}
+
+impl RawDeflateDecoder {
+    fn new(window_bits: u8) -> Self {
+        let mut stream = Box::new(z_stream::default());
+        // A negative window size selects raw DEFLATE, as required by RFC 7692.
+        // SAFETY: the default stream has valid allocator fields, remains at a
+        // stable address, and is not used until initialization succeeds.
+        let status = unsafe {
+            inflateInit2_(
+                &mut *stream,
+                -i32::from(window_bits),
+                zlibVersion(),
+                std::mem::size_of::<z_stream>() as i32,
+            )
+        };
+        assert_eq!(status, Z_OK, "failed to initialize DEFLATE decoder");
+        Self { stream }
+    }
+
+    fn inflate(
+        &mut self,
+        input: &[u8],
+        output: &mut [MaybeUninit<u8>],
+    ) -> Result<(Status, usize, usize)> {
+        let input = &input[..input.len().min(u32::MAX as usize)];
+        let output_len = output.len().min(u32::MAX as usize);
+        let output = &mut output[..output_len];
+        self.stream.next_in = input.as_ptr();
+        self.stream.avail_in = input.len() as u32;
+        self.stream.next_out = output.as_mut_ptr().cast();
+        self.stream.avail_out = output.len() as u32;
+
+        // SAFETY: the stream is initialized, and its input and output pointers
+        // refer to the slices above for the advertised lengths.
+        let status = unsafe { inflate(&mut *self.stream, Z_SYNC_FLUSH) };
+        let consumed = input.len() - self.stream.avail_in as usize;
+        let produced = output.len() - self.stream.avail_out as usize;
+        self.stream.next_in = std::ptr::null_mut();
+        self.stream.avail_in = 0;
+        self.stream.next_out = std::ptr::null_mut();
+        self.stream.avail_out = 0;
+
+        let status = match status {
+            Z_OK => Status::Ok,
+            Z_BUF_ERROR => Status::BufError,
+            Z_STREAM_END => Status::StreamEnd,
+            code => {
+                return Err(Error::Compression(format!(
+                    "inflate error: status code {code}"
+                )));
+            }
+        };
+        Ok((status, consumed, produced))
+    }
+
+    fn reset(&mut self, keep_window: bool) -> Result<()> {
+        // SAFETY: the stream was initialized in new and is exclusively borrowed.
+        let status = unsafe {
+            if keep_window {
+                inflateResetKeep(&mut *self.stream)
+            } else {
+                inflateReset(&mut *self.stream)
+            }
+        };
+        if status == Z_OK {
+            Ok(())
+        } else {
+            Err(Error::Compression(format!(
+                "inflate reset error: status code {status}"
+            )))
+        }
+    }
+}
+
+impl Drop for RawDeflateDecoder {
+    fn drop(&mut self) {
+        // SAFETY: the stream was initialized in new and is ended exactly once.
+        let status = unsafe { inflateEnd(&mut *self.stream) };
+        debug_assert_eq!(status, Z_OK);
+    }
+}
+
 /// Deflate decompressor for incoming messages
 pub struct DeflateDecoder {
-    decompress: Decompress,
+    decompress: RawDeflateDecoder,
     no_context_takeover: bool,
-    #[allow(dead_code)]
-    window_bits: u8,
 }
 
 impl DeflateDecoder {
     /// Create a new decoder
     pub fn new(window_bits: u8, no_context_takeover: bool) -> Self {
         // Use raw deflate (no zlib header) with the negotiated window_bits
-        let decompress = Decompress::new_with_window_bits(false, window_bits);
+        let decompress = RawDeflateDecoder::new(window_bits);
 
         Self {
             decompress,
             no_context_takeover,
-            window_bits,
         }
     }
 
@@ -311,7 +405,7 @@ impl DeflateDecoder {
     pub fn decompress(&mut self, data: &[u8], max_size: usize) -> Result<Bytes> {
         // Reset context if required
         if self.no_context_takeover {
-            self.decompress.reset(false);
+            self.decompress.reset(false)?;
         }
 
         // Per RFC 7692: Append 0x00 0x00 0xff 0xff before decompressing
@@ -335,21 +429,19 @@ impl DeflateDecoder {
                 ));
             }
 
-            let before_out = self.decompress.total_out();
-            let before_in = self.decompress.total_in();
             let at_limit = output.len() == max_size;
             let offered;
             let status;
+            let consumed;
+            let produced;
 
             if at_limit {
                 // Let inflate consume a trailer or report stream completion.
                 // Any byte produced into this probe exceeds the logical limit.
                 let mut probe = [std::mem::MaybeUninit::uninit()];
                 offered = probe.len();
-                status = self
-                    .decompress
-                    .decompress_uninit(&input[total_in..], &mut probe, FlushDecompress::Sync)
-                    .map_err(|e| Error::Compression(format!("inflate error: {}", e)))?;
+                (status, consumed, produced) =
+                    self.decompress.inflate(&input[total_in..], &mut probe)?;
             } else {
                 if output.len() == output.capacity() {
                     // At least double or add 4KB, whichever is larger. The
@@ -364,23 +456,18 @@ impl DeflateDecoder {
                 let remaining = max_size - out_start;
                 let spare = output.spare_capacity_mut();
                 let writable = spare.len().min(remaining);
-                let spare = &mut spare[..writable];
+                let spare = &mut spare[..writable.min(u32::MAX as usize)];
                 offered = spare.len();
-                status = self
-                    .decompress
-                    .decompress_uninit(&input[total_in..], spare, FlushDecompress::Sync)
-                    .map_err(|e| Error::Compression(format!("inflate error: {}", e)))?;
+                (status, consumed, produced) =
+                    self.decompress.inflate(&input[total_in..], spare)?;
 
-                let produced = (self.decompress.total_out() - before_out) as usize;
-                // SAFETY: decompress_uninit() wrote exactly `produced` bytes to the spare capacity.
+                // SAFETY: inflate initialized exactly `produced` bytes in the spare capacity.
                 // We're only extending the length by the number of bytes that were initialized.
                 unsafe {
                     output.set_len(out_start + produced);
                 }
             }
 
-            let consumed = (self.decompress.total_in() - before_in) as usize;
-            let produced = (self.decompress.total_out() - before_out) as usize;
             total_in += consumed;
 
             if at_limit && produced != 0 {
@@ -388,12 +475,20 @@ impl DeflateDecoder {
             }
 
             if status == Status::StreamEnd {
-                if total_in < data.len() {
+                if total_in > data.len() {
                     return Err(Error::Compression(
-                        "data follows the final DEFLATE block".into(),
+                        "final DEFLATE block consumed its synthetic trailer".into(),
                     ));
                 }
-                break;
+                // RFC 7692 permits BFINAL blocks. Start the next raw stream
+                // while retaining the current message's LZ77 dictionary.
+                self.decompress.reset(true)?;
+                if total_in == data.len() {
+                    // Do not feed the synthetic trailer to a fresh stream; it
+                    // would leave a partial empty block before the next message.
+                    break;
+                }
+                continue;
             }
 
             if consumed == 0 && produced == 0 {
@@ -416,7 +511,9 @@ impl DeflateDecoder {
 
     /// Reset the decompression context (for no_context_takeover)
     pub fn reset(&mut self) {
-        self.decompress.reset(false);
+        self.decompress
+            .reset(false)
+            .expect("failed to reset DEFLATE decoder");
     }
 }
 
