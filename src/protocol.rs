@@ -1587,14 +1587,31 @@ mod tests {
     #[test]
     fn shared_compression_survives_protocol_split() {
         let config = crate::Compression::Shared.to_deflate_config().unwrap();
-        let protocol = CompressedProtocol::server_with_shared_compression(
+        let server = CompressedProtocol::server_with_shared_compression(
+            1024 * 1024,
+            64 * 1024 * 1024,
+            config.clone(),
+        );
+
+        assert!(server.uses_shared_compression());
+        let (_reader, server_writer) = server.split(1024 * 1024, 64 * 1024 * 1024);
+        assert_eq!(server_writer.role, Role::Server);
+        assert!(matches!(
+            server_writer.encoder,
+            CompressionEncoder::Shared(_)
+        ));
+
+        let client = CompressedProtocol::client_with_shared_compression(
             1024 * 1024,
             64 * 1024 * 1024,
             config,
         );
-
-        assert!(protocol.uses_shared_compression());
-        let (_reader, writer) = protocol.split(1024 * 1024, 64 * 1024 * 1024);
-        assert!(matches!(writer.encoder, CompressionEncoder::Shared(_)));
+        assert!(client.uses_shared_compression());
+        let (_reader, client_writer) = client.split(1024 * 1024, 64 * 1024 * 1024);
+        assert_eq!(client_writer.role, Role::Client);
+        assert!(matches!(
+            client_writer.encoder,
+            CompressionEncoder::Shared(_)
+        ));
     }
 }

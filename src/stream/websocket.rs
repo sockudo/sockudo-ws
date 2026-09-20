@@ -2425,16 +2425,22 @@ mod tests {
     #[cfg(feature = "permessage-deflate")]
     #[test]
     fn tokio_compressed_stream_routes_shared_compression() {
-        let (shared_io, _) = tokio::io::duplex(1024);
+        let (shared_server_io, shared_client_io) = tokio::io::duplex(1024);
         let shared_config = Config::builder()
             .compression(crate::Compression::Shared)
             .build();
-        let shared = CompressedWebSocketStream::server(
-            shared_io,
+        let shared_server = CompressedWebSocketStream::server(
+            shared_server_io,
+            shared_config.clone(),
+            crate::Compression::Shared.to_deflate_config().unwrap(),
+        );
+        let shared_client = CompressedWebSocketStream::client(
+            shared_client_io,
             shared_config,
             crate::Compression::Shared.to_deflate_config().unwrap(),
         );
-        assert!(shared.protocol.uses_shared_compression());
+        assert!(shared_server.protocol.uses_shared_compression());
+        assert!(shared_client.protocol.uses_shared_compression());
 
         let (dedicated_io, _) = tokio::io::duplex(1024);
         let dedicated = CompressedWebSocketStream::server(

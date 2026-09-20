@@ -3126,19 +3126,33 @@ mod tests {
         let shared_config = Config::builder()
             .compression(crate::Compression::Shared)
             .build();
-        let shared = CompioCompressedWebSocketStream::server(
+        let shared_server = CompioCompressedWebSocketStream::server(
             server_io,
+            shared_config.clone(),
+            crate::Compression::Shared.to_deflate_config().unwrap(),
+        );
+        let shared_client = CompioCompressedWebSocketStream::client(
+            client_io,
             shared_config,
             crate::Compression::Shared.to_deflate_config().unwrap(),
         );
-        assert!(shared.protocol.uses_shared_compression());
+        assert!(shared_server.protocol.uses_shared_compression());
+        assert!(shared_client.protocol.uses_shared_compression());
 
-        let dedicated = CompioCompressedWebSocketStream::client(
-            client_io,
+        let dedicated_client_io = TcpStream::connect(addr).await.unwrap();
+        let (dedicated_server_io, _) = listener.accept().await.unwrap();
+        let dedicated_server = CompioCompressedWebSocketStream::server(
+            dedicated_server_io,
             Config::default(),
             DeflateConfig::default(),
         );
-        assert!(!dedicated.protocol.uses_shared_compression());
+        let dedicated_client = CompioCompressedWebSocketStream::client(
+            dedicated_client_io,
+            Config::default(),
+            DeflateConfig::default(),
+        );
+        assert!(!dedicated_server.protocol.uses_shared_compression());
+        assert!(!dedicated_client.protocol.uses_shared_compression());
     }
 
     #[cfg(feature = "permessage-deflate")]
