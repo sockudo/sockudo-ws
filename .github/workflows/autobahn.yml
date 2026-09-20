@@ -22,8 +22,6 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            target/
-            autobahn-testsuite-rs/target/
           key: ${{ runner.os }}-autobahn-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run full Autobahn suite
