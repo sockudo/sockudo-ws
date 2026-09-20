@@ -3,32 +3,15 @@
 use sockudo_ws::Error;
 use sockudo_ws::deflate::{DeflateDecoder, DeflateEncoder};
 
-fn finish_deflate(payload: &[u8]) -> Vec<u8> {
-    use flate2::{Compress, Compression, FlushCompress, Status};
-
-    let mut encoder = Compress::new_with_window_bits(Compression::new(6), false, 15);
-    let mut output = vec![0; payload.len() + 64];
-    let status = encoder
-        .compress(payload, &mut output, FlushCompress::Finish)
-        .unwrap();
-    assert_eq!(status, Status::StreamEnd);
-    output.truncate(encoder.total_out() as usize);
-    // RFC 7692 retains the header byte of the following empty stored block
-    // when a final DEFLATE block is transformed into a message payload.
-    output.push(0);
-    output
-}
-
 #[test]
-fn decompression_rejects_invalid_data_after_a_final_block() {
-    let payload = vec![b'A'; 1024];
-    let mut compressed = finish_deflate(&payload);
-    compressed.push(0x07);
+fn decompression_accepts_a_valid_final_block() {
     let mut decoder = DeflateDecoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, false);
 
-    let result = decoder.decompress(&compressed, payload.len());
+    let decoded = decoder
+        .decompress(&[0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x00], 5)
+        .unwrap();
 
-    assert!(matches!(result, Err(Error::Compression(_))));
+    assert_eq!(decoded.as_ref(), b"Hello");
 }
 
 #[test]

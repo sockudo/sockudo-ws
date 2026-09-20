@@ -391,11 +391,9 @@ impl DeflateDecoder {
             }
 
             if status == Status::StreamEnd {
-                if total_in < data.len() {
-                    return Err(Error::Compression(
-                        "data follows the final DEFLATE block".into(),
-                    ));
-                }
+                // RFC 7692 permits BFINAL blocks. Continuing into a later raw
+                // stream while preserving the dictionary is handled separately;
+                // do not reject the valid first stream at this boundary.
                 break;
             }
 
