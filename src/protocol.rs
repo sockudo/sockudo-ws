@@ -375,6 +375,25 @@ impl Protocol {
     /// This variant allows reusing a Vec<Message> across calls to avoid allocations.
     #[inline]
     pub fn process_into(&mut self, buf: &mut BytesMut, messages: &mut Vec<Message>) -> Result<()> {
+        self.process_frames::<false>(buf, messages)
+    }
+
+    /// Accept at most one message and leave later frames undiscovered.
+    #[inline]
+    pub(crate) fn process_next(
+        &mut self,
+        buf: &mut BytesMut,
+        messages: &mut Vec<Message>,
+    ) -> Result<()> {
+        self.process_frames::<true>(buf, messages)
+    }
+
+    #[inline]
+    fn process_frames<const ONE_MESSAGE: bool>(
+        &mut self,
+        buf: &mut BytesMut,
+        messages: &mut Vec<Message>,
+    ) -> Result<()> {
         messages.clear();
 
         while !buf.is_empty() {
@@ -383,6 +402,9 @@ impl Protocol {
                     let prevalidated = std::mem::take(&mut self.partial_checked);
                     if let Some(msg) = self.handle_frame(frame, prevalidated)? {
                         messages.push(msg);
+                        if ONE_MESSAGE {
+                            break;
+                        }
                     }
                 }
                 None => {

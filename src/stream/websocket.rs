@@ -1186,6 +1186,12 @@ where
     ///
     /// Ping and Pong frames remain visible after their automatic state-machine
     /// processing. A terminal heartbeat/idle cause is yielded once as an error.
+    ///
+    /// This reader accepts one message at a time. Later buffered frames,
+    /// including malformed ones, remain undiscovered until another call.
+    /// Writes remain allowed until an error is discovered; a connection timeout
+    /// takes precedence over unparsed bytes. Messages and errors parsed before
+    /// splitting retain their existing delivery order.
     pub async fn next(&mut self) -> Option<Result<Message>> {
         loop {
             if self.terminal_reported {
@@ -1243,11 +1249,12 @@ where
                 debug_assert!(self.pending_messages.is_empty());
                 match self
                     .protocol
-                    .process_into(&mut self.read_buf, &mut self.pending_messages)
+                    .process_next(&mut self.read_buf, &mut self.pending_messages)
                 {
                     Ok(()) => {
                         self.pending_messages.reverse();
                         if !self.pending_messages.is_empty() {
+                            self.has_unprocessed_read_data = !self.read_buf.is_empty();
                             continue;
                         }
                     }
@@ -1277,17 +1284,7 @@ where
                             let _ = self.control_tx.send(ControlRequest::Eof).await;
                             self.shared.terminate(TerminalCause::ConnectionClosed);
                         }
-                        Ok(_) => match self
-                            .protocol
-                            .process_into(&mut self.read_buf, &mut self.pending_messages)
-                        {
-                            Ok(()) => self.pending_messages.reverse(),
-                            Err(error) => {
-                                self.pending_messages.reverse();
-                                self.pending_parse_error = Some(error);
-                                self.shared.begin_closing();
-                            }
-                        },
+                        Ok(_) => self.has_unprocessed_read_data = true,
                         Err(error) => {
                             self.shared.terminate(TerminalCause::ConnectionClosed);
                             return Some(Err(error.into()));
