@@ -287,7 +287,7 @@ type H3ServerRecvStream = h3::server::RequestStream<h3_quinn::RecvStream, Bytes>
 pub struct Http3ServerStream {
     writer: H3Writer<H3ServerSendStream>,
     recv: H3ServerRecvStream,
-    read_buf: BytesMut,
+    read_buf: Bytes,
 }
 
 impl Http3ServerStream {
@@ -297,7 +297,7 @@ impl Http3ServerStream {
         Self {
             writer: H3Writer::new(send),
             recv,
-            read_buf: BytesMut::with_capacity(64 * 1024),
+            read_buf: Bytes::new(),
         }
     }
 
@@ -333,14 +333,8 @@ impl AsyncRead for Http3ServerStream {
                 let chunk = data.copy_to_bytes(to_copy);
                 buf.put_slice(&chunk);
 
-                // Buffer any remaining data
-                if data.has_remaining() {
-                    while data.has_remaining() {
-                        this.read_buf.extend_from_slice(data.chunk());
-                        let len = data.chunk().len();
-                        data.advance(len);
-                    }
-                }
+                // Retain the owned DATA remainder for the next read.
+                this.read_buf = data.copy_to_bytes(data.remaining());
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Ok(None)) => {
@@ -406,7 +400,7 @@ type H3ClientRecvStream = h3::client::RequestStream<h3_quinn::RecvStream, Bytes>
 pub struct Http3ClientStream {
     writer: H3Writer<H3ClientSendStream>,
     recv: H3ClientRecvStream,
-    read_buf: BytesMut,
+    read_buf: Bytes,
 }
 
 impl Http3ClientStream {
@@ -416,7 +410,7 @@ impl Http3ClientStream {
         Self {
             writer: H3Writer::new(send),
             recv,
-            read_buf: BytesMut::with_capacity(64 * 1024),
+            read_buf: Bytes::new(),
         }
     }
 
@@ -452,14 +446,8 @@ impl AsyncRead for Http3ClientStream {
                 let chunk = data.copy_to_bytes(to_copy);
                 buf.put_slice(&chunk);
 
-                // Buffer any remaining data
-                if data.has_remaining() {
-                    while data.has_remaining() {
-                        this.read_buf.extend_from_slice(data.chunk());
-                        let len = data.chunk().len();
-                        data.advance(len);
-                    }
-                }
+                // Retain the owned DATA remainder for the next read.
+                this.read_buf = data.copy_to_bytes(data.remaining());
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Ok(None)) => {
