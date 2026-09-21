@@ -2168,13 +2168,22 @@ where
 
         let clock_epoch = Instant::now();
         let heartbeat = Heartbeat::new(&config, 0);
-        Self {
-            inner,
-            protocol: CompressedProtocol::server(
+        let protocol = if config.compression.is_shared() {
+            CompressedProtocol::server_with_shared_compression(
                 config.max_frame_size,
                 config.max_message_size,
                 deflate_config,
-            ),
+            )
+        } else {
+            CompressedProtocol::server(
+                config.max_frame_size,
+                config.max_message_size,
+                deflate_config,
+            )
+        };
+        Self {
+            inner,
+            protocol,
             read_buf,
             write_buf: BytesMut::with_capacity(config.write_buffer_size),
             state: CompioStreamState::Open,
@@ -2206,13 +2215,22 @@ where
 
         let clock_epoch = Instant::now();
         let heartbeat = Heartbeat::new(&config, 0);
-        Self {
-            inner,
-            protocol: CompressedProtocol::client(
+        let protocol = if config.compression.is_shared() {
+            CompressedProtocol::client_with_shared_compression(
                 config.max_frame_size,
                 config.max_message_size,
                 deflate_config,
-            ),
+            )
+        } else {
+            CompressedProtocol::client(
+                config.max_frame_size,
+                config.max_message_size,
+                deflate_config,
+            )
+        };
+        Self {
+            inner,
+            protocol,
             read_buf,
             write_buf: BytesMut::with_capacity(config.write_buffer_size),
             state: CompioStreamState::Open,
@@ -3096,6 +3114,45 @@ mod tests {
         assert!(matches!(echoed, Message::Text(text) if text == "compressed"));
 
         server.await.unwrap();
+    }
+
+    #[cfg(feature = "permessage-deflate")]
+    #[compio::test]
+    async fn compio_compressed_stream_routes_shared_compression() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_io = TcpStream::connect(addr).await.unwrap();
+        let (server_io, _) = listener.accept().await.unwrap();
+        let shared_config = Config::builder()
+            .compression(crate::Compression::Shared)
+            .build();
+        let shared_server = CompioCompressedWebSocketStream::server(
+            server_io,
+            shared_config.clone(),
+            crate::Compression::Shared.to_deflate_config().unwrap(),
+        );
+        let shared_client = CompioCompressedWebSocketStream::client(
+            client_io,
+            shared_config,
+            crate::Compression::Shared.to_deflate_config().unwrap(),
+        );
+        assert!(shared_server.protocol.uses_shared_compression());
+        assert!(shared_client.protocol.uses_shared_compression());
+
+        let dedicated_client_io = TcpStream::connect(addr).await.unwrap();
+        let (dedicated_server_io, _) = listener.accept().await.unwrap();
+        let dedicated_server = CompioCompressedWebSocketStream::server(
+            dedicated_server_io,
+            Config::default(),
+            DeflateConfig::default(),
+        );
+        let dedicated_client = CompioCompressedWebSocketStream::client(
+            dedicated_client_io,
+            Config::default(),
+            DeflateConfig::default(),
+        );
+        assert!(!dedicated_server.protocol.uses_shared_compression());
+        assert!(!dedicated_client.protocol.uses_shared_compression());
     }
 
     #[cfg(feature = "permessage-deflate")]
