@@ -1053,12 +1053,13 @@ where
             })
             .await;
         drop(sink);
-        if result.is_err() {
-            if self.shared.status.load(Ordering::Acquire) == SPLIT_CLOSED {
-                return Err(self.current_error());
-            }
-            self.shared.terminate(TerminalCause::ConnectionClosed);
-            return result;
+        if let Err(error) = result {
+            let error = match *self.shared.terminal_tx.borrow() {
+                Some(TerminalCause::HeartbeatTimeout) => Error::HeartbeatTimeout,
+                Some(TerminalCause::IdleTimeout) => Error::IdleTimeout,
+                _ => error,
+            };
+            return Err(error);
         }
         if is_close {
             let _ = self.control_tx.send(ControlRequest::LocalCloseSent).await;
@@ -2545,6 +2546,30 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    struct FailingWriter {
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Err(io::Error::other("write failed")))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     async fn read_masked_control_payload(
         io: &mut tokio::io::DuplexStream,
         expected_opcode: u8,
@@ -2774,6 +2799,87 @@ mod tests {
         let (mut reader, writer) = WebSocketStream::client(client_io, config).split();
         drop(writer);
         assert!(reader.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_frame_write_stops_before_encoding_or_transport_io() {
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut sink = SplitSink::new(
+            FailingWriter {
+                polls: polls.clone(),
+            },
+            Protocol::new(Role::Server, 1024, 1024),
+            64,
+        );
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut encoded = false;
+
+        let result = sink
+            .write_frame(&cancel, |encoder, buf| {
+                encoded = true;
+                encoder.encode_message(&Message::text("cancelled"), buf)
+            })
+            .await;
+
+        assert!(matches!(result, Err(Error::ConnectionClosed)));
+        assert!(!encoded);
+        assert_eq!(polls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn split_send_preserves_transport_error_after_termination() {
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shared = SplitShared::new(false);
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let core = SplitWriterCore {
+            sink: Arc::new(tokio::sync::Mutex::new(SplitSink::new(
+                FailingWriter {
+                    polls: polls.clone(),
+                },
+                Protocol::new(Role::Server, 1024, 1024),
+                64,
+            ))),
+            control_tx,
+            shared: shared.clone(),
+        };
+
+        let result = core.send(Message::text("payload")).await;
+
+        assert!(matches!(result, Err(Error::Io(error)) if error.kind() == io::ErrorKind::Other));
+        assert_eq!(polls.load(Ordering::Relaxed), 1);
+        assert!(shared.cancel.is_cancelled());
+        assert_eq!(shared.status.load(Ordering::Acquire), SPLIT_CLOSED);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_flushed_close_does_not_abort_its_transport() {
+        let (io, mut peer) = tokio::io::duplex(64);
+        let shared = SplitShared::new(false);
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        control_tx.try_send(ControlRequest::LocalCloseSent).unwrap();
+        let core = SplitWriterCore {
+            sink: Arc::new(tokio::sync::Mutex::new(SplitSink::new(
+                io,
+                Protocol::new(Role::Server, 1024, 1024),
+                64,
+            ))),
+            control_tx,
+            shared: shared.clone(),
+        };
+
+        {
+            let send = core.send(Message::Close(Some(CloseReason::new(1000, ""))));
+            tokio::pin!(send);
+            assert!(futures_util::poll!(&mut send).is_pending());
+            let mut wire = [0; 4];
+            peer.read_exact(&mut wire).await.unwrap();
+            assert_eq!(wire, [0x88, 2, 3, 232]);
+            // Only notification is pending: the entire frame has been flushed.
+        }
+
+        assert!(!shared.cancel.is_cancelled());
+        assert_eq!(shared.status.load(Ordering::Acquire), SPLIT_CLOSING);
     }
 
     #[tokio::test]
@@ -3009,6 +3115,3 @@ mod tests {
         assert_eq!(big.as_ptr(), big_ptr);
     }
 }
-
-#[cfg(test)]
-mod cancellation_tests;
