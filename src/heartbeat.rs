@@ -60,15 +60,14 @@ impl Heartbeat {
             return None;
         }
 
-        let idle = (self.idle_timeout_ms != 0)
-            .then(|| self.last_inbound_ms.saturating_add(self.idle_timeout_ms));
-        // A Pong timeout deliberately wins ties with the hard idle timeout.
-        if let Some(pong) = self.outstanding.as_ref().and_then(|ping| ping.deadline_ms) {
-            return Some(match idle {
-                Some(idle) if idle < pong => Deadline::Idle(idle),
-                _ => Deadline::Pong(pong),
-            });
+        if self
+            .outstanding
+            .as_ref()
+            .is_some_and(|ping| ping.deadline_ms.is_some())
+        {
+            return self.next_hard_deadline();
         }
+        let idle = self.idle_deadline();
         let ping = (self.auto_ping && self.outstanding.is_none())
             .then(|| self.last_inbound_ms.saturating_add(self.ping_interval_ms));
 
@@ -79,6 +78,27 @@ impl Heartbeat {
             (None, Some(ping)) => Some(Deadline::Ping(ping)),
             (None, None) => None,
         }
+    }
+
+    /// Earliest hard deadline while a control write is in progress.
+    pub(crate) fn next_hard_deadline(&self) -> Option<Deadline> {
+        if self.stopped {
+            return None;
+        }
+        let pong = self.outstanding.as_ref().and_then(|ping| ping.deadline_ms);
+        let idle = self.idle_deadline();
+        // A Pong timeout deliberately wins ties with the hard idle timeout.
+        match (pong, idle) {
+            (Some(pong), Some(idle)) if idle < pong => Some(Deadline::Idle(idle)),
+            (Some(pong), _) => Some(Deadline::Pong(pong)),
+            (None, Some(idle)) => Some(Deadline::Idle(idle)),
+            (None, None) => None,
+        }
+    }
+
+    fn idle_deadline(&self) -> Option<u64> {
+        (self.idle_timeout_ms != 0)
+            .then(|| self.last_inbound_ms.saturating_add(self.idle_timeout_ms))
     }
 
     pub(crate) fn ping_due(&mut self, now_ms: u64) -> Option<Bytes> {
@@ -115,7 +135,8 @@ impl Heartbeat {
             return false;
         }
 
-        self.last_inbound_ms = now_ms;
+        // Shared data activity and queued control frames can arrive out of order.
+        self.last_inbound_ms = self.last_inbound_ms.max(now_ms);
         let matched = self.outstanding.as_ref().is_some_and(|ping| {
             ping.flushed
                 && ping.deadline_ms.is_none_or(|deadline| now_ms < deadline)
