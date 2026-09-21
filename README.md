@@ -72,7 +72,8 @@ sockudo-ws matches or exceeds uWebSockets performance while providing a safe, er
 
 ## Features
 
-- **SIMD Acceleration**: AVX2/AVX-512/SSE2/NEON/AltiVec/LSX for frame masking and UTF-8 validation
+- **SIMD Frame Masking**: Architecture-specific AVX2/AVX-512/SSE2/NEON/AltiVec/LSX/LASX/z13 implementations
+- **UTF-8 Validation**: `simdutf8` acceleration on supported x86, AArch64, and wasm32 targets, with a portable validator elsewhere
 - **Zero-Copy Parsing**: Direct buffer access without intermediate allocations
 - **Write Batching (Corking)**: Minimizes syscalls via vectored I/O
 - **permessage-deflate**: Full compression support with shared/dedicated compressors
