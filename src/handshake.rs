@@ -183,7 +183,10 @@ pub fn build_response(accept_key: &str, protocol: Option<&str>, extensions: Opti
     buf.freeze()
 }
 
-/// Build a WebSocket upgrade request (client-side)
+/// Build a WebSocket upgrade request (client-side).
+///
+/// This raw builder does not validate its arguments. Use
+/// [`build_request_with_headers`] for externally supplied values.
 pub fn build_request(
     host: &str,
     path: &str,
@@ -670,6 +673,23 @@ mod tests {
         ] {
             assert!(matches!(result, Err(Error::InvalidHttp(_))));
         }
+    }
+
+    #[test]
+    fn checked_request_builder_rejects_whitespace_in_request_target() {
+        let result = build_request_with_headers(
+            "example.com",
+            "/ws bad",
+            "dGhlIHNhbXBsZSBub25jZQ==",
+            None,
+            None,
+            None,
+        );
+
+        assert!(matches!(
+            result,
+            Err(Error::InvalidHttp("invalid request target"))
+        ));
     }
 
     #[test]
