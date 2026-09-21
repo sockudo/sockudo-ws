@@ -858,8 +858,9 @@ use tokio_util::sync::CancellationToken;
 
 const SPLIT_CONTROL_CAPACITY: usize = 32;
 const SPLIT_OPEN: u8 = 0;
-const SPLIT_CLOSING: u8 = 1;
-const SPLIT_CLOSED: u8 = 2;
+const SPLIT_LOCAL_CLOSING: u8 = 1;
+const SPLIT_PEER_CLOSING: u8 = 2;
+const SPLIT_CLOSED: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalCause {
@@ -918,15 +919,30 @@ impl SplitShared {
         self.last_inbound_ms.fetch_max(now_ms, Ordering::Relaxed);
     }
 
-    fn begin_closing(&self) -> bool {
+    fn begin_local_closing(&self) -> bool {
         self.status
             .compare_exchange(
                 SPLIT_OPEN,
-                SPLIT_CLOSING,
+                SPLIT_LOCAL_CLOSING,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
             .is_ok()
+    }
+
+    fn begin_peer_closing(&self) -> bool {
+        self.status
+            .compare_exchange(
+                SPLIT_OPEN,
+                SPLIT_PEER_CLOSING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn is_local_closing(&self) -> bool {
+        self.status.load(Ordering::Acquire) == SPLIT_LOCAL_CLOSING
     }
 
     fn terminate(&self, cause: TerminalCause) {
@@ -1029,6 +1045,7 @@ struct SplitWriterCore<W, E> {
     sink: SharedSink<W, E>,
     control_tx: mpsc::Sender<ControlRequest>,
     shared: Arc<SplitShared>,
+    close_timeout: Duration,
 }
 
 impl<W, E> SplitWriterCore<W, E>
@@ -1047,19 +1064,51 @@ where
                 .reserve()
                 .await
                 .map_err(|_| self.current_error())?;
-            if !self.shared.begin_closing() {
+            if !self.shared.begin_local_closing() {
                 return Err(self.current_error());
+            }
+            let started = tokio::time::Instant::now();
+            if self.close_timeout.is_zero() {
+                let Ok(mut sink) = self.sink.try_lock() else {
+                    self.shared.terminate(TerminalCause::ConnectionClosed);
+                    self.shared.cancel.cancel();
+                    return Err(self.current_error());
+                };
+                // Keep zero-timeout behavior independent of which runtime task
+                // wins the next poll: try this already-available sink exactly
+                // once before applying the expired budget.
+                let result = {
+                    let write = sink.write_application_frame(&self.shared, |encoder, buf| {
+                        encoder.encode_message(&msg, buf)
+                    });
+                    tokio::pin!(write);
+                    std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(std::future::Future::poll(write.as_mut(), cx))
+                    })
+                    .await
+                };
+                drop(sink);
+                return match result {
+                    std::task::Poll::Ready(Ok(())) => {
+                        permit.send(ControlRequest::LocalCloseSent);
+                        Ok(())
+                    }
+                    std::task::Poll::Ready(Err(error)) => Err(self.preferred_write_error(error)),
+                    std::task::Poll::Pending => {
+                        self.shared.terminate(TerminalCause::ConnectionClosed);
+                        self.shared.cancel.cancel();
+                        Err(self.current_error())
+                    }
+                };
             }
             // Publish before waiting for the sink: a blocked control write must
             // use the same closing budget as the application Close behind it.
-            permit.send(ControlRequest::LocalCloseStarted(
-                tokio::time::Instant::now(),
-            ));
+            permit.send(ControlRequest::LocalCloseStarted(started));
         }
         let mut sink = self.sink.lock().await;
         // Re-check under the lock: the control driver may have closed meanwhile.
         let status = self.shared.status.load(Ordering::Acquire);
-        if status != SPLIT_OPEN && !(is_close && status == SPLIT_CLOSING) {
+        if status != SPLIT_OPEN && !(is_close && status == SPLIT_LOCAL_CLOSING) {
             return Err(self.current_error());
         }
         let result = sink
@@ -1069,12 +1118,7 @@ where
             .await;
         drop(sink);
         if let Err(error) = result {
-            let error = match *self.shared.terminal_tx.borrow() {
-                Some(TerminalCause::HeartbeatTimeout) => Error::HeartbeatTimeout,
-                Some(TerminalCause::IdleTimeout) => Error::IdleTimeout,
-                _ => error,
-            };
-            return Err(error);
+            return Err(self.preferred_write_error(error));
         }
         if is_close {
             let _ = self.control_tx.send(ControlRequest::LocalCloseSent).await;
@@ -1110,6 +1154,14 @@ where
             .terminal_tx
             .borrow()
             .map_or(Error::ConnectionClosed, TerminalCause::error)
+    }
+
+    fn preferred_write_error(&self, error: Error) -> Error {
+        match *self.shared.terminal_tx.borrow() {
+            Some(TerminalCause::HeartbeatTimeout) => Error::HeartbeatTimeout,
+            Some(TerminalCause::IdleTimeout) => Error::IdleTimeout,
+            _ => error,
+        }
     }
 }
 
@@ -1168,6 +1220,7 @@ where
         let sink: SharedSink<WriteHalf<S>, Protocol> = Arc::new(tokio::sync::Mutex::new(
             SplitSink::new(writer, self.protocol, self.config.write_buffer_size),
         ));
+        let close_timeout = Duration::from_secs(self.config.close_timeout.into());
 
         tokio::spawn(split_writer_driver(
             sink.clone(),
@@ -1193,6 +1246,7 @@ where
                     sink,
                     control_tx,
                     shared,
+                    close_timeout,
                 },
             },
         )
@@ -1222,7 +1276,7 @@ where
                         ControlRequest::Pong(data.clone(), tokio::time::Instant::now())
                     }
                     Message::Close(_) => {
-                        self.shared.begin_closing();
+                        self.shared.begin_peer_closing();
                         ControlRequest::PeerClose
                     }
                     _ => {
@@ -1357,7 +1411,9 @@ where
     /// Send a local Close frame.
     ///
     /// Once this starts the closing budget, cancelling the future does not
-    /// reopen the connection.
+    /// reopen the connection. If the frame has not finished writing, it is not
+    /// retried and the peer may observe transport termination without a
+    /// WebSocket Close frame.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         self.send(Message::Close(Some(CloseReason::new(code, reason))))
             .await
@@ -1472,11 +1528,13 @@ async fn split_writer_driver<W, E>(
                     shared.cancel.cancel();
                     break;
                 }
-                pending_write.set(Some(write_split_control(
-                    sink.clone(),
-                    SplitControlFrame::Close,
-                    shared.cancel.clone(),
-                )));
+                if !shared.is_local_closing() {
+                    pending_write.set(Some(write_split_control(
+                        sink.clone(),
+                        SplitControlFrame::Close,
+                        shared.cancel.clone(),
+                    )));
+                }
             } else if let Some(payload) = pending_pong.take() {
                 pending_write.set(Some(write_split_control(
                     sink.clone(),
@@ -1545,14 +1603,21 @@ async fn split_writer_driver<W, E>(
                     ControlRequest::PeerClose => {
                         heartbeat.stop();
                         peer_close = true;
-                        closing_deadline.get_or_insert_with(|| {
-                            tokio::time::Instant::now()
-                                + Duration::from_secs(config.close_timeout.into())
-                        });
+                        // A local Close owns its original deadline and response.
+                        // Wait for its notification instead of scheduling a
+                        // second Close or replacing its budget.
+                        if !shared.is_local_closing() {
+                            closing_deadline.get_or_insert_with(|| {
+                                tokio::time::Instant::now()
+                                    + Duration::from_secs(config.close_timeout.into())
+                            });
+                        }
                     }
                     ControlRequest::LocalCloseStarted(started) => {
                         heartbeat.stop();
-                        closing_deadline.get_or_insert(started + Duration::from_secs(config.close_timeout.into()));
+                        closing_deadline.get_or_insert(
+                            started + Duration::from_secs(config.close_timeout.into()),
+                        );
                     }
                     ControlRequest::LocalCloseSent => {
                         heartbeat.stop();
@@ -2378,6 +2443,7 @@ where
             writer_protocol,
             self.config.write_buffer_size,
         )));
+        let close_timeout = Duration::from_secs(self.config.close_timeout.into());
 
         tokio::spawn(split_writer_driver(
             sink.clone(),
@@ -2402,6 +2468,7 @@ where
                     sink,
                     control_tx,
                     shared,
+                    close_timeout,
                 },
             },
         )
@@ -2432,7 +2499,7 @@ where
                         ControlRequest::Pong(data.clone(), tokio::time::Instant::now())
                     }
                     Message::Close(_) => {
-                        self.shared.begin_closing();
+                        self.shared.begin_peer_closing();
                         ControlRequest::PeerClose
                     }
                     _ => {
@@ -2541,7 +2608,9 @@ where
     /// Send a close frame
     ///
     /// Once this starts the closing budget, cancelling the future does not
-    /// reopen the connection.
+    /// reopen the connection. If the frame has not finished writing, it is not
+    /// retried and the peer may observe transport termination without a
+    /// WebSocket Close frame.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         self.send(Message::Close(Some(CloseReason::new(code, reason))))
             .await
@@ -2867,6 +2936,7 @@ mod tests {
             ))),
             control_tx,
             shared: shared.clone(),
+            close_timeout: Duration::from_secs(1),
         };
 
         let result = core.send(Message::text("payload")).await;
@@ -2881,7 +2951,9 @@ mod tests {
     async fn cancelling_a_flushed_close_does_not_abort_its_transport() {
         let (io, mut peer) = tokio::io::duplex(64);
         let shared = SplitShared::new(false);
-        let (control_tx, _control_rx) = mpsc::channel(1);
+        let (control_tx, _control_rx) = mpsc::channel(2);
+        // Leave room for the reserved start notification, then keep the final
+        // LocalCloseSent notification pending after the frame is flushed.
         control_tx.try_send(ControlRequest::LocalCloseSent).unwrap();
         let core = SplitWriterCore {
             sink: Arc::new(tokio::sync::Mutex::new(SplitSink::new(
@@ -2891,6 +2963,7 @@ mod tests {
             ))),
             control_tx,
             shared: shared.clone(),
+            close_timeout: Duration::from_secs(1),
         };
 
         {
@@ -2904,7 +2977,7 @@ mod tests {
         }
 
         assert!(!shared.cancel.is_cancelled());
-        assert_eq!(shared.status.load(Ordering::Acquire), SPLIT_CLOSING);
+        assert_eq!(shared.status.load(Ordering::Acquire), SPLIT_LOCAL_CLOSING);
     }
 
     #[tokio::test]
