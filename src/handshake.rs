@@ -6,6 +6,8 @@
 //! - Minimal allocations
 //! - Fast Base64/SHA-1 for accept key generation
 
+use std::collections::HashSet;
+
 use base64::Engine;
 use bytes::{BufMut, Bytes, BytesMut};
 use sha1::{Digest, Sha1};
@@ -83,8 +85,14 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>
                 } else if name.eq_ignore_ascii_case("sec-websocket-version") {
                     version = Some(value);
                 } else if name.eq_ignore_ascii_case("sec-websocket-protocol") {
+                    if !is_valid_protocol_list(value) {
+                        return Err(Error::HandshakeFailed("invalid Sec-WebSocket-Protocol"));
+                    }
                     protocol = Some(value);
                 } else if name.eq_ignore_ascii_case("sec-websocket-extensions") {
+                    if !is_valid_extension_list(value) {
+                        return Err(Error::HandshakeFailed("invalid Sec-WebSocket-Extensions"));
+                    }
                     extensions = Some(value);
                 } else if name.eq_ignore_ascii_case("host") {
                     host = Some(value);
@@ -156,7 +164,10 @@ pub fn generate_accept_key(key: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(hash)
 }
 
-/// Build a WebSocket upgrade response
+/// Build a WebSocket upgrade response.
+///
+/// This raw builder does not validate its arguments. Callers must supply
+/// values that follow the WebSocket handshake field grammar.
 pub fn build_response(accept_key: &str, protocol: Option<&str>, extensions: Option<&str>) -> Bytes {
     let mut buf = BytesMut::with_capacity(256);
 
@@ -200,8 +211,9 @@ pub fn build_request(
 /// Build a WebSocket upgrade request with additional HTTP headers.
 ///
 /// Custom headers are emitted in the supplied order. Header names must use the
-/// HTTP token syntax, and values must not contain disallowed control bytes.
-/// Headers managed by the WebSocket handshake cannot be overridden.
+/// HTTP token syntax, values must not contain disallowed control bytes, and
+/// WebSocket protocol and extension values must follow their handshake field
+/// grammar. Headers managed by the WebSocket handshake cannot be overridden.
 ///
 /// # Errors
 ///
@@ -243,11 +255,15 @@ fn validate_request_fields(
         return Err(Error::InvalidHttp("invalid request target"));
     }
     validate_header_value(key, "invalid Sec-WebSocket-Key")?;
-    if let Some(protocol) = protocol {
-        validate_header_value(protocol, "invalid Sec-WebSocket-Protocol")?;
+    if let Some(protocol) = protocol
+        && (!is_valid_protocol_list(protocol) || list_elements(protocol).any(str::is_empty))
+    {
+        return Err(Error::InvalidHttp("invalid Sec-WebSocket-Protocol"));
     }
-    if let Some(extensions) = extensions {
-        validate_header_value(extensions, "invalid Sec-WebSocket-Extensions")?;
+    if let Some(extensions) = extensions
+        && (!is_valid_extension_list(extensions) || list_elements(extensions).any(str::is_empty))
+    {
+        return Err(Error::InvalidHttp("invalid Sec-WebSocket-Extensions"));
     }
     Ok(())
 }
@@ -262,7 +278,7 @@ fn validate_header_value(value: &str, error: &'static str) -> Result<()> {
 
 fn validate_extra_headers(headers: &[(String, String)]) -> Result<()> {
     for (name, value) in headers {
-        if name.is_empty() || !name.bytes().all(is_header_name_byte) {
+        if !is_token(name) {
             return Err(Error::InvalidHttp("invalid header name"));
         }
 
@@ -310,6 +326,97 @@ fn is_header_name_byte(byte: u8) -> bool {
                 | b'|'
                 | b'~'
         )
+}
+
+fn is_token(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(is_header_name_byte)
+}
+
+fn trim_optional_whitespace(value: &str) -> &str {
+    value.trim_matches(|character| matches!(character, ' ' | '\t'))
+}
+
+fn list_elements(value: &str) -> impl Iterator<Item = &str> {
+    value.split(',').map(trim_optional_whitespace)
+}
+
+/// Preserve the default server's historical behavior of accepting any single
+/// offered protocol while returning a valid selection for multi-value offers.
+/// `value` must come from `parse_request`, which validates the complete offer.
+pub(crate) fn select_default_subprotocol(value: Option<&str>) -> Option<&str> {
+    value.and_then(|value| list_elements(value).find(|protocol| !protocol.is_empty()))
+}
+
+fn is_valid_protocol_list(value: &str) -> bool {
+    // RFC 6455 requires every offered subprotocol to be unique.
+    let mut protocols = HashSet::new();
+
+    for protocol in list_elements(value).filter(|protocol| !protocol.is_empty()) {
+        if !is_token(protocol) || !protocols.insert(protocol) {
+            return false;
+        }
+    }
+
+    !protocols.is_empty()
+}
+
+fn is_valid_extension_list(value: &str) -> bool {
+    let mut has_extension = false;
+
+    for extension in list_elements(value).filter(|extension| !extension.is_empty()) {
+        has_extension = true;
+        let mut parts = extension.split(';').map(trim_optional_whitespace);
+        if !parts.next().is_some_and(is_token) {
+            return false;
+        }
+        if !parts.all(|parameter| {
+            if let Some((name, value)) = parameter.split_once('=') {
+                is_token(trim_optional_whitespace(name))
+                    && is_valid_extension_value(trim_optional_whitespace(value))
+            } else {
+                is_token(parameter)
+            }
+        }) {
+            return false;
+        }
+    }
+
+    has_extension
+}
+
+fn is_valid_extension_value(value: &str) -> bool {
+    if is_token(value) {
+        return true;
+    }
+
+    // RFC 6455 narrows HTTP quoted-string values: after unescaping, the value
+    // must still satisfy the token grammar.
+    let Some(value) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return false;
+    };
+    if value.is_empty() {
+        return false;
+    }
+
+    let mut bytes = value.bytes();
+    while let Some(byte) = bytes.next() {
+        let unescaped = if byte == b'\\' {
+            let Some(escaped) = bytes.next() else {
+                return false;
+            };
+            escaped
+        } else {
+            byte
+        };
+        if !is_header_name_byte(unescaped) {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn build_request_inner(
@@ -422,8 +529,14 @@ pub fn parse_response(buf: &[u8]) -> Result<Option<(HandshakeResponse<'_>, usize
                 if name.eq_ignore_ascii_case("sec-websocket-accept") {
                     accept = Some(value);
                 } else if name.eq_ignore_ascii_case("sec-websocket-protocol") {
+                    if !is_token(value) {
+                        return Err(Error::HandshakeFailed("invalid Sec-WebSocket-Protocol"));
+                    }
                     protocol = Some(value);
                 } else if name.eq_ignore_ascii_case("sec-websocket-extensions") {
+                    if !is_valid_extension_list(value) {
+                        return Err(Error::HandshakeFailed("invalid Sec-WebSocket-Extensions"));
+                    }
                     extensions = Some(value);
                 }
             }
@@ -474,14 +587,14 @@ where
         if let Some((req, consumed)) = parse_request(&buf)? {
             // Extract values before mutably borrowing buf
             let path = req.path.to_string();
-            let protocol = req.protocol.map(String::from);
+            let protocol = select_default_subprotocol(req.protocol).map(str::to_owned);
             let extensions = req.extensions.map(String::from);
 
             // Generate accept key
             let accept_key = generate_accept_key(req.key);
 
             // Build and send response
-            let response = build_response(&accept_key, req.protocol, None);
+            let response = build_response(&accept_key, protocol.as_deref(), None);
             stream.write_all(&response).await?;
             stream.flush().await?;
 
