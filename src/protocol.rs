@@ -14,7 +14,9 @@ use crate::frame::{Frame, FrameParser, OpCode, encode_frame};
 use crate::utf8::{Utf8Stream, validate_utf8};
 
 #[cfg(feature = "permessage-deflate")]
-use crate::deflate::{DeflateConfig, DeflateContext};
+use crate::compression::{CompressionContext, CompressionEncoder};
+#[cfg(feature = "permessage-deflate")]
+use crate::deflate::{DeflateConfig, DeflateEncoder};
 
 /// WebSocket endpoint role
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -803,7 +805,7 @@ pub struct CompressedProtocol {
     /// Base protocol handler
     inner: Protocol,
     /// Deflate compression context
-    deflate: DeflateContext,
+    deflate: CompressionContext,
     /// Whether the current fragmented message is compressed
     fragment_compressed: bool,
     /// Buffer for decompressed fragment data
@@ -812,30 +814,56 @@ pub struct CompressedProtocol {
 
 #[cfg(feature = "permessage-deflate")]
 impl CompressedProtocol {
-    /// Create a new compressed protocol handler for server role
-    pub fn server(max_frame_size: usize, max_message_size: usize, config: DeflateConfig) -> Self {
-        let mut inner = Protocol::new(Role::Server, max_frame_size, max_message_size);
+    fn new(
+        role: Role,
+        max_frame_size: usize,
+        max_message_size: usize,
+        deflate: CompressionContext,
+    ) -> Self {
+        let mut inner = Protocol::new(role, max_frame_size, max_message_size);
         inner.enable_compression();
 
         Self {
             inner,
-            deflate: DeflateContext::server(config),
+            deflate,
             fragment_compressed: false,
             decompress_buf: BytesMut::new(),
         }
     }
 
+    /// Create a new compressed protocol handler for server role
+    pub fn server(max_frame_size: usize, max_message_size: usize, config: DeflateConfig) -> Self {
+        let deflate = CompressionContext::server_with_config(config, false);
+        Self::new(Role::Server, max_frame_size, max_message_size, deflate)
+    }
+
+    pub(crate) fn server_with_shared_compression(
+        max_frame_size: usize,
+        max_message_size: usize,
+        config: DeflateConfig,
+    ) -> Self {
+        let deflate = CompressionContext::server_with_config(config, true);
+        Self::new(Role::Server, max_frame_size, max_message_size, deflate)
+    }
+
     /// Create a new compressed protocol handler for client role
     pub fn client(max_frame_size: usize, max_message_size: usize, config: DeflateConfig) -> Self {
-        let mut inner = Protocol::new(Role::Client, max_frame_size, max_message_size);
-        inner.enable_compression();
+        let deflate = CompressionContext::client_with_config(config, false);
+        Self::new(Role::Client, max_frame_size, max_message_size, deflate)
+    }
 
-        Self {
-            inner,
-            deflate: DeflateContext::client(config),
-            fragment_compressed: false,
-            decompress_buf: BytesMut::new(),
-        }
+    pub(crate) fn client_with_shared_compression(
+        max_frame_size: usize,
+        max_message_size: usize,
+        config: DeflateConfig,
+    ) -> Self {
+        let deflate = CompressionContext::client_with_config(config, true);
+        Self::new(Role::Client, max_frame_size, max_message_size, deflate)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uses_shared_compression(&self) -> bool {
+        matches!(self.deflate, CompressionContext::Shared { .. })
     }
 
     /// Check if connection is closed
@@ -1099,6 +1127,7 @@ impl CompressedProtocol {
         max_message_size: usize,
     ) -> (CompressedReaderProtocol, CompressedWriterProtocol) {
         let role = self.inner.role;
+        let (encoder, decoder) = self.deflate.into_parts();
 
         // Create fresh reader protocol (decoder state)
         let reader = CompressedReaderProtocol {
@@ -1107,15 +1136,12 @@ impl CompressedProtocol {
             fragment_buf: self.inner.fragment_buf,
             fragment_opcode: self.inner.fragment_opcode,
             max_message_size,
-            decoder: self.deflate.decoder,
+            decoder,
             fragment_compressed: self.fragment_compressed,
         };
 
         // Create fresh writer protocol (encoder state)
-        let writer = CompressedWriterProtocol {
-            role,
-            encoder: self.deflate.encoder,
-        };
+        let writer = CompressedWriterProtocol { role, encoder };
 
         (reader, writer)
     }
@@ -1359,7 +1385,7 @@ pub struct CompressedWriterProtocol {
     /// Endpoint role
     role: Role,
     /// Deflate encoder
-    encoder: crate::deflate::DeflateEncoder,
+    encoder: CompressionEncoder,
 }
 
 #[cfg(feature = "permessage-deflate")]
@@ -1368,12 +1394,12 @@ impl CompressedWriterProtocol {
     pub fn server(config: &DeflateConfig) -> Self {
         Self {
             role: Role::Server,
-            encoder: crate::deflate::DeflateEncoder::new(
+            encoder: CompressionEncoder::Dedicated(DeflateEncoder::new(
                 config.server_max_window_bits,
                 config.server_no_context_takeover,
                 config.compression_level,
                 config.compression_threshold,
-            ),
+            )),
         }
     }
 
@@ -1381,12 +1407,12 @@ impl CompressedWriterProtocol {
     pub fn client(config: &DeflateConfig) -> Self {
         Self {
             role: Role::Client,
-            encoder: crate::deflate::DeflateEncoder::new(
+            encoder: CompressionEncoder::Dedicated(DeflateEncoder::new(
                 config.client_max_window_bits,
                 config.client_no_context_takeover,
                 config.compression_level,
                 config.compression_threshold,
-            ),
+            )),
         }
     }
 
@@ -1556,5 +1582,19 @@ mod tests {
 
         let validated = validated_protocol.process(&mut validated_buf);
         assert!(matches!(validated, Err(Error::InvalidUtf8)));
+    }
+    #[cfg(feature = "permessage-deflate")]
+    #[test]
+    fn shared_compression_survives_protocol_split() {
+        let config = crate::Compression::Shared.to_deflate_config().unwrap();
+        let protocol = CompressedProtocol::server_with_shared_compression(
+            1024 * 1024,
+            64 * 1024 * 1024,
+            config,
+        );
+
+        assert!(protocol.uses_shared_compression());
+        let (_reader, writer) = protocol.split(1024 * 1024, 64 * 1024 * 1024);
+        assert!(matches!(writer.encoder, CompressionEncoder::Shared(_)));
     }
 }
