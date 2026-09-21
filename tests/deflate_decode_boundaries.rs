@@ -58,6 +58,15 @@ fn decompression_accepts_a_valid_final_block() {
 }
 
 #[test]
+fn decompression_accepts_an_empty_final_stored_block() {
+    let mut decoder = DeflateDecoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, false);
+
+    let decoded = decoder.decompress(&[0x01], 0).unwrap();
+
+    assert!(decoded.is_empty());
+}
+
+#[test]
 fn decompression_preserves_context_after_a_final_block() {
     let first = vec![b'A'; 1024];
     let second = [vec![b'A'; 768], vec![b'B'; 256]].concat();
@@ -95,6 +104,20 @@ fn decompression_accepts_multiple_final_blocks_in_one_message() {
         .unwrap();
 
     assert_eq!(decoded.as_ref(), [first, second].concat());
+}
+
+#[test]
+fn decompression_rejects_output_over_limit_across_final_streams() {
+    let first = vec![b'A'; 1024];
+    let second = [vec![b'A'; 768], vec![b'B'; 256]].concat();
+    let mut compressed = finish_deflate(&first, None);
+    compressed.extend_from_slice(&finish_deflate(&second, Some(&first)));
+    compressed.push(0);
+    let mut decoder = DeflateDecoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, true);
+
+    let result = decoder.decompress(&compressed, first.len());
+
+    assert!(matches!(result, Err(Error::MessageTooLarge)));
 }
 
 #[test]

@@ -359,7 +359,7 @@ impl RawDeflateDecoder {
         Ok((status, consumed, produced))
     }
 
-    fn reset(&mut self, keep_window: bool) -> Result<()> {
+    fn reset(&mut self, keep_window: bool) {
         // SAFETY: the stream was initialized in new and is exclusively borrowed.
         let status = unsafe {
             if keep_window {
@@ -368,13 +368,7 @@ impl RawDeflateDecoder {
                 inflateReset(&mut *self.stream)
             }
         };
-        if status == Z_OK {
-            Ok(())
-        } else {
-            Err(Error::Compression(format!(
-                "inflate reset error: status code {status}"
-            )))
-        }
+        assert_eq!(status, Z_OK, "failed to reset DEFLATE decoder");
     }
 }
 
@@ -408,7 +402,7 @@ impl DeflateDecoder {
     pub fn decompress(&mut self, data: &[u8], max_size: usize) -> Result<Bytes> {
         // Reset context if required
         if self.no_context_takeover {
-            self.decompress.reset(false)?;
+            self.decompress.reset(false);
         }
 
         // Per RFC 7692: Append 0x00 0x00 0xff 0xff before decompressing
@@ -461,6 +455,7 @@ impl DeflateDecoder {
                 let remaining = max_size - out_start;
                 let spare = output.spare_capacity_mut();
                 let writable = spare.len().min(remaining);
+                // Keep `offered` equal to the u32-sized output range passed to inflate.
                 let spare = &mut spare[..writable.min(u32::MAX as usize)];
                 offered = spare.len();
                 (status, consumed, produced) =
@@ -480,17 +475,12 @@ impl DeflateDecoder {
             }
 
             if status == Status::StreamEnd {
-                if total_in > data.len() {
-                    return Err(Error::Compression(
-                        "final DEFLATE block consumed its synthetic trailer".into(),
-                    ));
-                }
                 // RFC 7692 permits BFINAL blocks. Start the next raw stream
                 // while retaining the current message's LZ77 dictionary.
-                self.decompress.reset(true)?;
-                if total_in == data.len() {
-                    // Do not feed the synthetic trailer to a fresh stream; it
-                    // would leave a partial empty block before the next message.
+                self.decompress.reset(true);
+                if total_in >= data.len() {
+                    // The final stream either ended at the payload boundary or
+                    // consumed the synthetic trailer appended for decompression.
                     break;
                 }
                 continue;
@@ -518,9 +508,7 @@ impl DeflateDecoder {
 
     /// Reset the decompression context (for no_context_takeover)
     pub fn reset(&mut self) {
-        self.decompress
-            .reset(false)
-            .expect("failed to reset DEFLATE decoder");
+        self.decompress.reset(false);
     }
 }
 
