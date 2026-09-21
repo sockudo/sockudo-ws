@@ -30,6 +30,7 @@ use crate::error::{CloseReason, Error, Result};
 use crate::handshake::{
     HandshakeResult, build_request_with_headers, build_response, generate_accept_key, generate_key,
     parse_request, parse_response, select_default_subprotocol, validate_accept_key,
+    validate_selected_protocol,
 };
 use crate::heartbeat::{Deadline, Heartbeat, bounded_close_reason};
 use crate::protocol::{Message, Protocol, Role};
@@ -319,6 +320,7 @@ where
             if !validate_accept_key(&key, accept) {
                 return Err(Error::HandshakeFailed("invalid Sec-WebSocket-Accept"));
             }
+            validate_selected_protocol(protocol, res.protocol)?;
 
             let res_protocol = res.protocol.map(String::from);
             let res_extensions = res.extensions.map(String::from);
@@ -2802,6 +2804,43 @@ mod tests {
         .unwrap();
 
         assert_eq!(handshake.path, "/ws");
+        server.await.unwrap();
+    }
+
+    #[compio::test]
+    async fn compio_http1_client_rejects_an_unoffered_subprotocol() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = ::compio::runtime::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = BytesMut::with_capacity(4096);
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                assert!(read_more(&mut stream, &mut request).await.unwrap() > 0);
+            }
+            let request = std::str::from_utf8(&request).unwrap();
+            let key = request
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("Sec-WebSocket-Key")
+                        .then(|| value.trim())
+                })
+                .unwrap();
+            let response = build_response(&generate_accept_key(key), Some("unoffered"), None);
+            write_all_owned(&mut stream, response).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let error = client_handshake(&mut stream, &addr.to_string(), "/ws", Some("chat"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::HandshakeFailed("server returned an unoffered subprotocol")
+        ));
         server.await.unwrap();
     }
 
