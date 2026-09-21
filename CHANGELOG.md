@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   messages instead of cloning them, and publish inbound activity through a
   shared cell instead of a channel message per data frame.
 
+### Fixed
+
+- UTF-8 validation no longer rejects valid multi-byte characters that cross internal SIMD block boundaries on SSE2-only x86 or nightly LoongArch64, PowerPC, and s390x paths; complete inputs now use `simdutf8` and its portable fallback where no dedicated backend exists.
+
 ## [2.1.0] - 2026-09-19
 
 ### Added
