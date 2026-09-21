@@ -57,7 +57,7 @@ compio-runtime = [
 axum-integration = ["axum", "hyper", "hyper-util", "tokio-runtime"]
 
 # Compression (permessage-deflate, RFC 7692)
-permessage-deflate = ["flate2"]
+permessage-deflate = ["flate2", "dep:libz-rs-sys"]
 
 # TLS support via native-tls
 native-tls = ["dep:native-tls", "dep:tokio-native-tls", "tokio-runtime"]
@@ -173,7 +173,8 @@ futures-channel = { version = "^0.3", features = ["sink"], optional = true }
 futures-util = { version = "^0.3", default-features = false, features = ["async-await", "sink"], optional = true }
 
 # Compression (permessage-deflate, RFC 7692)
-flate2 = { version = "^1.1.3", default-features = false, features = ["zlib-rs"], optional = true }
+flate2 = { version = "^1.1.10", default-features = false, features = ["zlib-rs"], optional = true }
+libz-rs-sys = { version = "^0.6.8", optional = true }
 
 # Socket options (SO_REUSEPORT, TCP_NODELAY)
 socket2 = { version = "^0.5", features = ["all"] }

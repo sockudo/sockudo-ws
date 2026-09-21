@@ -403,6 +403,9 @@ impl AsyncWrite for UpgradedStream {
 
 /// Inner stream type that can be either compressed or uncompressed
 #[cfg(feature = "permessage-deflate")]
+// Keeping both stream variants inline avoids an allocation and pointer
+// indirection on every upgraded connection.
+#[allow(clippy::large_enum_variant)]
 enum WebSocketInner {
     Plain(WebSocketStream<UpgradedStream>),
     Compressed(CompressedWebSocketStream<UpgradedStream>),
