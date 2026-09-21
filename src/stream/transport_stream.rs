@@ -27,8 +27,10 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+#[cfg(feature = "http2")]
+use bytes::Buf;
 #[cfg(any(feature = "http2", feature = "http3"))]
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::transport::{Http1, Transport};
