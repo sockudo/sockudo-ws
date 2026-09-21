@@ -892,25 +892,27 @@ Transport features are runtime-neutral. Pair `http2` or `http3` with either `tok
 
 sockudo-ws uses SIMD acceleration for frame masking and UTF-8 validation:
 
-| Architecture | Instructions | Masking | UTF-8 | Stable | Nightly |
-|--------------|--------------|---------|-------|--------|---------|
-| x86_64 | SSE2 | ✅ | ✅ | ✅ | ✅ |
-| x86_64 | SSE4.2 | ✅ | ✅ | ✅ | ✅ |
-| x86_64 | AVX2 | ✅ | ✅ | ✅ | ✅ |
-| x86_64 | AVX-512 | ✅ | ✅ | ✅ | ✅ |
-| aarch64 | NEON | ✅ | ✅ | ✅ | ✅ |
-| arm | NEON | ✅ | ✅ | ❌ | ✅ |
-| loongarch64 | LSX | ✅ | ✅* | ❌ | ✅ |
-| loongarch64 | LASX | ✅ | ✅* | ❌ | ✅ |
-| powerpc | AltiVec | ✅ | ✅* | ❌ | ✅ |
-| powerpc64 | AltiVec | ✅ | ✅* | ❌ | ✅ |
-| s390x | z13 vectors | ✅ | ✅* | ❌ | ✅ |
+| Architecture | Instructions | Masking | UTF-8 backend | Stable | Nightly |
+|--------------|--------------|---------|---------------|--------|---------|
+| x86_64 | SSE2 | ✅ | Portable fallback | ✅ | ✅ |
+| x86_64 | SSE4.2 | ✅ | SSE4.2 | ✅ | ✅ |
+| x86_64 | AVX2 | ✅ | AVX2 | ✅ | ✅ |
+| x86_64 | AVX-512 | ✅ | AVX2 | ✅ | ✅ |
+| aarch64 | NEON | ✅ | NEON | ✅ | ✅ |
+| arm | NEON | ✅ | Portable fallback | ❌ | ✅ |
+| loongarch64 | LSX | ✅ | Portable fallback | ❌ | ✅ |
+| loongarch64 | LASX | ✅ | Portable fallback | ❌ | ✅ |
+| powerpc | AltiVec | ✅ | Portable fallback | ❌ | ✅ |
+| powerpc64 | AltiVec | ✅ | Portable fallback | ❌ | ✅ |
+| s390x | z13 vectors | ✅ | Portable fallback | ❌ | ✅ |
 
-*Custom SIMD UTF-8 validation with ASCII fast-path (requires `nightly` feature).
+The UTF-8 backend column describes acceleration, not validation availability.
+Portable fallback uses the dependency's standard validator, so all targets validate complete UTF-8 inputs.
+The Stable and Nightly columns describe availability of the listed masking implementation.
 
 UTF-8 validation uses:
-- [simdutf8](https://github.com/rusticstuff/simdutf8) for x86_64 (SSE4.2, AVX2, AVX-512), aarch64 (NEON), arm (NEON), wasm32
-- Custom SIMD implementations for LoongArch64, PowerPC, and s390x (with `nightly` feature)
+- [simdutf8](https://github.com/rusticstuff/simdutf8) for x86/x86_64 (SSE4.2 or AVX2), aarch64 (NEON), and SIMD-enabled wasm32
+- The dependency's standard UTF-8 validator fallback on other targets, including arm, LoongArch64, PowerPC, and s390x
 
 ## API Reference
 
