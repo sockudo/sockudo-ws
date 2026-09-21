@@ -481,9 +481,12 @@ where
 
             // Heartbeat deadlines are based on inbound inactivity. A Pong
             // deadline starts only after the corresponding Ping is flushed.
-            let deadline = self.heartbeat.next_deadline();
-            if let Some(deadline) = deadline {
-                let now = self.clock_epoch.elapsed().as_millis() as u64;
+            // Reuse the deadline-check timestamp when delivering buffered input.
+            let deadline = self
+                .heartbeat
+                .next_deadline()
+                .map(|deadline| (deadline, self.clock_epoch.elapsed().as_millis() as u64));
+            if let Some((deadline, now)) = deadline {
                 if deadline.at() <= now {
                     let this = self.as_mut().get_mut();
                     match deadline {
@@ -549,7 +552,10 @@ where
             // First, return any pending messages
             if let Some(msg) = self.as_mut().get_mut().next_pending_message() {
                 let this = self.as_mut().get_mut();
-                let now = this.clock_epoch.elapsed().as_millis() as u64;
+                let now = deadline.map_or_else(
+                    || this.clock_epoch.elapsed().as_millis() as u64,
+                    |(_, now)| now,
+                );
                 let pong = match &msg {
                     Message::Pong(payload) => Some(payload),
                     _ => None,
@@ -1987,9 +1993,12 @@ where
                 return Poll::Ready(None);
             }
 
-            let deadline = self.heartbeat.next_deadline();
-            if let Some(deadline) = deadline {
-                let now = self.clock_epoch.elapsed().as_millis() as u64;
+            // Reuse the deadline-check timestamp when delivering buffered input.
+            let deadline = self
+                .heartbeat
+                .next_deadline()
+                .map(|deadline| (deadline, self.clock_epoch.elapsed().as_millis() as u64));
+            if let Some((deadline, now)) = deadline {
                 if deadline.at() <= now {
                     let this = self.as_mut().get_mut();
                     match deadline {
@@ -2054,7 +2063,10 @@ where
 
             if let Some(msg) = self.as_mut().get_mut().next_pending_message() {
                 let this = self.as_mut().get_mut();
-                let now = this.clock_epoch.elapsed().as_millis() as u64;
+                let now = deadline.map_or_else(
+                    || this.clock_epoch.elapsed().as_millis() as u64,
+                    |(_, now)| now,
+                );
                 let pong = match &msg {
                     Message::Pong(payload) => Some(payload),
                     _ => None,
