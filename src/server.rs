@@ -29,12 +29,10 @@
 
 use std::future::Future;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 #[cfg(feature = "http3")]
 use std::net::SocketAddr;
-
-#[cfg(feature = "http3")]
-use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::protocol::Role;
@@ -100,7 +98,7 @@ pub struct WebSocketServer<T: Transport> {
 
 // Server inner state - different for each transport
 enum ServerInner<T: Transport> {
-    Http1(PhantomData<T>),
+    Http1(Option<Arc<[String]>>),
     #[cfg(feature = "http2")]
     Http2(PhantomData<T>),
     #[cfg(feature = "http3")]
@@ -120,8 +118,42 @@ impl WebSocketServer<Http1> {
     pub fn new(config: Config) -> Self {
         Self {
             config,
-            inner: ServerInner::Http1(PhantomData),
+            inner: ServerInner::Http1(None),
         }
+    }
+
+    /// Set supported WebSocket subprotocols in server preference order.
+    ///
+    /// The server selects the first exact match from this list. If no protocol
+    /// matches, the handshake succeeds without a selected protocol and
+    /// [`HandshakeResult::protocol`] is `None`. Browser clients that offered
+    /// protocols reject a response without a selection.
+    ///
+    /// Passing an empty iterator disables the default selection of the
+    /// client's first offer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any configured subprotocol is not a valid token.
+    pub fn protocols<I, P>(mut self, protocols: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<str>,
+    {
+        let protocols = protocols
+            .into_iter()
+            .map(|protocol| protocol.as_ref().to_owned())
+            .collect::<Vec<_>>();
+        handshake::validate_supported_protocols(&protocols)?;
+        self.inner = ServerInner::Http1(Some(protocols.into()));
+        Ok(self)
+    }
+
+    fn supported_protocols(&self) -> Option<&[String]> {
+        let ServerInner::Http1(protocols) = &self.inner else {
+            unreachable!("HTTP/1 server has a non-HTTP/1 inner state");
+        };
+        protocols.as_deref()
     }
 
     /// Create a new HTTP/1.1 WebSocket server with default configuration
@@ -170,7 +202,11 @@ impl WebSocketServer<Http1> {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         // Perform the HTTP/1.1 WebSocket handshake
-        let handshake_result = handshake::server_handshake(&mut stream).await?;
+        let handshake_result = handshake::server_handshake_with_supported_protocols(
+            &mut stream,
+            self.supported_protocols(),
+        )
+        .await?;
 
         // Wrap in Stream<Http1>
         let stream = Stream::<Http1>::new(stream);
@@ -223,7 +259,11 @@ impl WebSocketServer<Http1> {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         // Perform the HTTP/1.1 WebSocket handshake
-        let handshake_result = handshake::server_handshake(&mut stream).await?;
+        let handshake_result = handshake::server_handshake_with_supported_protocols(
+            &mut stream,
+            self.supported_protocols(),
+        )
+        .await?;
 
         // Preserve frame bytes read together with the HTTP upgrade request.
         let ws = WebSocketStream::from_raw_with_leftover(
@@ -266,10 +306,9 @@ impl WebSocketServer<Http1> {
             let (stream, _addr) = listener.accept().await.map_err(Error::Io)?;
 
             let handler = handler.clone();
-            let config = self.config.clone();
+            let server = self.clone();
 
             tokio::spawn(async move {
-                let server = WebSocketServer::<Http1>::new(config);
                 match server.accept(stream).await {
                     Ok((ws, handshake)) => {
                         handler(ws, handshake).await;
@@ -291,9 +330,12 @@ impl Default for WebSocketServer<Http1> {
 
 impl Clone for WebSocketServer<Http1> {
     fn clone(&self) -> Self {
+        let ServerInner::Http1(protocols) = &self.inner else {
+            unreachable!("HTTP/1 server has a non-HTTP/1 inner state");
+        };
         Self {
             config: self.config.clone(),
-            inner: ServerInner::Http1(PhantomData),
+            inner: ServerInner::Http1(protocols.clone()),
         }
     }
 }

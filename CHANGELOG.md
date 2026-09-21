@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `WebSocketServer<Http1>::protocols` configures HTTP/1 subprotocol selection in server preference order while preserving the existing first-offered default when no list is configured.
+
 ### Changed
 
 - Outbound frames are coalesced across `send()` calls while inbound messages

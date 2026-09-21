@@ -347,6 +347,27 @@ pub(crate) fn select_default_subprotocol(value: Option<&str>) -> Option<&str> {
     value.and_then(|value| list_elements(value).find(|protocol| !protocol.is_empty()))
 }
 
+pub(crate) fn validate_supported_protocols(protocols: &[String]) -> Result<()> {
+    if protocols.iter().all(|protocol| is_token(protocol)) {
+        Ok(())
+    } else {
+        Err(Error::InvalidHttp("invalid supported subprotocol"))
+    }
+}
+
+/// Select the first server-preferred protocol present in an offer previously
+/// validated by `parse_request`.
+pub(crate) fn select_supported_subprotocol<'a>(
+    offered: Option<&str>,
+    supported: &'a [String],
+) -> Option<&'a str> {
+    let offered = offered?;
+    supported
+        .iter()
+        .find(|candidate| list_elements(offered).any(|offer| offer == candidate.as_str()))
+        .map(String::as_str)
+}
+
 fn is_valid_protocol_list(value: &str) -> bool {
     // RFC 6455 requires every offered subprotocol to be unique.
     let mut protocols = HashSet::new();
@@ -591,6 +612,17 @@ pub async fn server_handshake<S>(stream: &mut S) -> Result<HandshakeResult>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    server_handshake_with_supported_protocols(stream, None).await
+}
+
+#[cfg(feature = "tokio-runtime")]
+pub(crate) async fn server_handshake_with_supported_protocols<S>(
+    stream: &mut S,
+    supported_protocols: Option<&[String]>,
+) -> Result<HandshakeResult>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut buf = BytesMut::with_capacity(4096);
@@ -610,7 +642,11 @@ where
         if let Some((req, consumed)) = parse_request(&buf)? {
             // Extract values before mutably borrowing buf
             let path = req.path.to_string();
-            let protocol = select_default_subprotocol(req.protocol).map(str::to_owned);
+            let protocol = match supported_protocols {
+                Some(supported) => select_supported_subprotocol(req.protocol, supported),
+                None => select_default_subprotocol(req.protocol),
+            }
+            .map(str::to_owned);
             let extensions = req.extensions.map(String::from);
 
             // Generate accept key
