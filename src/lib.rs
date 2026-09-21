@@ -459,7 +459,9 @@ pub struct Config {
     /// Close reason used when a native Pong deadline expires.
     pub pong_timeout_close_reason: String,
     /// Maximum time spent flushing a timeout/handshake Close and shutting down
-    /// the transport (default: 5 seconds, 0 = immediate best effort).
+    /// the transport (default: 5 seconds). A Tokio split `close()` starts this
+    /// budget when local closing begins, including time waiting for the shared
+    /// sink. Zero makes that path try the sink and write once without waiting.
     pub close_timeout: u32,
     /// Coalesce outbound frames while inbound messages are still queued
     /// (default: true).
