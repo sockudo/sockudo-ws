@@ -373,6 +373,7 @@ impl Protocol {
     /// Process incoming data into a reusable message buffer (zero-allocation hot path)
     ///
     /// This variant allows reusing a Vec<Message> across calls to avoid allocations.
+    /// If a later frame fails, messages accepted earlier in this call remain in wire order.
     #[inline]
     pub fn process_into(&mut self, buf: &mut BytesMut, messages: &mut Vec<Message>) -> Result<()> {
         messages.clear();
@@ -858,6 +859,8 @@ impl CompressedProtocol {
     }
 
     /// Process incoming data into a reusable message buffer
+    ///
+    /// If a later frame fails, messages accepted earlier in this call remain in wire order.
     #[inline]
     pub fn process_into(&mut self, buf: &mut BytesMut, messages: &mut Vec<Message>) -> Result<()> {
         const DEBUG: bool = false;
@@ -1184,6 +1187,8 @@ impl CompressedReaderProtocol {
     }
 
     /// Process incoming data into a reusable message buffer
+    ///
+    /// If a later frame fails, messages accepted earlier in this call remain in wire order.
     pub fn process_into(&mut self, buf: &mut BytesMut, messages: &mut Vec<Message>) -> Result<()> {
         messages.clear();
 
