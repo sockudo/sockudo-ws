@@ -354,6 +354,7 @@ impl DeflateDecoder {
                     .decompress_uninit(&input[total_in..], &mut probe, FlushDecompress::Sync)
                     .map_err(|e| Error::Compression(format!("inflate error: {}", e)))?;
             } else {
+                // Ensure we have space in the output buffer.
                 if output.len() == output.capacity() {
                     // At least double or add 4KB, whichever is larger. The
                     // allocator may reserve more, so the writable slice below
@@ -363,6 +364,7 @@ impl DeflateDecoder {
                     output.reserve(additional);
                 }
 
+                // Get writable slice using spare_capacity_mut to avoid UB with uninitialized memory.
                 let out_start = output.len();
                 let remaining = max_size - out_start;
                 let spare = output.spare_capacity_mut();
@@ -399,7 +401,9 @@ impl DeflateDecoder {
 
             if consumed == 0 && produced == 0 {
                 if total_in < input.len() {
-                    return Err(Error::Compression("incomplete deflate payload".into()));
+                    return Err(Error::Compression(
+                        "inflate made no progress with input remaining".into(),
+                    ));
                 }
                 break;
             }
