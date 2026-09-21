@@ -773,7 +773,7 @@ let config = Config::builder()
 | `pong_timeout` | 10s | Matching Pong deadline after Ping flush (0 = no deadline and no second Ping until a match) |
 | `pong_timeout_close_code` | 1001 | Close code for a missed Pong |
 | `pong_timeout_close_reason` | `Pong reply not received in time` | Close reason for a missed Pong |
-| `close_timeout` | 5s | Bound for timeout Close flush and transport shutdown |
+| `close_timeout` | 5s | Bound for Close handling; Tokio split `close()` includes waiting for the shared sink (0 = one immediate attempt without waiting) |
 | `write_buffer_size` | 16KB | Cork buffer size |
 
 ### Native keepalive semantics

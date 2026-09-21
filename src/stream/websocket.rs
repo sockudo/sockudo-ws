@@ -1094,11 +1094,9 @@ where
                         Ok(())
                     }
                     std::task::Poll::Ready(Err(error)) => Err(self.preferred_write_error(error)),
-                    std::task::Poll::Pending => {
-                        self.shared.terminate(TerminalCause::ConnectionClosed);
-                        self.shared.cancel.cancel();
-                        Err(self.current_error())
-                    }
+                    // Dropping the pending write above runs SplitSendGuard and
+                    // terminates the connection before the sink is released.
+                    std::task::Poll::Pending => Err(self.current_error()),
                 };
             }
             // Publish before waiting for the sink: a blocked control write must
@@ -1516,7 +1514,8 @@ async fn split_writer_driver<W, E>(
         if pending_write.is_none() {
             if peer_close {
                 if local_close_sent {
-                    let deadline = closing_deadline.expect("peer Close starts a closing deadline");
+                    let deadline =
+                        closing_deadline.expect("a Close handshake has a closing deadline");
                     // Include acquiring the sink in the original closing budget.
                     let _ = tokio::time::timeout_at(deadline, async {
                         let mut guard = sink.lock().await;
