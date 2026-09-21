@@ -183,7 +183,10 @@ pub fn build_response(accept_key: &str, protocol: Option<&str>, extensions: Opti
     buf.freeze()
 }
 
-/// Build a WebSocket upgrade request (client-side)
+/// Build a WebSocket upgrade request (client-side).
+///
+/// This raw builder does not validate its arguments. Use
+/// [`build_request_with_headers`] for externally supplied values.
 pub fn build_request(
     host: &str,
     path: &str,
@@ -202,8 +205,9 @@ pub fn build_request(
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidHttp`] if a header name or value is invalid, or if
-/// a custom header conflicts with a handshake-managed header.
+/// Returns [`Error::InvalidHttp`] if the request target or a header name or
+/// value is invalid, or if a custom header conflicts with a handshake-managed
+/// header.
 pub fn build_request_with_headers(
     host: &str,
     path: &str,
@@ -212,6 +216,7 @@ pub fn build_request_with_headers(
     extensions: Option<&str>,
     extra_headers: Option<&[(String, String)]>,
 ) -> Result<Bytes> {
+    validate_request_fields(host, path, key, protocol, extensions)?;
     if let Some(headers) = extra_headers {
         validate_extra_headers(headers)?;
     }
@@ -224,6 +229,35 @@ pub fn build_request_with_headers(
         extensions,
         extra_headers,
     ))
+}
+
+fn validate_request_fields(
+    host: &str,
+    path: &str,
+    key: &str,
+    protocol: Option<&str>,
+    extensions: Option<&str>,
+) -> Result<()> {
+    validate_header_value(host, "invalid Host")?;
+    if !path.bytes().all(is_request_target_byte) {
+        return Err(Error::InvalidHttp("invalid request target"));
+    }
+    validate_header_value(key, "invalid Sec-WebSocket-Key")?;
+    if let Some(protocol) = protocol {
+        validate_header_value(protocol, "invalid Sec-WebSocket-Protocol")?;
+    }
+    if let Some(extensions) = extensions {
+        validate_header_value(extensions, "invalid Sec-WebSocket-Extensions")?;
+    }
+    Ok(())
+}
+
+fn validate_header_value(value: &str, error: &'static str) -> Result<()> {
+    if value.bytes().all(is_header_value_byte) {
+        Ok(())
+    } else {
+        Err(Error::InvalidHttp(error))
+    }
 }
 
 fn validate_extra_headers(headers: &[(String, String)]) -> Result<()> {
@@ -251,6 +285,10 @@ fn is_header_value_byte(byte: u8) -> bool {
     // Keep HTTP/1 validation independent of the optional HTTP/2 and HTTP/3
     // `http` dependency. RFC 9110 permits HTAB, visible bytes, and obs-text.
     byte == b'\t' || (byte >= b' ' && byte != 0x7f)
+}
+
+fn is_request_target_byte(byte: u8) -> bool {
+    byte > b' ' && byte != 0x7f
 }
 
 fn is_header_name_byte(byte: u8) -> bool {
@@ -612,6 +650,46 @@ mod tests {
         assert!(response_str.contains("101 Switching Protocols"));
         assert!(response_str.contains("Upgrade: websocket"));
         assert!(response_str.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+    }
+
+    #[test]
+    fn checked_request_builder_rejects_injected_lines() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let injected = "safe\r\nX-Injected: true";
+
+        for result in [
+            build_request_with_headers(injected, "/ws", key, None, None, None),
+            build_request_with_headers(
+                "example.com",
+                "/ws\r\nX-Injected: true",
+                key,
+                None,
+                None,
+                None,
+            ),
+            build_request_with_headers("example.com", "/ws", injected, None, None, None),
+            build_request_with_headers("example.com", "/ws", key, Some(injected), None, None),
+            build_request_with_headers("example.com", "/ws", key, None, Some(injected), None),
+        ] {
+            assert!(matches!(result, Err(Error::InvalidHttp(_))));
+        }
+    }
+
+    #[test]
+    fn checked_request_builder_rejects_whitespace_in_request_target() {
+        let result = build_request_with_headers(
+            "example.com",
+            "/ws bad",
+            "dGhlIHNhbXBsZSBub25jZQ==",
+            None,
+            None,
+            None,
+        );
+
+        assert!(matches!(
+            result,
+            Err(Error::InvalidHttp("invalid request target"))
+        ));
     }
 
     #[test]
