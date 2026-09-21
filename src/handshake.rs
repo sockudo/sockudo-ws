@@ -529,6 +529,9 @@ pub fn parse_response(buf: &[u8]) -> Result<Option<(HandshakeResponse<'_>, usize
                 if name.eq_ignore_ascii_case("sec-websocket-accept") {
                     accept = Some(value);
                 } else if name.eq_ignore_ascii_case("sec-websocket-protocol") {
+                    if protocol.is_some() {
+                        return Err(Error::HandshakeFailed("duplicate Sec-WebSocket-Protocol"));
+                    }
                     if !is_token(value) {
                         return Err(Error::HandshakeFailed("invalid Sec-WebSocket-Protocol"));
                     }
@@ -560,6 +563,26 @@ pub fn parse_response(buf: &[u8]) -> Result<Option<(HandshakeResponse<'_>, usize
 pub fn validate_accept_key(sent_key: &str, received_accept: &str) -> bool {
     let expected = generate_accept_key(sent_key);
     expected == received_accept
+}
+
+/// Validate the selected subprotocol from a parsed response against the
+/// protocol list already validated by the request builder.
+pub(crate) fn validate_selected_protocol(
+    offered: Option<&str>,
+    selected: Option<&str>,
+) -> Result<()> {
+    let Some(selected) = selected else {
+        return Ok(());
+    };
+
+    if offered.is_some_and(|offered| list_elements(offered).any(|candidate| candidate == selected))
+    {
+        Ok(())
+    } else {
+        Err(Error::HandshakeFailed(
+            "server returned an unoffered subprotocol",
+        ))
+    }
 }
 
 /// Perform server-side handshake
@@ -696,6 +719,7 @@ where
             if !validate_accept_key(&key, accept) {
                 return Err(Error::HandshakeFailed("invalid Sec-WebSocket-Accept"));
             }
+            validate_selected_protocol(protocol, res.protocol)?;
 
             // Extract values before mutably borrowing buf
             let res_protocol = res.protocol.map(String::from);
@@ -811,5 +835,37 @@ mod tests {
         let accept = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
         assert!(validate_accept_key(key, accept));
         assert!(!validate_accept_key(key, "invalid"));
+    }
+
+    #[test]
+    fn response_rejects_duplicate_subprotocol_headers() {
+        let response = b"HTTP/1.1 101 Switching Protocols\r\n\
+            Sec-WebSocket-Protocol: chat\r\n\
+            Sec-WebSocket-Protocol: superchat\r\n\
+            \r\n";
+
+        assert!(matches!(
+            parse_response(response),
+            Err(Error::HandshakeFailed("duplicate Sec-WebSocket-Protocol"))
+        ));
+    }
+
+    #[test]
+    fn selected_subprotocol_must_exactly_match_one_offer() {
+        let cases = [
+            (Some("chat,\tsuperchat"), Some("superchat"), true),
+            (Some("chat"), None, true),
+            (None, Some("chat"), false),
+            (Some("chat"), Some("other"), false),
+            (Some("chat"), Some("CHAT"), false),
+        ];
+
+        for (offered, selected, valid) in cases {
+            assert_eq!(
+                validate_selected_protocol(offered, selected).is_ok(),
+                valid,
+                "offered={offered:?}, selected={selected:?}"
+            );
+        }
     }
 }
