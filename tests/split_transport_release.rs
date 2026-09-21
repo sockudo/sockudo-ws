@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use futures_util::task::AtomicWaker;
 use sockudo_ws::{Config, Error, WebSocketStream};
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::sync::Notify;
@@ -17,7 +16,6 @@ struct WriteGate {
     bytes: Mutex<Vec<u8>>,
     blocked: Notify,
     shutdown_started: Notify,
-    waker: AtomicWaker,
     dropped: AtomicBool,
 }
 
@@ -39,10 +37,9 @@ impl AsyncRead for GatedIo {
 impl AsyncWrite for GatedIo {
     fn poll_write(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        _cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.gate.waker.register(cx.waker());
         let count = bytes.len().min(self.gate.remaining.load(Ordering::Relaxed));
         if count == 0 {
             self.gate.blocked.notify_one();
@@ -61,8 +58,7 @@ impl AsyncWrite for GatedIo {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.gate.waker.register(cx.waker());
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.gate.shutdown_started.notify_one();
         Poll::Pending
     }
@@ -81,7 +77,6 @@ fn connection(write_limit: usize) -> (GatedIo, DuplexStream, Arc<WriteGate>) {
         bytes: Mutex::new(Vec::new()),
         blocked: Notify::new(),
         shutdown_started: Notify::new(),
-        waker: AtomicWaker::new(),
         dropped: AtomicBool::new(false),
     });
     (
@@ -157,6 +152,8 @@ async fn idle_timeout_closes_an_idle_sink_before_waking_a_queued_sender() {
     tokio::time::advance(Duration::from_millis(1001)).await;
     gate.shutdown_started.notified().await;
     let send = tokio::spawn(async move { writer.send_text("late").await });
+    tokio::task::yield_now().await;
+    assert!(!send.is_finished());
     tokio::time::advance(Duration::from_millis(1001)).await;
 
     assert!(matches!(read.await.unwrap(), Some(Err(Error::IdleTimeout))));
@@ -193,6 +190,24 @@ async fn peer_eof_during_timeout_shutdown_does_not_replace_the_timeout_cause() {
 
     tokio::time::advance(Duration::from_millis(1001)).await;
     assert!(matches!(read.await.unwrap(), Some(Err(Error::IdleTimeout))));
+    assert!(gate.dropped.load(Ordering::Relaxed));
+}
+
+#[tokio::test(start_paused = true)]
+async fn local_close_deadline_releases_transport_with_live_handles() {
+    let (io, _peer, gate) = connection(usize::MAX);
+    let config = Config::builder()
+        .auto_ping(false)
+        .idle_timeout(0)
+        .close_timeout(1)
+        .build();
+    let (mut reader, mut writer) = WebSocketStream::client(io, config).split();
+
+    writer.close(1000, "done").await.unwrap();
+    tokio::time::advance(Duration::from_millis(1001)).await;
+    gate.shutdown_started.notified().await;
+
+    assert!(reader.next().await.is_none());
     assert!(gate.dropped.load(Ordering::Relaxed));
 }
 

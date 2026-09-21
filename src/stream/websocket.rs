@@ -1755,12 +1755,13 @@ where
     W: AsyncWrite + Unpin,
 {
     tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(Error::ConnectionClosed),
         result = async {
             writer.write_all(bytes).await?;
             writer.flush().await?;
             Ok::<(), std::io::Error>(())
         } => result.map_err(Into::into),
-        _ = cancel.cancelled() => Err(Error::ConnectionClosed),
     }
 }
 
@@ -2948,6 +2949,21 @@ mod tests {
 
         assert!(matches!(result, Err(Error::ConnectionClosed)));
         assert!(!encoded);
+        assert_eq!(polls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_split_write_does_not_poll_the_transport() {
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut writer = FailingWriter {
+            polls: polls.clone(),
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let result = write_split_bytes(&mut writer, b"cancelled", &cancel).await;
+
+        assert!(matches!(result, Err(Error::ConnectionClosed)));
         assert_eq!(polls.load(Ordering::Relaxed), 0);
     }
 

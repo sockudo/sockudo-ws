@@ -14,6 +14,8 @@ struct SharedTransport<S> {
 
 enum TransportState<S> {
     Open(S),
+    // Public I/O polls intentionally stay pending without storing a waker. The
+    // split reader and writer also await terminal and cancellation signals.
     Closing,
     Closed,
 }
