@@ -332,7 +332,7 @@ fn is_token(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(is_header_name_byte)
 }
 
-fn trim_optional_whitespace(value: &str) -> &str {
+pub(crate) fn trim_optional_whitespace(value: &str) -> &str {
     value.trim_matches(|character| matches!(character, ' ' | '\t'))
 }
 
