@@ -21,7 +21,6 @@ use std::cell::Cell;
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
-#[cfg(feature = "http2")]
 use std::pin::Pin;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -2092,8 +2091,8 @@ async fn compio_split_writer_driver<W, E>(
     let mut closing = CompioClosing {
         deadline: None,
         timeout: Duration::from_secs(config.close_timeout.into()),
-        immediate_write_attempt: false,
     };
+    let mut timer = CompioDriverTimer::default();
     let mut local_close_sent = false;
     let mut write_buf = BytesMut::with_capacity(config.write_buffer_size);
     let mut last_synced_inbound_ms = 0u64;
@@ -2111,18 +2110,16 @@ async fn compio_split_writer_driver<W, E>(
             heartbeat.on_inbound(observed_inbound, None);
         }
 
-        let now_ms = epoch.elapsed().as_millis() as u64;
-        let heartbeat_delay = heartbeat
-            .next_deadline()
-            .map(|deadline| Duration::from_millis(deadline.at().saturating_sub(now_ms)))
-            .unwrap_or(Duration::from_secs(365 * 24 * 60 * 60));
-        let close_delay = closing
-            .deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-            .unwrap_or(Duration::from_secs(365 * 24 * 60 * 60));
-        let timer_delay = heartbeat_delay.min(close_delay);
+        let now = Instant::now();
+        let now_ms = now.saturating_duration_since(epoch).as_millis() as u64;
+        let heartbeat_deadline = heartbeat.next_deadline();
+        let close_deadline = closing.deadline;
+        let timer_expired = heartbeat_deadline.is_some_and(|deadline| deadline.at() <= now_ms)
+            || close_deadline.is_some_and(|deadline| deadline <= now);
 
-        let wake = {
+        let wake = if timer_expired {
+            CompioDriverWake::Timer
+        } else {
             let cancel = cancel_rx.next().fuse();
             let control = async {
                 match deferred_control.take() {
@@ -2132,30 +2129,21 @@ async fn compio_split_writer_driver<W, E>(
             }
             .fuse();
             let application = application_rx.next().fuse();
-            let sleep = ::compio::time::sleep(timer_delay);
-            futures_util::pin_mut!(sleep);
-            // Check the clock on every poll. A ready application request must
-            // not hide an already-expired heartbeat or closing deadline.
-            let timer = std::future::poll_fn(|cx| {
-                if closing
-                    .deadline
-                    .is_some_and(|deadline| Instant::now() >= deadline)
-                    || heartbeat
-                        .next_deadline()
-                        .is_some_and(|deadline| epoch.elapsed().as_millis() as u64 >= deadline.at())
-                {
-                    std::task::Poll::Ready(())
-                } else {
-                    sleep.as_mut().poll(cx)
-                }
-            })
-            .fuse();
-            futures_util::pin_mut!(cancel, control, application, timer);
+            let timer_wait = timer
+                .wait_until(compio_timer_deadline(
+                    epoch,
+                    heartbeat_deadline,
+                    close_deadline,
+                ))
+                .fuse();
+            futures_util::pin_mut!(cancel, control, application, timer_wait);
+            // Deadlines already expired at loop entry were handled above. Keep
+            // ready application work ahead of a still-pending timer.
             futures_util::select_biased! {
                 _ = cancel => CompioDriverWake::Cancel,
                 request = control => CompioDriverWake::Control(request),
-                _ = timer => CompioDriverWake::Timer,
                 request = application => CompioDriverWake::Application(request),
+                _ = timer_wait => CompioDriverWake::Timer,
             }
         };
 
@@ -2187,6 +2175,7 @@ async fn compio_split_writer_driver<W, E>(
                         },
                         &shared,
                         &mut closing,
+                        &mut timer,
                         &mut last_synced_inbound_ms,
                     )
                     .await
@@ -2200,9 +2189,10 @@ async fn compio_split_writer_driver<W, E>(
                     if !local_close_sent {
                         write_buf.clear();
                         encoder.encode_close_response(&mut write_buf);
-                        let _ = ::compio::time::timeout(
+                        compio_bounded_flush(
+                            &mut writer,
+                            &mut write_buf,
                             deadline.saturating_duration_since(Instant::now()),
-                            flush_bytes(&mut writer, &mut write_buf),
                         )
                         .await;
                     }
@@ -2243,6 +2233,7 @@ async fn compio_split_writer_driver<W, E>(
                                 },
                                 &shared,
                                 &mut closing,
+                                &mut timer,
                                 &mut last_synced_inbound_ms,
                             )
                             .await
@@ -2268,6 +2259,7 @@ async fn compio_split_writer_driver<W, E>(
                         },
                         &shared,
                         &mut closing,
+                        &mut timer,
                         &mut last_synced_inbound_ms,
                     )
                     .await;
@@ -2313,6 +2305,7 @@ async fn compio_split_writer_driver<W, E>(
                                 },
                                 &shared,
                                 &mut closing,
+                                &mut timer,
                                 &mut last_synced_inbound_ms,
                             )
                             .await
@@ -2365,19 +2358,52 @@ async fn compio_split_writer_driver<W, E>(
 struct CompioClosing {
     deadline: Option<Instant>,
     timeout: Duration,
-    immediate_write_attempt: bool,
 }
 
 impl CompioClosing {
     fn begin(&mut self) -> Instant {
-        *self.deadline.get_or_insert_with(|| {
-            self.immediate_write_attempt = self.timeout.is_zero();
-            Instant::now() + self.timeout
-        })
+        *self
+            .deadline
+            .get_or_insert_with(|| Instant::now() + self.timeout)
     }
+}
 
-    fn take_immediate_write_attempt(&mut self) -> bool {
-        std::mem::take(&mut self.immediate_write_attempt)
+#[derive(Default)]
+struct CompioDriverTimer {
+    deadline: Option<Instant>,
+    sleep: Option<Pin<Box<dyn Future<Output = ()>>>>,
+}
+
+impl CompioDriverTimer {
+    async fn wait_until(&mut self, deadline: Option<Instant>) {
+        // Compio sleeps cannot be reset. Retain the current one until its
+        // target changes instead of inserting and removing it for every poll.
+        if self.deadline != deadline {
+            self.deadline = deadline;
+            self.sleep =
+                deadline.map(|deadline| Box::pin(::compio::time::sleep_until(deadline)) as _);
+        }
+        std::future::poll_fn(|cx| match self.sleep.as_mut() {
+            Some(sleep) => sleep.as_mut().poll(cx),
+            None => std::task::Poll::Pending,
+        })
+        .await;
+        self.deadline = None;
+        self.sleep = None;
+    }
+}
+
+fn compio_timer_deadline(
+    epoch: Instant,
+    heartbeat: Option<Deadline>,
+    closing: Option<Instant>,
+) -> Option<Instant> {
+    let heartbeat = heartbeat.map(|deadline| epoch + Duration::from_millis(deadline.at()));
+    match (heartbeat, closing) {
+        (Some(heartbeat), Some(closing)) => Some(heartbeat.min(closing)),
+        (Some(heartbeat), None) => Some(heartbeat),
+        (None, Some(closing)) => Some(closing),
+        (None, None) => None,
     }
 }
 
@@ -2395,6 +2421,7 @@ async fn await_compio_write(
     channels: CompioWriteChannels<'_>,
     shared: &CompioSplitShared,
     closing: &mut CompioClosing,
+    timer: &mut CompioDriverTimer,
     last_synced_inbound_ms: &mut u64,
 ) -> Result<()> {
     let CompioWriteChannels {
@@ -2409,16 +2436,6 @@ async fn await_compio_write(
         if observed_inbound > *last_synced_inbound_ms {
             *last_synced_inbound_ms = observed_inbound;
             heartbeat.on_inbound(observed_inbound, None);
-        }
-
-        // A zero Close budget still makes one best-effort poll. This preserves
-        // immediate Close writes without allowing a blocked write to wait.
-        if closing.take_immediate_write_attempt() {
-            let polled =
-                std::future::poll_fn(|cx| std::task::Poll::Ready(write.as_mut().poll(cx))).await;
-            if let std::task::Poll::Ready(result) = polled {
-                return result;
-            }
         }
 
         let deadline = heartbeat.next_hard_deadline();
@@ -2436,38 +2453,14 @@ async fn await_compio_write(
         }
         .fuse();
         let cancel = cancel.next().fuse();
-        let timer = async {
-            let heartbeat_delay = deadline.map(|deadline| {
-                Duration::from_millis(
-                    deadline
-                        .at()
-                        .saturating_sub(shared.epoch.elapsed().as_millis() as u64),
-                )
-            });
-            let close_delay = close_at.map(|at| at.saturating_duration_since(Instant::now()));
-            let delay = match (heartbeat_delay, close_delay) {
-                (Some(a), Some(b)) => a.min(b),
-                (Some(a), None) | (None, Some(a)) => a,
-                (None, None) => return std::future::pending::<()>().await,
-            };
-            let sleep = ::compio::time::sleep(delay);
-            futures_util::pin_mut!(sleep);
-            std::future::poll_fn(|cx| {
-                if close_at.is_some_and(|at| Instant::now() >= at)
-                    || deadline.is_some_and(|deadline| {
-                        shared.epoch.elapsed().as_millis() as u64 >= deadline.at()
-                    })
-                {
-                    std::task::Poll::Ready(())
-                } else {
-                    sleep.as_mut().poll(cx)
-                }
-            })
-            .await;
-        }
-        .fuse();
-        futures_util::pin_mut!(control, cancel, timer);
+        let timer_wait = timer
+            .wait_until(compio_timer_deadline(shared.epoch, deadline, close_at))
+            .fuse();
+        futures_util::pin_mut!(control, cancel, timer_wait);
+        // An immediately writable frame wins without polling any interrupt
+        // source. A Pending write still observes all of them in this turn.
         futures_util::select_biased! {
+            result = write => return result,
             _ = cancel => return Err(Error::ConnectionClosed),
             request = control => match request {
                 Some(ControlRequest::Pong(payload, received_at)) => {
@@ -2497,7 +2490,7 @@ async fn await_compio_write(
                 }
                 Some(ControlRequest::Eof) | None => return Err(Error::ConnectionClosed),
             },
-            _ = timer => {
+            _ = timer_wait => {
                 if close_at.is_some_and(|at| Instant::now() >= at) {
                     return Err(Error::ConnectionClosed);
                 }
@@ -2517,8 +2510,22 @@ async fn await_compio_write(
                     _ => {}
                 }
             },
-            result = write => return result,
         }
+    }
+}
+
+async fn compio_bounded_flush<W>(writer: &mut W, buf: &mut BytesMut, timeout: Duration)
+where
+    W: AsyncWrite,
+{
+    let flush = flush_bytes(writer, buf).fuse();
+    let timer = ::compio::time::sleep(timeout).fuse();
+    futures_util::pin_mut!(flush, timer);
+    // Give an immediately writable Close one attempt even when the budget is
+    // zero; a Pending flush then yields to the timer in the same poll.
+    futures_util::select_biased! {
+        _ = flush => {}
+        _ = timer => {}
     }
 }
 
@@ -2535,9 +2542,10 @@ async fn compio_timeout_close<W, E>(
     let mut buf = BytesMut::with_capacity(128);
     let close = Message::Close(Some(CloseReason::new(code, bounded_close_reason(reason))));
     if encoder.encode_message(&close, &mut buf).is_ok() {
-        let _ = ::compio::time::timeout(
+        compio_bounded_flush(
+            writer,
+            &mut buf,
             Duration::from_secs(config.close_timeout.into()),
-            flush_bytes(writer, &mut buf),
         )
         .await;
     }

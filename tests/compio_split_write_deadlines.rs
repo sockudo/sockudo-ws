@@ -194,6 +194,21 @@ fn blocked_flush_connection() -> (TestIo, Rc<WriteState>, oneshot::Receiver<()>)
     )
 }
 
+fn immediate_connection() -> (TestIo, Rc<WriteState>) {
+    let state = Rc::new(WriteState::default());
+    state.write_limit.set(usize::MAX);
+    (
+        TestIo(
+            PendingReader(state.clone()),
+            PartialWriter {
+                state: state.clone(),
+                blocked: None,
+            },
+        ),
+        state,
+    )
+}
+
 #[compio::test]
 async fn idle_timeout_cancels_a_partial_send_before_notifying_handles() {
     let (io, state, entered) = partial_connection();
@@ -467,6 +482,29 @@ async fn zero_close_timeout_keeps_an_immediate_best_effort_write() {
 
     writer.close(1000, "").await.unwrap();
     assert_eq!(bytes.borrow().first(), Some(&0x88));
+}
+
+#[compio::test]
+async fn zero_close_timeout_keeps_an_immediate_peer_close_response() {
+    let mut wire = bytes::BytesMut::new();
+    Protocol::new(Role::Server, 65_536, 65_536)
+        .encode_message(&Message::Close(None), &mut wire)
+        .unwrap();
+
+    for _ in 0..32 {
+        let (io, state) = immediate_connection();
+        state.push_input(wire.to_vec());
+        let config = Config::builder()
+            .auto_ping(false)
+            .idle_timeout(0)
+            .close_timeout(0)
+            .build();
+        let (mut reader, _writer) = CompioWebSocketStream::client(io, config).split();
+
+        assert!(reader.next().await.unwrap().unwrap().is_close());
+        assert!(reader.next().await.is_none());
+        assert_eq!(state.bytes.borrow().first(), Some(&0x88));
+    }
 }
 
 #[compio::test]
