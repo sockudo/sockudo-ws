@@ -18,11 +18,9 @@
 //! `compio::io::util::Split::new(transport)` before passing them to these APIs.
 
 use std::cell::Cell;
-#[cfg(any(feature = "http2", feature = "http3"))]
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
-#[cfg(feature = "http2")]
 use std::pin::Pin;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -112,6 +110,14 @@ enum CompioTerminalCause {
 }
 
 impl CompioTerminalCause {
+    fn from_error(error: &Error) -> Self {
+        match error {
+            Error::HeartbeatTimeout => Self::HeartbeatTimeout,
+            Error::IdleTimeout => Self::IdleTimeout,
+            _ => Self::ConnectionClosed,
+        }
+    }
+
     fn error(self) -> Error {
         match self {
             Self::ConnectionClosed => Error::ConnectionClosed,
@@ -1860,6 +1866,10 @@ pub struct CompioSplitReader<R> {
 }
 
 /// Write half of a split Compio WebSocket stream.
+///
+/// Pending sends and flushes continue to enforce idle, Pong, and closing
+/// deadlines. A terminal deadline releases the transport writer before pending
+/// operations return their error.
 pub struct CompioSplitWriter<W> {
     application_tx: mpsc::Sender<ApplicationRequest>,
     cancel_tx: mpsc::UnboundedSender<()>,
@@ -2078,12 +2088,21 @@ async fn compio_split_writer_driver<W, E>(
     } = channels;
     let epoch = shared.epoch;
     let mut heartbeat = Heartbeat::new(&config, 0);
-    let mut closing_deadline: Option<Instant> = None;
+    let mut closing = CompioClosing {
+        deadline: None,
+        timeout: Duration::from_secs(config.close_timeout.into()),
+    };
+    let mut timer = CompioDriverTimer::default();
     let mut local_close_sent = false;
     let mut write_buf = BytesMut::with_capacity(config.write_buffer_size);
     let mut last_synced_inbound_ms = 0u64;
+    let mut deferred_control = None;
+    let mut failed_request = None;
 
-    loop {
+    let cause = loop {
+        if shared.status.get() == SPLIT_CLOSED {
+            break CompioTerminalCause::ConnectionClosed;
+        }
         // Pick up data-frame activity published by the reader without a channel.
         let observed_inbound = shared.last_inbound_ms.get();
         if observed_inbound > last_synced_inbound_ms {
@@ -2091,38 +2110,48 @@ async fn compio_split_writer_driver<W, E>(
             heartbeat.on_inbound(observed_inbound, None);
         }
 
-        let now_ms = epoch.elapsed().as_millis() as u64;
-        let heartbeat_delay = heartbeat
-            .next_deadline()
-            .map(|deadline| Duration::from_millis(deadline.at().saturating_sub(now_ms)))
-            .unwrap_or(Duration::from_secs(365 * 24 * 60 * 60));
-        let close_delay = closing_deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-            .unwrap_or(Duration::from_secs(365 * 24 * 60 * 60));
-        let timer_delay = heartbeat_delay.min(close_delay);
+        let now = Instant::now();
+        let now_ms = now.saturating_duration_since(epoch).as_millis() as u64;
+        let heartbeat_deadline = heartbeat.next_deadline();
+        let close_deadline = closing.deadline;
+        let timer_expired = heartbeat_deadline.is_some_and(|deadline| deadline.at() <= now_ms)
+            || close_deadline.is_some_and(|deadline| deadline <= now);
 
-        let wake = {
+        let wake = if timer_expired {
+            CompioDriverWake::Timer
+        } else {
             let cancel = cancel_rx.next().fuse();
-            let control = control_rx.next().fuse();
+            let control = async {
+                match deferred_control.take() {
+                    Some(request) => Some(request),
+                    None => control_rx.next().await,
+                }
+            }
+            .fuse();
             let application = application_rx.next().fuse();
-            let timer = ::compio::time::sleep(timer_delay).fuse();
-            futures_util::pin_mut!(cancel, control, application, timer);
+            let timer_wait = timer
+                .wait_until(compio_timer_deadline(
+                    epoch,
+                    heartbeat_deadline,
+                    close_deadline,
+                ))
+                .fuse();
+            futures_util::pin_mut!(cancel, control, application, timer_wait);
+            // Deadlines already expired at loop entry were handled above. Keep
+            // ready application work ahead of a still-pending timer.
             futures_util::select_biased! {
                 _ = cancel => CompioDriverWake::Cancel,
                 request = control => CompioDriverWake::Control(request),
                 request = application => CompioDriverWake::Application(request),
-                _ = timer => CompioDriverWake::Timer,
+                _ = timer_wait => CompioDriverWake::Timer,
             }
         };
 
         match wake {
-            CompioDriverWake::Cancel => {
-                compio_terminate(&shared, &terminal_tx, CompioTerminalCause::ConnectionClosed);
-                break;
-            }
-            CompioDriverWake::Control(None) => {
-                compio_terminate(&shared, &terminal_tx, CompioTerminalCause::ConnectionClosed);
-                break;
+            CompioDriverWake::Cancel
+            | CompioDriverWake::Control(None)
+            | CompioDriverWake::Application(None) => {
+                break CompioTerminalCause::ConnectionClosed;
             }
             CompioDriverWake::Control(Some(request)) => match request {
                 ControlRequest::Pong(payload, received_at) => {
@@ -2136,47 +2165,48 @@ async fn compio_split_writer_driver<W, E>(
                     heartbeat.on_inbound(received_ms, None);
                     write_buf.clear();
                     encoder.encode_pong(&payload, &mut write_buf);
-                    if compio_cancellable_flush(&mut writer, &mut write_buf, &mut cancel_rx)
-                        .await
-                        .is_err()
+                    if let Err(error) = await_compio_write(
+                        flush_bytes(&mut writer, &mut write_buf),
+                        &mut heartbeat,
+                        CompioWriteChannels {
+                            control: &mut control_rx,
+                            deferred: &mut deferred_control,
+                            cancel: &mut cancel_rx,
+                        },
+                        &shared,
+                        &mut closing,
+                        &mut timer,
+                        &mut last_synced_inbound_ms,
+                    )
+                    .await
                     {
-                        compio_terminate(
-                            &shared,
-                            &terminal_tx,
-                            CompioTerminalCause::ConnectionClosed,
-                        );
-                        break;
+                        break CompioTerminalCause::from_error(&error);
                     }
                 }
                 ControlRequest::PeerClose => {
                     heartbeat.stop();
+                    let deadline = closing.begin();
                     if !local_close_sent {
                         write_buf.clear();
                         encoder.encode_close_response(&mut write_buf);
-                        let _ = ::compio::time::timeout(
-                            Duration::from_secs(config.close_timeout.into()),
-                            flush_bytes(&mut writer, &mut write_buf),
+                        compio_bounded_flush(
+                            &mut writer,
+                            &mut write_buf,
+                            deadline.saturating_duration_since(Instant::now()),
                         )
                         .await;
                     }
-                    compio_terminate(&shared, &terminal_tx, CompioTerminalCause::ConnectionClosed);
-                    break;
+                    break CompioTerminalCause::ConnectionClosed;
                 }
                 ControlRequest::ReadError => {
                     heartbeat.stop();
-                    compio_terminate(&shared, &terminal_tx, CompioTerminalCause::ConnectionClosed);
-                    break;
+                    break CompioTerminalCause::ConnectionClosed;
                 }
                 ControlRequest::Eof => {
                     heartbeat.stop();
-                    compio_terminate(&shared, &terminal_tx, CompioTerminalCause::ConnectionClosed);
-                    break;
+                    break CompioTerminalCause::ConnectionClosed;
                 }
             },
-            CompioDriverWake::Application(None) => {
-                compio_terminate(&shared, &terminal_tx, CompioTerminalCause::ConnectionClosed);
-                break;
-            }
             CompioDriverWake::Application(Some(request)) => match request {
                 ApplicationRequest::Send(message, completion) => {
                     if !shared.is_open() {
@@ -2188,58 +2218,73 @@ async fn compio_split_writer_driver<W, E>(
                         shared.begin_closing();
                         heartbeat.stop();
                         local_close_sent = true;
+                        closing.begin();
                     }
                     write_buf.clear();
                     let result = match encoder.encode_message(&message, &mut write_buf) {
                         Ok(()) => {
-                            compio_cancellable_flush(&mut writer, &mut write_buf, &mut cancel_rx)
-                                .await
+                            await_compio_write(
+                                flush_bytes(&mut writer, &mut write_buf),
+                                &mut heartbeat,
+                                CompioWriteChannels {
+                                    control: &mut control_rx,
+                                    deferred: &mut deferred_control,
+                                    cancel: &mut cancel_rx,
+                                },
+                                &shared,
+                                &mut closing,
+                                &mut timer,
+                                &mut last_synced_inbound_ms,
+                            )
+                            .await
                         }
                         Err(error) => Err(error),
                     };
-                    let failed = result.is_err();
-                    let _ = completion.send(result);
-                    if failed {
-                        compio_terminate(
-                            &shared,
-                            &terminal_tx,
-                            CompioTerminalCause::ConnectionClosed,
-                        );
-                        break;
+                    if let Err(error) = result {
+                        let cause = CompioTerminalCause::from_error(&error);
+                        failed_request = Some((completion, error));
+                        break cause;
                     }
-                    if is_close {
-                        closing_deadline =
-                            Some(Instant::now() + Duration::from_secs(config.close_timeout.into()));
-                    }
+                    let _ = completion.send(Ok(()));
                 }
                 ApplicationRequest::Flush(completion) => {
                     write_buf.clear();
-                    let result =
-                        compio_cancellable_flush(&mut writer, &mut write_buf, &mut cancel_rx).await;
-                    let failed = result.is_err();
-                    let _ = completion.send(result);
-                    if failed {
-                        compio_terminate(
-                            &shared,
-                            &terminal_tx,
-                            CompioTerminalCause::ConnectionClosed,
-                        );
-                        break;
+                    let result = await_compio_write(
+                        flush_bytes(&mut writer, &mut write_buf),
+                        &mut heartbeat,
+                        CompioWriteChannels {
+                            control: &mut control_rx,
+                            deferred: &mut deferred_control,
+                            cancel: &mut cancel_rx,
+                        },
+                        &shared,
+                        &mut closing,
+                        &mut timer,
+                        &mut last_synced_inbound_ms,
+                    )
+                    .await;
+                    if let Err(error) = result {
+                        let cause = CompioTerminalCause::from_error(&error);
+                        failed_request = Some((completion, error));
+                        break cause;
                     }
+                    let _ = completion.send(Ok(()));
                 }
             },
             CompioDriverWake::Timer => {
+                if closing
+                    .deadline
+                    .is_some_and(|deadline| deadline <= Instant::now())
+                {
+                    break CompioTerminalCause::ConnectionClosed;
+                }
+
                 // The reader can publish activity while the old timer is asleep.
                 let observed_inbound = shared.last_inbound_ms.get();
                 if observed_inbound > last_synced_inbound_ms {
                     last_synced_inbound_ms = observed_inbound;
                     heartbeat.on_inbound(observed_inbound, None);
                 }
-                if closing_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
-                    compio_terminate(&shared, &terminal_tx, CompioTerminalCause::ConnectionClosed);
-                    break;
-                }
-
                 let now_ms = epoch.elapsed().as_millis() as u64;
                 match heartbeat.next_deadline() {
                     Some(Deadline::Ping(at)) if at <= now_ms => {
@@ -2247,21 +2292,25 @@ async fn compio_split_writer_driver<W, E>(
                             write_buf.clear();
                             let result =
                                 encoder.encode_message(&Message::Ping(payload), &mut write_buf);
-                            if result.is_err()
-                                || compio_cancellable_flush(
-                                    &mut writer,
-                                    &mut write_buf,
-                                    &mut cancel_rx,
-                                )
-                                .await
-                                .is_err()
+                            if let Err(error) = result {
+                                break CompioTerminalCause::from_error(&error);
+                            }
+                            if let Err(error) = await_compio_write(
+                                flush_bytes(&mut writer, &mut write_buf),
+                                &mut heartbeat,
+                                CompioWriteChannels {
+                                    control: &mut control_rx,
+                                    deferred: &mut deferred_control,
+                                    cancel: &mut cancel_rx,
+                                },
+                                &shared,
+                                &mut closing,
+                                &mut timer,
+                                &mut last_synced_inbound_ms,
+                            )
+                            .await
                             {
-                                compio_terminate(
-                                    &shared,
-                                    &terminal_tx,
-                                    CompioTerminalCause::ConnectionClosed,
-                                );
-                                break;
+                                break CompioTerminalCause::from_error(&error);
                             }
                             heartbeat.ping_flushed(epoch.elapsed().as_millis() as u64);
                         }
@@ -2275,12 +2324,7 @@ async fn compio_split_writer_driver<W, E>(
                             &config.pong_timeout_close_reason,
                         )
                         .await;
-                        compio_terminate(
-                            &shared,
-                            &terminal_tx,
-                            CompioTerminalCause::HeartbeatTimeout,
-                        );
-                        break;
+                        break CompioTerminalCause::HeartbeatTimeout;
                     }
                     Some(Deadline::Idle(at)) if at <= now_ms => {
                         compio_timeout_close(
@@ -2291,40 +2335,198 @@ async fn compio_split_writer_driver<W, E>(
                             "Connection idle timeout",
                         )
                         .await;
-                        compio_terminate(&shared, &terminal_tx, CompioTerminalCause::IdleTimeout);
-                        break;
+                        break CompioTerminalCause::IdleTimeout;
                     }
                     _ => {}
                 }
             }
         }
+    };
+
+    // Dropping a Compio write future can leave an owned kernel operation in
+    // flight. Release the writer before either handle observes termination.
+    shared.begin_closing();
+    drop(writer);
+    shared.terminate(cause);
+    let _ = terminal_tx.unbounded_send(cause);
+    if let Some((completion, error)) = failed_request {
+        let _ = completion.send(Err(error));
     }
 }
 
-async fn compio_cancellable_flush<W>(
-    writer: &mut W,
-    buf: &mut BytesMut,
-    cancel_rx: &mut mpsc::UnboundedReceiver<()>,
-) -> Result<()>
+// One budget covers finishing an in-progress frame and a peer Close response.
+struct CompioClosing {
+    deadline: Option<Instant>,
+    timeout: Duration,
+}
+
+impl CompioClosing {
+    fn begin(&mut self) -> Instant {
+        *self
+            .deadline
+            .get_or_insert_with(|| Instant::now() + self.timeout)
+    }
+}
+
+#[derive(Default)]
+struct CompioDriverTimer {
+    deadline: Option<Instant>,
+    sleep: Option<Pin<Box<dyn Future<Output = ()>>>>,
+}
+
+impl CompioDriverTimer {
+    async fn wait_until(&mut self, deadline: Option<Instant>) {
+        // Compio sleeps cannot be reset. Retain the current one until its
+        // target changes instead of inserting and removing it for every poll.
+        if self.deadline != deadline {
+            self.deadline = deadline;
+            self.sleep =
+                deadline.map(|deadline| Box::pin(::compio::time::sleep_until(deadline)) as _);
+        }
+        std::future::poll_fn(|cx| match self.sleep.as_mut() {
+            Some(sleep) => sleep.as_mut().poll(cx),
+            None => std::task::Poll::Pending,
+        })
+        .await;
+        self.deadline = None;
+        self.sleep = None;
+    }
+}
+
+fn compio_timer_deadline(
+    epoch: Instant,
+    heartbeat: Option<Deadline>,
+    closing: Option<Instant>,
+) -> Option<Instant> {
+    let heartbeat = heartbeat.map(|deadline| epoch + Duration::from_millis(deadline.at()));
+    match (heartbeat, closing) {
+        (Some(heartbeat), Some(closing)) => Some(heartbeat.min(closing)),
+        (Some(heartbeat), None) => Some(heartbeat),
+        (None, Some(closing)) => Some(closing),
+        (None, None) => None,
+    }
+}
+
+// Keep the same owned write alive across controls and timer wakes. Restarting
+// write_all after a partial write would duplicate bytes in the current frame.
+struct CompioWriteChannels<'a> {
+    control: &'a mut mpsc::Receiver<ControlRequest>,
+    deferred: &'a mut Option<ControlRequest>,
+    cancel: &'a mut mpsc::UnboundedReceiver<()>,
+}
+
+async fn await_compio_write(
+    write: impl Future<Output = Result<()>>,
+    heartbeat: &mut Heartbeat,
+    channels: CompioWriteChannels<'_>,
+    shared: &CompioSplitShared,
+    closing: &mut CompioClosing,
+    timer: &mut CompioDriverTimer,
+    last_synced_inbound_ms: &mut u64,
+) -> Result<()> {
+    let CompioWriteChannels {
+        control,
+        deferred,
+        cancel,
+    } = channels;
+    let write = write.fuse();
+    futures_util::pin_mut!(write);
+    loop {
+        let observed_inbound = shared.last_inbound_ms.get();
+        if observed_inbound > *last_synced_inbound_ms {
+            *last_synced_inbound_ms = observed_inbound;
+            heartbeat.on_inbound(observed_inbound, None);
+        }
+
+        let deadline = heartbeat.next_hard_deadline();
+        let close_at = closing.deadline;
+        let can_read_control = !matches!(
+            deferred,
+            Some(ControlRequest::PeerClose | ControlRequest::ReadError)
+        );
+        let control = async {
+            if can_read_control {
+                control.next().await
+            } else {
+                std::future::pending().await
+            }
+        }
+        .fuse();
+        let cancel = cancel.next().fuse();
+        let timer_wait = timer
+            .wait_until(compio_timer_deadline(shared.epoch, deadline, close_at))
+            .fuse();
+        futures_util::pin_mut!(control, cancel, timer_wait);
+        // An immediately writable frame wins without polling any interrupt
+        // source. A Pending write still observes all of them in this turn.
+        futures_util::select_biased! {
+            result = write => return result,
+            _ = cancel => return Err(Error::ConnectionClosed),
+            request = control => match request {
+                Some(ControlRequest::Pong(payload, received_at)) => {
+                    let received_ms = received_at
+                        .saturating_duration_since(shared.epoch)
+                        .as_millis() as u64;
+                    heartbeat.on_inbound(received_ms, Some(&payload));
+                }
+                Some(ControlRequest::PeerPing(payload, received_at)) => {
+                    let received_ms = received_at
+                        .saturating_duration_since(shared.epoch)
+                        .as_millis() as u64;
+                    heartbeat.on_inbound(received_ms, None);
+                    // RFC 6455 permits replying only to the latest queued Ping.
+                    // Defer it until the current frame is complete.
+                    *deferred = Some(ControlRequest::PeerPing(payload, received_at));
+                }
+                Some(ControlRequest::PeerClose) => {
+                    heartbeat.stop();
+                    closing.begin();
+                    *deferred = Some(ControlRequest::PeerClose);
+                }
+                Some(ControlRequest::ReadError) => {
+                    heartbeat.stop();
+                    closing.begin();
+                    *deferred = Some(ControlRequest::ReadError);
+                }
+                Some(ControlRequest::Eof) | None => return Err(Error::ConnectionClosed),
+            },
+            _ = timer_wait => {
+                if close_at.is_some_and(|at| Instant::now() >= at) {
+                    return Err(Error::ConnectionClosed);
+                }
+                let observed_inbound = shared.last_inbound_ms.get();
+                if observed_inbound > *last_synced_inbound_ms {
+                    *last_synced_inbound_ms = observed_inbound;
+                    heartbeat.on_inbound(observed_inbound, None);
+                }
+                let now_ms = shared.epoch.elapsed().as_millis() as u64;
+                match heartbeat.next_hard_deadline() {
+                    Some(Deadline::Pong(at)) if at <= now_ms => {
+                        return Err(Error::HeartbeatTimeout);
+                    }
+                    Some(Deadline::Idle(at)) if at <= now_ms => {
+                        return Err(Error::IdleTimeout);
+                    }
+                    _ => {}
+                }
+            },
+        }
+    }
+}
+
+async fn compio_bounded_flush<W>(writer: &mut W, buf: &mut BytesMut, timeout: Duration)
 where
     W: AsyncWrite,
 {
-    let write = flush_bytes(writer, buf).fuse();
-    let cancel = cancel_rx.next().fuse();
-    futures_util::pin_mut!(write, cancel);
-    match futures_util::future::select(write, cancel).await {
-        futures_util::future::Either::Left((result, _)) => result,
-        futures_util::future::Either::Right((_, _)) => Err(Error::ConnectionClosed),
+    let flush = flush_bytes(writer, buf).fuse();
+    let timer = ::compio::time::sleep(timeout).fuse();
+    futures_util::pin_mut!(flush, timer);
+    // Give an immediately writable Close one attempt even when the budget is
+    // zero; a Pending flush then yields to the timer in the same poll.
+    futures_util::select_biased! {
+        _ = flush => {}
+        _ = timer => {}
     }
-}
-
-fn compio_terminate(
-    shared: &CompioSplitShared,
-    terminal_tx: &mpsc::UnboundedSender<CompioTerminalCause>,
-    cause: CompioTerminalCause,
-) {
-    shared.terminate(cause);
-    let _ = terminal_tx.unbounded_send(cause);
 }
 
 async fn compio_timeout_close<W, E>(
@@ -2340,9 +2542,10 @@ async fn compio_timeout_close<W, E>(
     let mut buf = BytesMut::with_capacity(128);
     let close = Message::Close(Some(CloseReason::new(code, bounded_close_reason(reason))));
     if encoder.encode_message(&close, &mut buf).is_ok() {
-        let _ = ::compio::time::timeout(
+        compio_bounded_flush(
+            writer,
+            &mut buf,
             Duration::from_secs(config.close_timeout.into()),
-            flush_bytes(writer, &mut buf),
         )
         .await;
     }
@@ -2852,6 +3055,9 @@ pub struct CompioCompressedSplitReader<R> {
 }
 
 /// Write half of a split compressed Compio WebSocket stream.
+///
+/// Pending sends and flushes use the same deadline and transport-release
+/// contract as [`CompioSplitWriter`].
 #[cfg(feature = "permessage-deflate")]
 pub struct CompioCompressedSplitWriter<W> {
     application_tx: mpsc::Sender<ApplicationRequest>,
