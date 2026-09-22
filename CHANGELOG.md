@@ -43,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Shared compression contexts now reuse role-aware encoder pools instead of allocating four encoders per connection while preserving connection-local decoders. Client contexts honor `client_max_window_bits`.
 - Compio split writers now keep hard idle/Pong and closing deadlines active while a transport write is pending. EOF aborts immediately, while peer Close and parse errors allow the existing write to finish within `close_timeout`; with `close_timeout = 0`, an immediately writable Close still gets one best-effort poll. A send-only connection that receives no inbound frames now reliably reaches the configured idle timeout (120 seconds by default).
 - UTF-8 validation no longer rejects valid multi-byte characters that cross internal SIMD block boundaries on SSE2-only x86 or nightly LoongArch64, PowerPC, and s390x paths; complete inputs now use `simdutf8` and its portable fallback where no dedicated backend exists.
 
