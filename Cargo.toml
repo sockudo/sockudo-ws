@@ -129,7 +129,7 @@ tokio = { version = "^1.48", default-features = false, optional = true }
 tokio-util = { version = "^0.7", default-features = false, optional = true }
 
 # Compio completion-based async runtime
-compio = { version = "^0.18", default-features = false, features = ["net", "macros", "bytes", "sync", "time"], optional = true }
+compio = { version = "^0.19", default-features = false, features = ["net", "macros", "bytes", "sync", "time"], optional = true }
 
 # Fast synchronization primitives for pub/sub
 parking_lot = "^0.12"
