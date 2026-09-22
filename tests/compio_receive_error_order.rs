@@ -1,6 +1,6 @@
 #![cfg(feature = "compio-runtime")]
 
-use compio::io::{AsyncReadExt, AsyncWriteExt};
+use compio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use compio::net::{TcpListener, TcpStream};
 use sockudo_ws::{CompioWebSocketStream, Config, Error};
 
@@ -148,13 +148,13 @@ macro_rules! unified_close_cases {
                 assert!(stream.next().await.unwrap().unwrap().is_close());
                 assert!(stream.next().await.is_none());
 
-                assert!(
-                    compio::time::timeout(
-                        std::time::Duration::from_millis(50),
-                        peer.read_exact(vec![0; 1]),
-                    )
-                    .await
-                    .is_err(),
+                let result =
+                    compio::time::timeout(std::time::Duration::from_secs(1), peer.read(vec![0; 1]))
+                        .await
+                        .expect("explicit Close must end the write half");
+                assert_eq!(
+                    result.0.unwrap(),
+                    0,
                     "the peer Close must not trigger a second local Close"
                 );
             }

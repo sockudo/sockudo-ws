@@ -124,13 +124,12 @@ macro_rules! unified_close_cases {
                 assert!(stream.next().await.is_none());
 
                 let mut extra = [0; 1];
-                assert!(
-                    tokio::time::timeout(
-                        std::time::Duration::from_millis(50),
-                        peer.read(&mut extra),
-                    )
-                    .await
-                    .is_err(),
+                assert_eq!(
+                    tokio::time::timeout(std::time::Duration::from_secs(1), peer.read(&mut extra))
+                        .await
+                        .expect("explicit Close must end the write half")
+                        .unwrap(),
+                    0,
                     "the peer Close must not trigger a second local Close"
                 );
             }
