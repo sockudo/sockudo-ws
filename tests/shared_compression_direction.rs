@@ -22,15 +22,16 @@ fn shared_client_encoder_uses_the_client_window() {
         })
         .collect();
     let payload = [prefix.as_slice(), prefix.as_slice(), &[b'a'; 8192]].concat();
-    let mut expected = DeflateEncoder::new(
+    let mut reference_encoder = DeflateEncoder::new(
         sockudo_ws::DeflateWindowBits::Bits10,
         true,
         config.compression_level,
         0,
     );
-    let expected = expected.compress(&payload).unwrap();
+    let expected_compressed = reference_encoder.compress(&payload).unwrap();
     let pool = Arc::new(SharedCompressorPool::new(config));
     let mut client = CompressionContext::with_shared_pool(pool, false);
 
-    assert!(client.compress(&payload).unwrap() == expected);
+    // Avoid dumping multi-kilobyte compressed buffers if this assertion fails.
+    assert!(client.compress(&payload).unwrap() == expected_compressed);
 }

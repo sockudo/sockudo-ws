@@ -6,8 +6,7 @@
 //! - **Shared**: Connections share a pool of compressors
 //! - **Window sizes**: Various window sizes for memory/compression tradeoffs
 
-use std::collections::HashMap;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -38,7 +37,7 @@ impl CompressionContext {
     pub fn server(mode: Compression) -> Self {
         match mode.to_deflate_config() {
             None => Self::Disabled,
-            Some(config) if mode.is_shared() => Self::server_with_config(config, true),
+            Some(_) if mode.is_shared() => Self::with_shared_pool(global_shared_pool(), true),
             Some(config) => Self::Dedicated(DeflateContext::server(config)),
         }
     }
@@ -47,28 +46,15 @@ impl CompressionContext {
     pub fn client(mode: Compression) -> Self {
         match mode.to_deflate_config() {
             None => Self::Disabled,
-            Some(config) if mode.is_shared() => Self::client_with_config(config, true),
+            Some(_) if mode.is_shared() => Self::with_shared_pool(global_shared_pool(), false),
             Some(config) => Self::Dedicated(DeflateContext::client(config)),
         }
     }
 
-    pub(crate) fn server_with_config(config: DeflateConfig, shared: bool) -> Self {
-        if shared {
-            return Self::with_shared_pool(shared_pool_for_config(&config), true);
-        }
-
-        Self::Dedicated(DeflateContext::server(config))
-    }
-
-    pub(crate) fn client_with_config(config: DeflateConfig, shared: bool) -> Self {
-        if shared {
-            return Self::with_shared_pool(shared_pool_for_config(&config), false);
-        }
-
-        Self::Dedicated(DeflateContext::client(config))
-    }
-
-    /// Create a shared context that uses an existing pool
+    /// Create a shared context that uses an existing pool.
+    ///
+    /// The context stores a role-specific handle to the pool's encoder sets,
+    /// rather than retaining the supplied [`Arc`] itself.
     pub fn with_shared_pool(pool: Arc<SharedCompressorPool>, is_server: bool) -> Self {
         let config = pool.config().clone();
         let decoder = if is_server {
@@ -155,6 +141,7 @@ impl SharedEncoderPool {
             .map(|_| {
                 Mutex::new(DeflateEncoder::new(
                     window_bits,
+                    // Reset between messages because pool users can be different connections.
                     true,
                     config.compression_level,
                     config.compression_threshold,
@@ -174,14 +161,7 @@ impl SharedEncoderPool {
             .next_encoder
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             % SHARED_POOL_SIZE;
-        let mut encoder = self.encoders[index].lock();
-        let result = encoder.compress(data);
-        // A failed shared encoder must not expose its pending bytes or history
-        // to the next connection that acquires this slot.
-        if result.is_err() {
-            encoder.reset();
-        }
-        result
+        self.encoders[index].lock().compress(data)
     }
 }
 
@@ -193,6 +173,10 @@ struct SharedCompressorPoolInner {
 }
 
 /// Shared server and client encoder pools selected by the sending role.
+///
+/// Contexts share four synchronous encoder instances per distinct role window,
+/// reducing encoder memory at the cost of possible contention. Compression runs
+/// on the caller thread and waits synchronously when the selected slot is busy.
 pub struct SharedCompressorPool {
     inner: Arc<SharedCompressorPoolInner>,
     is_server: bool,
@@ -204,8 +188,6 @@ impl SharedCompressorPool {
     /// [`CompressionContext::with_shared_pool`] selects the matching sending
     /// direction when the pool is attached to a client context.
     pub fn new(config: DeflateConfig) -> Self {
-        // Shared encoders must reset between messages because successive uses
-        // can belong to different connections.
         let server = Arc::new(SharedEncoderPool::new(
             &config,
             config.server_max_window_bits,
@@ -258,9 +240,6 @@ impl SharedCompressorPool {
 /// all connections using `Compression::Shared`. Compression runs on the caller
 /// thread and waits synchronously when the selected encoder slot is busy.
 static GLOBAL_POOL: std::sync::OnceLock<Arc<SharedCompressorPool>> = std::sync::OnceLock::new();
-static CONFIGURED_POOLS: std::sync::OnceLock<
-    Mutex<HashMap<DeflateConfig, Weak<SharedCompressorPoolInner>>>,
-> = std::sync::OnceLock::new();
 
 /// Get the global shared compressor pool
 pub fn global_shared_pool() -> Arc<SharedCompressorPool> {
@@ -272,30 +251,6 @@ pub fn global_shared_pool() -> Arc<SharedCompressorPool> {
             Arc::new(SharedCompressorPool::new(config))
         })
         .clone()
-}
-
-fn shared_pool_for_config(config: &DeflateConfig) -> Arc<SharedCompressorPool> {
-    let default_config = Compression::Shared
-        .to_deflate_config()
-        .expect("shared compression has a deflate configuration");
-    if config == &default_config {
-        return global_shared_pool();
-    }
-
-    let mut pools = CONFIGURED_POOLS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock();
-    pools.retain(|_, inner| inner.strong_count() != 0);
-    if let Some(inner) = pools.get(config).and_then(Weak::upgrade) {
-        return Arc::new(SharedCompressorPool {
-            inner,
-            is_server: true,
-        });
-    }
-
-    let pool = Arc::new(SharedCompressorPool::new(config.clone()));
-    pools.insert(config.clone(), Arc::downgrade(&pool.inner));
-    pool
 }
 
 #[cfg(test)]
@@ -380,46 +335,6 @@ mod tests {
         assert!(Arc::ptr_eq(
             &server_one.inner.server,
             &server_one.inner.client
-        ));
-    }
-
-    #[test]
-    fn asymmetric_shared_contexts_use_role_specific_encoders() {
-        let config = DeflateConfig {
-            server_max_window_bits: DeflateWindowBits::Bits15,
-            client_max_window_bits: DeflateWindowBits::Bits10,
-            server_no_context_takeover: true,
-            client_no_context_takeover: true,
-            compression_level: 6,
-            compression_threshold: 16,
-        };
-        let mut server = CompressionContext::server_with_config(config.clone(), true);
-        let mut client = CompressionContext::client_with_config(config, true);
-        let data = b"role-specific shared compression payload ".repeat(32);
-
-        let server_compressed = server.compress(&data).unwrap().unwrap();
-        let from_server = client.decompress(&server_compressed, 1024 * 1024).unwrap();
-        let client_compressed = client.compress(&data).unwrap().unwrap();
-        let from_client = server.decompress(&client_compressed, 1024 * 1024).unwrap();
-
-        assert_eq!(from_server.as_ref(), data.as_slice());
-        assert_eq!(from_client.as_ref(), data.as_slice());
-        let CompressionContext::Shared {
-            pool: server_pool, ..
-        } = server
-        else {
-            panic!("server context must be shared");
-        };
-        let CompressionContext::Shared {
-            pool: client_pool, ..
-        } = client
-        else {
-            panic!("client context must be shared");
-        };
-        assert!(Arc::ptr_eq(&server_pool.inner, &client_pool.inner));
-        assert!(!Arc::ptr_eq(
-            &server_pool.inner.server,
-            &server_pool.inner.client
         ));
     }
 
