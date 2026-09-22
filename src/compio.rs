@@ -2372,24 +2372,47 @@ impl CompioClosing {
 struct CompioDriverTimer {
     deadline: Option<Instant>,
     sleep: Option<Pin<Box<dyn Future<Output = ()>>>>,
+    registered_waker: Option<std::task::Waker>,
 }
 
 impl CompioDriverTimer {
     async fn wait_until(&mut self, deadline: Option<Instant>) {
         // Compio sleeps cannot be reset. Retain the current one until its
-        // target changes instead of inserting and removing it for every poll.
+        // target changes, and avoid polling its timer wheel again while the
+        // same task waker remains registered.
         if self.deadline != deadline {
             self.deadline = deadline;
             self.sleep =
                 deadline.map(|deadline| Box::pin(::compio::time::sleep_until(deadline)) as _);
+            self.registered_waker = None;
         }
-        std::future::poll_fn(|cx| match self.sleep.as_mut() {
-            Some(sleep) => sleep.as_mut().poll(cx),
-            None => std::task::Poll::Pending,
+        std::future::poll_fn(|cx| {
+            if self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                return std::task::Poll::Ready(());
+            }
+            if self
+                .registered_waker
+                .as_ref()
+                .is_some_and(|waker| waker.will_wake(cx.waker()))
+            {
+                return std::task::Poll::Pending;
+            }
+            let Some(sleep) = self.sleep.as_mut() else {
+                return std::task::Poll::Pending;
+            };
+            let poll = sleep.as_mut().poll(cx);
+            if poll.is_pending() {
+                self.registered_waker = Some(cx.waker().clone());
+            }
+            poll
         })
         .await;
         self.deadline = None;
         self.sleep = None;
+        self.registered_waker = None;
     }
 }
 
