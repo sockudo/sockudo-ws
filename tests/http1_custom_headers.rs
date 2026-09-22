@@ -3,6 +3,7 @@
 mod support;
 
 use futures_util::StreamExt;
+use rstest::rstest;
 use sockudo_ws::{Config, Error, Http1, Message};
 use sockudo_ws::{
     client::WebSocketClient,
@@ -59,74 +60,71 @@ fn http1_request_accepts_horizontal_tabs_and_obs_text_values() {
     );
 }
 
-#[test]
-fn http1_request_rejects_reserved_handshake_headers() {
-    for name in [
-        "Host",
-        "UPGRADE",
-        "Connection",
-        "Sec-WebSocket-Key",
-        "Sec-WebSocket-Version",
-        "Sec-WebSocket-Protocol",
-        "Sec-WebSocket-Extensions",
-    ] {
-        let headers = vec![(name.to_string(), "value".to_string())];
-        let error = build_request_with_headers(
-            "example.com",
-            "/ws",
-            "dGhlIHNhbXBsZSBub25jZQ==",
-            None,
-            None,
-            Some(&headers),
-        )
-        .unwrap_err();
+#[rstest]
+#[case::host("Host")]
+#[case::upgrade("UPGRADE")]
+#[case::connection("Connection")]
+#[case::key("Sec-WebSocket-Key")]
+#[case::version("Sec-WebSocket-Version")]
+#[case::protocol("Sec-WebSocket-Protocol")]
+#[case::extensions("Sec-WebSocket-Extensions")]
+fn http1_request_rejects_reserved_handshake_headers(#[case] name: &str) {
+    let headers = vec![(name.to_string(), "value".to_string())];
+    let error = build_request_with_headers(
+        "example.com",
+        "/ws",
+        "dGhlIHNhbXBsZSBub25jZQ==",
+        None,
+        None,
+        Some(&headers),
+    )
+    .unwrap_err();
 
-        assert!(matches!(
-            error,
-            Error::InvalidHttp("reserved handshake header")
-        ));
-    }
+    assert!(matches!(
+        error,
+        Error::InvalidHttp("reserved handshake header")
+    ));
 }
 
-#[test]
-fn http1_request_rejects_invalid_header_names() {
-    for name in ["", "bad header", "x:test", "x\r\ninjected", "ümlaut"] {
-        let headers = vec![(name.to_string(), "value".to_string())];
-        let error = build_request_with_headers(
-            "example.com",
-            "/ws",
-            "dGhlIHNhbXBsZSBub25jZQ==",
-            None,
-            None,
-            Some(&headers),
-        )
-        .unwrap_err();
+#[rstest]
+#[case::empty("")]
+#[case::space("bad header")]
+#[case::colon("x:test")]
+#[case::line_break("x\r\ninjected")]
+#[case::non_ascii("ümlaut")]
+fn http1_request_rejects_invalid_header_names(#[case] name: &str) {
+    let headers = vec![(name.to_string(), "value".to_string())];
+    let error = build_request_with_headers(
+        "example.com",
+        "/ws",
+        "dGhlIHNhbXBsZSBub25jZQ==",
+        None,
+        None,
+        Some(&headers),
+    )
+    .unwrap_err();
 
-        assert!(matches!(error, Error::InvalidHttp("invalid header name")));
-    }
+    assert!(matches!(error, Error::InvalidHttp("invalid header name")));
 }
 
-#[test]
-fn http1_request_rejects_invalid_header_values() {
-    for value in [
-        "value\r\nInjected: true",
-        "value\0suffix",
-        "value\u{1f}suffix",
-        "value\u{7f}suffix",
-    ] {
-        let headers = vec![("X-Test".to_string(), value.to_string())];
-        let error = build_request_with_headers(
-            "example.com",
-            "/ws",
-            "dGhlIHNhbXBsZSBub25jZQ==",
-            None,
-            None,
-            Some(&headers),
-        )
-        .unwrap_err();
+#[rstest]
+#[case::line_break("value\r\nInjected: true")]
+#[case::nul("value\0suffix")]
+#[case::unit_separator("value\u{1f}suffix")]
+#[case::delete("value\u{7f}suffix")]
+fn http1_request_rejects_invalid_header_values(#[case] value: &str) {
+    let headers = vec![("X-Test".to_string(), value.to_string())];
+    let error = build_request_with_headers(
+        "example.com",
+        "/ws",
+        "dGhlIHNhbXBsZSBub25jZQ==",
+        None,
+        None,
+        Some(&headers),
+    )
+    .unwrap_err();
 
-        assert!(matches!(error, Error::InvalidHttp("invalid header value")));
-    }
+    assert!(matches!(error, Error::InvalidHttp("invalid header value")));
 }
 
 #[tokio::test]

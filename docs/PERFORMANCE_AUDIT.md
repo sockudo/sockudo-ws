@@ -265,10 +265,10 @@ These are design-level and are listed so the next round has a target list.
 
 ```bash
 # primitives
-cargo bench --bench websocket_bench -- '^mask/|^utf8/'
+RUSTFLAGS="-C target-cpu=native" cargo bench --bench websocket_bench -- '^mask/|^utf8/'
 
 # Autobahn (Rust port of the suite)
-cargo build --release --bin autobahn-server && ./target/release/autobahn-server &
+RUSTFLAGS="-C target-cpu=native" cargo build --release --bin autobahn-server && ./target/release/autobahn-server &
 /path/to/autobahn-testsuite-rs/target/release/wstest -m fuzzingclient \
     -s autobahn/fuzzingclient.json --concurrency 8
 ```

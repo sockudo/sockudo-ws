@@ -1,4 +1,4 @@
-#[cfg(feature = "http3")]
+#[cfg(all(feature = "tokio-runtime", feature = "http3"))]
 mod h3_support {
     use std::sync::Once;
 

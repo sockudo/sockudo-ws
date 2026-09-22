@@ -1,5 +1,6 @@
 #![cfg(feature = "permessage-deflate")]
 
+use rstest::rstest;
 use sockudo_ws::Error;
 use sockudo_ws::deflate::{DeflateDecoder, DeflateEncoder};
 
@@ -150,25 +151,29 @@ fn decompression_rejects_output_over_limit_in_the_final_call() {
     assert!(matches!(result, Err(Error::MessageTooLarge)));
 }
 
-#[test]
-fn decompression_accepts_exact_limits_across_output_growth() {
-    for size in [0, 32, 1024, 1025, 5120, 65536] {
-        let payload = vec![b'A'; size];
-        let compressed = if size == 0 {
-            // An empty sync-flushed DEFLATE block with the four-byte trailer removed.
-            vec![0].into()
-        } else {
-            DeflateEncoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, true, 6, 0)
-                .compress(&payload)
-                .unwrap()
-                .unwrap()
-        };
-        let mut decoder = DeflateDecoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, true);
+#[rstest]
+#[case::empty(0)]
+#[case::bytes_32(32)]
+#[case::bytes_1024(1024)]
+#[case::bytes_1025(1025)]
+#[case::bytes_5120(5120)]
+#[case::bytes_65536(65536)]
+fn decompression_accepts_exact_limits_across_output_growth(#[case] size: usize) {
+    let payload = vec![b'A'; size];
+    let compressed = if size == 0 {
+        // An empty sync-flushed DEFLATE block with the four-byte trailer removed.
+        vec![0].into()
+    } else {
+        DeflateEncoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, true, 6, 0)
+            .compress(&payload)
+            .unwrap()
+            .unwrap()
+    };
+    let mut decoder = DeflateDecoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, true);
 
-        let result = decoder.decompress(&compressed, size).unwrap();
+    let result = decoder.decompress(&compressed, size).unwrap();
 
-        assert_eq!(result.as_ref(), payload);
-    }
+    assert_eq!(result.as_ref(), payload);
 }
 
 #[test]

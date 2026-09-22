@@ -1,3 +1,4 @@
+use rstest::rstest;
 use sockudo_ws::Error;
 use sockudo_ws::handshake::{build_request_with_headers, parse_request, parse_response};
 
@@ -48,84 +49,76 @@ fn parsers_accept_valid_optional_header_grammar() {
     assert!(parse_response(&response).unwrap().is_some());
 }
 
-#[test]
-fn request_parser_rejects_invalid_optional_header_grammar() {
-    for header in [
-        "Sec-WebSocket-Protocol: chat, invalid protocol",
-        "Sec-WebSocket-Protocol: chat,\u{00a0}superchat",
-        "Sec-WebSocket-Protocol: chat, chat",
-        "Sec-WebSocket-Protocol: , ,",
-        "Sec-WebSocket-Extensions: permessage-deflate; mode=\"fast mode\"",
-        "Sec-WebSocket-Extensions: permessage-deflate;\u{00a0}mode=fast",
-        "Sec-WebSocket-Extensions: permessage-deflate; mode=\"fast\\\"",
-        "Sec-WebSocket-Extensions: ; mode=fast",
-    ] {
-        assert!(
-            matches!(
-                parse_request(&request_with(header)),
-                Err(Error::HandshakeFailed(_))
-            ),
-            "unexpected result for {header}"
-        );
-    }
+#[rstest]
+#[case::protocol_with_space("Sec-WebSocket-Protocol: chat, invalid protocol")]
+#[case::protocol_with_non_ascii_whitespace("Sec-WebSocket-Protocol: chat,\u{00a0}superchat")]
+#[case::duplicate_protocol("Sec-WebSocket-Protocol: chat, chat")]
+#[case::empty_protocols("Sec-WebSocket-Protocol: , ,")]
+#[case::quoted_extension_with_space(
+    "Sec-WebSocket-Extensions: permessage-deflate; mode=\"fast mode\""
+)]
+#[case::extension_with_non_ascii_whitespace(
+    "Sec-WebSocket-Extensions: permessage-deflate;\u{00a0}mode=fast"
+)]
+#[case::extension_with_unclosed_quote(
+    "Sec-WebSocket-Extensions: permessage-deflate; mode=\"fast\\\""
+)]
+#[case::extension_without_name("Sec-WebSocket-Extensions: ; mode=fast")]
+fn request_parser_rejects_invalid_optional_header_grammar(#[case] header: &str) {
+    assert!(
+        matches!(
+            parse_request(&request_with(header)),
+            Err(Error::HandshakeFailed(_))
+        ),
+        "unexpected result for {header}"
+    );
 }
 
-#[test]
-fn response_parser_rejects_invalid_optional_header_grammar() {
-    for header in [
-        "Sec-WebSocket-Protocol: chat, superchat",
-        "Sec-WebSocket-Protocol: invalid protocol",
-        "Sec-WebSocket-Extensions: permessage-deflate; mode=\"fast mode\"",
-        "Sec-WebSocket-Extensions: permessage-deflate; =fast",
-    ] {
-        assert!(
-            matches!(
-                parse_response(&response_with(header)),
-                Err(Error::HandshakeFailed(_))
-            ),
-            "unexpected result for {header}"
-        );
-    }
+#[rstest]
+#[case::multiple_protocols("Sec-WebSocket-Protocol: chat, superchat")]
+#[case::protocol_with_space("Sec-WebSocket-Protocol: invalid protocol")]
+#[case::quoted_extension_with_space(
+    "Sec-WebSocket-Extensions: permessage-deflate; mode=\"fast mode\""
+)]
+#[case::extension_parameter_without_name("Sec-WebSocket-Extensions: permessage-deflate; =fast")]
+fn response_parser_rejects_invalid_optional_header_grammar(#[case] header: &str) {
+    assert!(
+        matches!(
+            parse_response(&response_with(header)),
+            Err(Error::HandshakeFailed(_))
+        ),
+        "unexpected result for {header}"
+    );
 }
 
-#[test]
-fn checked_request_builder_rejects_invalid_optional_header_grammar() {
-    for protocol in [
-        "chat, invalid protocol",
-        "chat,\u{00a0}superchat",
-        "chat, chat",
-        "chat,,superchat",
-        ", ,",
-    ] {
-        assert!(
-            matches!(
-                build_request_with_headers("example.com", "/chat", KEY, Some(protocol), None, None,),
-                Err(Error::InvalidHttp(_))
-            ),
-            "unexpected result for {protocol}"
-        );
-    }
+#[rstest]
+#[case::protocol_with_space("chat, invalid protocol")]
+#[case::protocol_with_non_ascii_whitespace("chat,\u{00a0}superchat")]
+#[case::duplicate_protocol("chat, chat")]
+#[case::empty_protocol_between_commas("chat,,superchat")]
+#[case::empty_protocols(", ,")]
+fn checked_request_builder_rejects_invalid_protocol_grammar(#[case] protocol: &str) {
+    assert!(
+        matches!(
+            build_request_with_headers("example.com", "/chat", KEY, Some(protocol), None, None,),
+            Err(Error::InvalidHttp(_))
+        ),
+        "unexpected result for {protocol}"
+    );
+}
 
-    for extensions in [
-        "permessage-deflate; mode=\"fast mode\"",
-        "permessage-deflate;\u{00a0}mode=fast",
-        "permessage-deflate,,x-example",
-    ] {
-        assert!(
-            matches!(
-                build_request_with_headers(
-                    "example.com",
-                    "/chat",
-                    KEY,
-                    None,
-                    Some(extensions),
-                    None,
-                ),
-                Err(Error::InvalidHttp(_))
-            ),
-            "unexpected result for {extensions}"
-        );
-    }
+#[rstest]
+#[case::quoted_value_with_space("permessage-deflate; mode=\"fast mode\"")]
+#[case::non_ascii_whitespace("permessage-deflate;\u{00a0}mode=fast")]
+#[case::empty_extension_between_commas("permessage-deflate,,x-example")]
+fn checked_request_builder_rejects_invalid_extension_grammar(#[case] extensions: &str) {
+    assert!(
+        matches!(
+            build_request_with_headers("example.com", "/chat", KEY, None, Some(extensions), None,),
+            Err(Error::InvalidHttp(_))
+        ),
+        "unexpected result for {extensions}"
+    );
 }
 
 #[test]
@@ -159,25 +152,19 @@ async fn default_tokio_server_round_trip(
 }
 
 #[cfg(feature = "tokio-runtime")]
+#[rstest]
+#[case::none_offered(None, None)]
+#[case::single_protocol(Some("chat"), Some("chat"))]
+#[case::selects_first_offered_protocol(Some("chat, superchat"), Some("chat"))]
 #[tokio::test]
-async fn default_tokio_server_omits_protocol_when_none_is_offered() {
-    assert_eq!(default_tokio_server_round_trip(None).await, (None, None));
-}
+async fn default_tokio_server_negotiates_expected_protocol(
+    #[case] offered: Option<&str>,
+    #[case] expected: Option<&str>,
+) {
+    let expected = expected.map(str::to_owned);
 
-#[cfg(feature = "tokio-runtime")]
-#[tokio::test]
-async fn default_tokio_server_preserves_single_protocol_negotiation() {
     assert_eq!(
-        default_tokio_server_round_trip(Some("chat")).await,
-        (Some("chat".to_owned()), Some("chat".to_owned()))
-    );
-}
-
-#[cfg(feature = "tokio-runtime")]
-#[tokio::test]
-async fn default_tokio_server_selects_the_first_offered_protocol() {
-    assert_eq!(
-        default_tokio_server_round_trip(Some("chat, superchat")).await,
-        (Some("chat".to_owned()), Some("chat".to_owned()))
+        default_tokio_server_round_trip(offered).await,
+        (expected.clone(), expected)
     );
 }

@@ -29,7 +29,7 @@ git clone https://github.com/nurmohammed840/web-socket-benchmark
 cd web-socket-benchmark
 
 # Add sockudo-ws to the benchmark suite, then run:
-cargo bench
+RUSTFLAGS="-C target-cpu=native" cargo bench
 ```
 
 The benchmark measures:
@@ -999,20 +999,26 @@ if let Message::Text(bytes) = msg {
 
 ## Running Tests
 
-### Unit Tests
+### Unit and Integration Tests
 
 ```bash
-cargo test
+cargo nextest run
+cargo test --doc
 ```
+
+Install [`cargo-nextest`](https://nexte.st/docs/installation/) before using these commands. Nextest runs each test as a separate process and reports parameterized cases independently; doctests remain a separate `cargo test --doc` target because nextest does not execute them.
+
+Nextest can run tests from different binaries concurrently, so integration tests must bind OS-assigned ports instead of fixed ports.
 
 ### With Features
 
 ```bash
-cargo test --features http2
-cargo test --features http3
-cargo test --no-default-features --features compio-runtime,http2
-cargo test --no-default-features --features compio-runtime,http3
-cargo test --features full
+cargo nextest run --features http2
+cargo nextest run --features http3
+cargo nextest run --features full
+cargo nextest run --all-features
+cargo nextest run --no-default-features --features tokio-runtime,http2,http3
+cargo nextest run --no-default-features --features compio-runtime,http2,http3
 ```
 
 ### End-to-End Transport Tests
@@ -1020,9 +1026,9 @@ cargo test --features full
 These tests bind real loopback TCP/QUIC endpoints and use the public runtime APIs for HTTP/2 and HTTP/3 WebSocket handshakes.
 
 ```bash
-cargo test --all-features --test e2e_runtime_transports
-cargo test --no-default-features --features tokio-runtime,http2,http3 --test e2e_runtime_transports
-cargo test --no-default-features --features compio-runtime,http2,http3 --test e2e_runtime_transports
+cargo nextest run --all-features --test e2e_runtime_transports
+cargo nextest run --no-default-features --features tokio-runtime,http2,http3 --test e2e_runtime_transports
+cargo nextest run --no-default-features --features compio-runtime,http2,http3 --test e2e_runtime_transports
 ```
 
 ### Autobahn Test Suite
@@ -1036,7 +1042,7 @@ for process management.
 make -C autobahn test
 ```
 
-The command builds both binaries, waits for the server, runs four cases at a
+The command builds both binaries, waits for the server, runs eight cases at a
 time, and stops the server on completion or failure. Reports and logs are saved
 in `autobahn/reports/`; open `index.html` for case details. A failing case or close
 handshake makes the command fail. Concurrent runs are for conformance checking;
