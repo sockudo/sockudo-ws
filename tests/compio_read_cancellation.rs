@@ -54,7 +54,7 @@ async fn unified_read_preserves_partial_payload_across_ping_deadline() {
 #[cfg(feature = "permessage-deflate")]
 #[compio::test]
 async fn compressed_unified_read_preserves_partial_payload_across_ping_deadline() {
-    use sockudo_ws::deflate::{DeflateConfig, DeflateEncoder};
+    use sockudo_ws::deflate::{DeflateConfig, DeflateEncoder, MAX_WINDOW_BITS};
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let stream = TcpStream::connect(listener.local_addr().unwrap())
@@ -68,7 +68,7 @@ async fn compressed_unified_read_preserves_partial_payload_across_ping_deadline(
         DeflateConfig::default(),
     );
     let payload = vec![b'A'; 1024];
-    let mut encoder = DeflateEncoder::new(15, false, 6, 0);
+    let mut encoder = DeflateEncoder::new(MAX_WINDOW_BITS, false, 6, 0);
     let compressed = encoder.compress(&payload).unwrap().unwrap();
     let mut frame = BytesMut::new();
     encode_frame_with_rsv(&mut frame, OpCode::Binary, &compressed, true, None, true);
