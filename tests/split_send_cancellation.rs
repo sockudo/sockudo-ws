@@ -2,6 +2,7 @@
 
 use std::task::Poll;
 
+#[cfg(feature = "permessage-deflate")]
 use bytes::Bytes;
 use futures_util::poll;
 use sockudo_ws::{Config, Error, Message, WebSocketStream};
