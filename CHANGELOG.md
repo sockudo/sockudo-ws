@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Breaking:** Compio 0.19 HTTP/2 entry points require Splittable; wrap other transports with compio::io::util::Split::new. Automatic Ping requires pending custom reads to cooperate with cancellation; an existing idle/Pong deadline remains terminal. With idle timeout disabled, nonzero pong_timeout also bounds read-buffer recovery from Ping's due time; expiry reports HeartbeatTimeout even if Ping has not been sent. Setting both timeouts to zero leaves recovery unbounded.
-- **Breaking:** DEFLATE encoder windows use DeflateWindowBits (9–15). An unsupported 8-bit encoder limit is rejected instead of panicking or widening it; server negotiation can still receive an 8-bit client stream with a larger decoder window.
+- **Breaking:** DEFLATE encoder windows use `DeflateWindowBits` (9–15), including the public window constants and codec configuration fields. An unsupported 8-bit encoder limit is rejected instead of panicking or widening it; server negotiation can still receive an 8-bit client stream with a larger decoder window. A server policy below 15 client window bits declines a `permessage-deflate` offer that omits `client_max_window_bits` rather than exceeding the configured policy. Public offer parsing now rejects duplicate or empty parameters, malformed quoted values, leading zeroes, and non-ASCII optional whitespace.
 
 - Outbound frames are coalesced across `send()` calls while inbound messages
   that were already parsed are still queued for the application

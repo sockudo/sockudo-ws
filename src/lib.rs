@@ -318,6 +318,11 @@ impl From<DeflateWindowBits> for u8 {
 /// at a 512-byte window. Larger windows provide better compression but use more
 /// memory per connection.
 ///
+/// Window-specific modes constrain both endpoint directions. During server
+/// negotiation, modes below 32KB require the client to offer
+/// `client_max_window_bits`; clients that send only `permessage-deflate` remain
+/// uncompressed rather than exceeding the configured client window limit.
+///
 /// # Memory Usage per Connection
 ///
 /// | Mode | Description | Window Bits | Window Size |

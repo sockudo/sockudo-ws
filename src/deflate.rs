@@ -88,6 +88,9 @@ impl DeflateConfig {
     ///
     /// This reduces encoder and retained takeover-history windows. The
     /// configured zlib-rs decoder may still retain its internal 32 KiB window.
+    /// When used as a server negotiation policy, clients must offer
+    /// `client_max_window_bits`; a bare `permessage-deflate` offer is declined
+    /// rather than exceeding the configured client window limit.
     pub fn low_memory() -> Self {
         Self {
             server_max_window_bits: DeflateWindowBits::Bits10, // 1KB window
