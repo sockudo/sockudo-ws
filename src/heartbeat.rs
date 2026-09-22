@@ -40,6 +40,8 @@ struct OutstandingPing {
     payload: Bytes,
     deadline_ms: Option<u64>,
     flushed: bool,
+    // An acknowledgement can arrive after the write but before flush completes.
+    acknowledged: bool,
 }
 
 impl Heartbeat {
@@ -112,6 +114,7 @@ impl Heartbeat {
             payload: payload.clone(),
             deadline_ms: None,
             flushed: false,
+            acknowledged: false,
         });
         Some(payload)
     }
@@ -120,6 +123,10 @@ impl Heartbeat {
         if let Some(ping) = &mut self.outstanding
             && !ping.flushed
         {
+            if ping.acknowledged {
+                self.outstanding = None;
+                return;
+            }
             ping.flushed = true;
             ping.deadline_ms =
                 (self.pong_timeout_ms != 0).then(|| now_ms.saturating_add(self.pong_timeout_ms));
@@ -130,6 +137,7 @@ impl Heartbeat {
     ///
     /// Every valid inbound frame resets inactivity. Only the exact Pong for the
     /// currently outstanding, successfully flushed Ping clears its deadline.
+    /// An earlier matching Pong is retained until that Ping finishes flushing.
     pub(crate) fn on_inbound(&mut self, now_ms: u64, pong: Option<&Bytes>) -> bool {
         if self.stopped {
             return false;
@@ -137,11 +145,17 @@ impl Heartbeat {
 
         // Shared data activity and queued control frames can arrive out of order.
         self.last_inbound_ms = self.last_inbound_ms.max(now_ms);
-        let matched = self.outstanding.as_ref().is_some_and(|ping| {
-            ping.flushed
+        let matched = if let Some(ping) = &mut self.outstanding {
+            let matching_payload = pong.is_some_and(|payload| payload == &ping.payload);
+            if matching_payload && !ping.flushed {
+                ping.acknowledged = true;
+            }
+            matching_payload
+                && ping.flushed
                 && ping.deadline_ms.is_none_or(|deadline| now_ms < deadline)
-                && pong.is_some_and(|payload| payload == &ping.payload)
-        });
+        } else {
+            false
+        };
         if matched {
             self.outstanding = None;
         }
@@ -213,6 +227,29 @@ mod tests {
         heartbeat.ping_flushed(10_000);
         heartbeat.on_inbound(12_000, None);
         assert_eq!(heartbeat.next_deadline(), Some(Deadline::Pong(15_000)));
+    }
+
+    #[test]
+    fn matching_pong_before_flush_is_retained_until_flush_completes() {
+        let mut heartbeat = Heartbeat::new(&config(), 0);
+        let payload = heartbeat.ping_due(10_000).unwrap();
+
+        assert!(!heartbeat.on_inbound(11_000, Some(&payload)));
+        heartbeat.ping_flushed(12_000);
+
+        assert!(!heartbeat.has_outstanding_ping());
+        assert_eq!(heartbeat.next_deadline(), Some(Deadline::Ping(21_000)));
+    }
+
+    #[test]
+    fn queued_pong_does_not_move_inactivity_backwards() {
+        let mut heartbeat = Heartbeat::new(&config(), 0);
+        let payload = heartbeat.ping_due(10_000).unwrap();
+        heartbeat.ping_flushed(10_000);
+        heartbeat.on_inbound(12_000, None);
+
+        assert!(heartbeat.on_inbound(11_000, Some(&payload)));
+        assert_eq!(heartbeat.next_deadline(), Some(Deadline::Ping(22_000)));
     }
 
     #[test]
