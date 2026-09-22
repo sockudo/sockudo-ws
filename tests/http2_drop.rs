@@ -118,15 +118,19 @@ async fn websocket_close_delivers_the_last_frames(compressed: bool) {
                 #[cfg(feature = "permessage-deflate")]
                 {
                     let mut ws =
-                        CompressedWebSocketStream::server(stream, config, DeflateConfig::default());
+                        CompressedWebSocketStream::server(stream, config, DeflateConfig::default())
+                            .with_immediate_write_shutdown();
                     ws.close(1000, "bye").await.unwrap();
+                    SinkExt::close(&mut ws).await.unwrap();
                 }
             } else {
-                let mut ws = WebSocketStream::server(stream, config);
+                let mut ws =
+                    WebSocketStream::server(stream, config).with_immediate_write_shutdown();
                 ws.send(Message::Binary(Bytes::from_static(b"queued response")))
                     .await
                     .unwrap();
                 ws.close(1000, "bye").await.unwrap();
+                SinkExt::close(&mut ws).await.unwrap();
             }
             // Model a returning handler: release every stream reference before
             // the peer reads DATA. Keep only the connection driver alive.
@@ -181,4 +185,55 @@ async fn websocket_close_delivers_queued_data_before_handler_returns() {
 #[tokio::test]
 async fn compressed_websocket_close_delivers_close_before_handler_returns() {
     websocket_close_delivers_the_last_frames(true).await;
+}
+
+#[tokio::test]
+async fn websocket_reads_crossing_ping_and_close_after_end_stream() {
+    use futures_util::StreamExt;
+    use sockudo_ws::{Config, WebSocketStream};
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            let (request, mut response) = connection.accept().await.unwrap().unwrap();
+            let driver = tokio::spawn(async move { while connection.accept().await.is_some() {} });
+            let send = response
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            let stream = Http2Stream::new(send, request.into_body());
+            let config = Config::builder().auto_ping(false).idle_timeout(0).build();
+            let mut ws = WebSocketStream::server(stream, config).with_immediate_write_shutdown();
+            ws.close(1000, "").await.unwrap();
+            assert!(ws.next().await.unwrap().unwrap().is_ping());
+            assert!(ws.next().await.unwrap().unwrap().is_close());
+            driver.abort();
+        });
+
+        let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let (response, mut send) = client
+            .send_request(
+                http::Request::builder()
+                    .uri("https://localhost/")
+                    .body(())
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        let mut recv = response.await.unwrap().into_body();
+        assert_eq!(
+            recv.data().await.unwrap().unwrap().as_ref(),
+            b"\x88\x02\x03\xe8"
+        );
+        send.send_data(
+            bytes::Bytes::from_static(b"\x89\x81\x00\x00\x00\x00p\x88\x82\x00\x00\x00\x00\x03\xe8"),
+            true,
+        )
+        .unwrap();
+        server.await.unwrap();
+        driver.abort();
+    })
+    .await
+    .unwrap();
 }

@@ -529,7 +529,8 @@ impl WebSocketClient<Http2> {
         let h2_stream = Stream::<Http2>::from_h2(send_stream, recv_stream);
 
         // Create and return WebSocketStream
-        Ok(WebSocketStream::from_raw(h2_stream, Role::Client, config))
+        Ok(WebSocketStream::from_raw(h2_stream, Role::Client, config)
+            .with_immediate_write_shutdown())
     }
 
     /// Connect to multiple WebSocket endpoints over the same HTTP/2 connection
@@ -730,11 +731,10 @@ impl WebSocketClient<Http3> {
                     Some(send_request.clone()),
                 );
 
-                Ok(WebSocketStream::from_raw(
-                    h3_stream,
-                    Role::Client,
-                    self.config.clone(),
-                ))
+                Ok(
+                    WebSocketStream::from_raw(h3_stream, Role::Client, self.config.clone())
+                        .with_immediate_write_shutdown(),
+                )
             }
             StatusCode::NOT_IMPLEMENTED => Err(Error::ExtendedConnectNotSupported),
             StatusCode::FORBIDDEN => Err(Error::HandshakeFailed(

@@ -734,7 +734,8 @@ impl CompioHttp2Connection {
         }
 
         let stream = CompioHttp2Stream::new(send_stream, response.into_body());
-        Ok(CompioWebSocketStream::client(stream, self.config.clone()))
+        Ok(CompioWebSocketStream::client(stream, self.config.clone())
+            .with_immediate_write_shutdown())
     }
 }
 
@@ -859,7 +860,7 @@ where
             .map_err(Error::from)?;
         let recv_stream = request.into_body();
         let stream = CompioHttp2Stream::new(send_stream, recv_stream);
-        let ws = CompioWebSocketStream::server(stream, config);
+        let ws = CompioWebSocketStream::server(stream, config).with_immediate_write_shutdown();
         handler(ws, ws_req).await;
     } else {
         let response = build_extended_connect_error(
@@ -1068,7 +1069,8 @@ impl CompioHttp3Connection {
             Some(self.endpoint.clone()),
             Some(self.send_request.clone()),
         );
-        Ok(CompioWebSocketStream::client(stream, self.config.clone()))
+        Ok(CompioWebSocketStream::client(stream, self.config.clone())
+            .with_immediate_write_shutdown())
     }
 
     /// Get the local UDP address backing this connection.
@@ -1295,7 +1297,8 @@ where
     let response = build_extended_connect_response(None, None);
     stream.send_response(response).await.map_err(Error::from)?;
 
-    let ws = CompioWebSocketStream::server(CompioHttp3ServerStream::new(stream), config);
+    let ws = CompioWebSocketStream::server(CompioHttp3ServerStream::new(stream), config)
+        .with_immediate_write_shutdown();
     handler(ws, ws_req).await;
 
     Ok(())
@@ -1308,6 +1311,8 @@ pub struct CompioWebSocketStream<S> {
     read_buf: BytesMut,
     write_buf: BytesMut,
     state: CompioStreamState,
+    immediate_write_shutdown: bool,
+    write_shutdown_complete: bool,
     config: Config,
     pending_messages: Vec<Message>,
     // Deliver accepted messages before a later parse failure.
@@ -1347,6 +1352,8 @@ where
             read_buf,
             write_buf: BytesMut::with_capacity(config.write_buffer_size),
             state: CompioStreamState::Open,
+            immediate_write_shutdown: false,
+            write_shutdown_complete: false,
             config,
             pending_messages: Vec::new(),
             pending_parse_error: None,
@@ -1375,6 +1382,16 @@ where
     /// Create a client-side stream with post-handshake leftover bytes.
     pub fn client_with_leftover(inner: S, config: Config, leftover: Option<Bytes>) -> Self {
         Self::from_raw_with_leftover(inner, Role::Client, config, leftover)
+    }
+
+    /// End the transport send half immediately after an explicit WebSocket Close.
+    ///
+    /// Use this for HTTP/2 and HTTP/3, whose queued Close frame requires an
+    /// explicit send-side shutdown before the stream is released. TCP and TLS
+    /// streams should keep the default and wait for the peer Close.
+    pub fn with_immediate_write_shutdown(mut self) -> Self {
+        self.immediate_write_shutdown = true;
+        self
     }
 
     /// Get a reference to the underlying stream.
@@ -1636,8 +1653,10 @@ where
         self.send(Message::Binary(data)).await
     }
 
-    /// Send a close frame and shut down the transport write half.
+    /// Send a close frame.
     ///
+    /// TCP/TLS keep the write half open until the peer's Close; multiplexed
+    /// transports configured with `with_immediate_write_shutdown` end it now.
     /// The read half remains available for the peer's closing response.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         if self.state != CompioStreamState::Open {
@@ -1646,8 +1665,11 @@ where
 
         self.send(Message::Close(Some(CloseReason::new(code, reason))))
             .await?;
-        // Finish the send half so multiplexed transports retain queued frames.
-        self.inner.shutdown().await?;
+        if self.immediate_write_shutdown {
+            // Finish the send half so multiplexed transports retain queued frames.
+            self.inner.shutdown().await?;
+            self.write_shutdown_complete = true;
+        }
         Ok(())
     }
 
@@ -1679,11 +1701,15 @@ where
     async fn handle_incoming_message(&mut self, msg: Message) -> Result<Message> {
         match &msg {
             Message::Ping(data) => {
-                self.protocol.encode_pong(data, &mut self.write_buf);
-                if let Err(error) = self.flush().await {
-                    self.heartbeat.stop();
-                    self.state = CompioStreamState::Closed;
-                    return Err(error);
+                // END_STREAM forbids a Pong, but the read half must continue
+                // through a crossing Ping to the peer's Close.
+                if !self.write_shutdown_complete {
+                    self.protocol.encode_pong(data, &mut self.write_buf);
+                    if let Err(error) = self.flush().await {
+                        self.heartbeat.stop();
+                        self.state = CompioStreamState::Closed;
+                        return Err(error);
+                    }
                 }
             }
             Message::Close(reason) => {
@@ -1700,6 +1726,13 @@ where
                         self.state = CompioStreamState::Closed;
                         return Err(error);
                     }
+                }
+                if !self.write_shutdown_complete {
+                    if let Err(error) = self.inner.shutdown().await {
+                        self.state = CompioStreamState::Closed;
+                        return Err(error.into());
+                    }
+                    self.write_shutdown_complete = true;
                 }
                 self.state = CompioStreamState::Closed;
                 return Ok(Message::Close(reason.clone()));
@@ -2588,6 +2621,8 @@ pub struct CompioCompressedWebSocketStream<S> {
     read_buf: BytesMut,
     write_buf: BytesMut,
     state: CompioStreamState,
+    immediate_write_shutdown: bool,
+    write_shutdown_complete: bool,
     config: Config,
     pending_messages: Vec<Message>,
     // Deliver accepted messages before a later parse failure.
@@ -2632,6 +2667,8 @@ where
             read_buf,
             write_buf: BytesMut::with_capacity(config.write_buffer_size),
             state: CompioStreamState::Open,
+            immediate_write_shutdown: false,
+            write_shutdown_complete: false,
             config,
             pending_messages: Vec::new(),
             pending_parse_error: None,
@@ -2671,6 +2708,8 @@ where
             read_buf,
             write_buf: BytesMut::with_capacity(config.write_buffer_size),
             state: CompioStreamState::Open,
+            immediate_write_shutdown: false,
+            write_shutdown_complete: false,
             config,
             pending_messages: Vec::new(),
             pending_parse_error: None,
@@ -2679,6 +2718,15 @@ where
             high_water_mark: DEFAULT_HIGH_WATER_MARK,
             low_water_mark: DEFAULT_LOW_WATER_MARK,
         }
+    }
+
+    /// End the transport send half immediately after an explicit WebSocket Close.
+    ///
+    /// Use this for HTTP/2 and HTTP/3. TCP and TLS streams should keep the
+    /// default and wait for the peer Close.
+    pub fn with_immediate_write_shutdown(mut self) -> Self {
+        self.immediate_write_shutdown = true;
+        self
     }
 
     /// Receive the next WebSocket message.
@@ -2879,8 +2927,10 @@ where
         self.send(Message::Binary(data)).await
     }
 
-    /// Send a close frame and shut down the transport write half.
+    /// Send a close frame.
     ///
+    /// TCP/TLS keep the write half open until the peer's Close; multiplexed
+    /// transports configured with `with_immediate_write_shutdown` end it now.
     /// The read half remains available for the peer's closing response.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         if self.state != CompioStreamState::Open {
@@ -2889,8 +2939,11 @@ where
 
         self.send(Message::Close(Some(CloseReason::new(code, reason))))
             .await?;
-        // Finish the send half so multiplexed transports retain queued frames.
-        self.inner.shutdown().await?;
+        if self.immediate_write_shutdown {
+            // Finish the send half so multiplexed transports retain queued frames.
+            self.inner.shutdown().await?;
+            self.write_shutdown_complete = true;
+        }
         Ok(())
     }
 
@@ -2947,11 +3000,15 @@ where
     async fn handle_incoming_message(&mut self, msg: Message) -> Result<Message> {
         match &msg {
             Message::Ping(data) => {
-                self.protocol.encode_pong(data, &mut self.write_buf);
-                if let Err(error) = self.flush().await {
-                    self.heartbeat.stop();
-                    self.state = CompioStreamState::Closed;
-                    return Err(error);
+                // END_STREAM forbids a Pong, but the read half must continue
+                // through a crossing Ping to the peer's Close.
+                if !self.write_shutdown_complete {
+                    self.protocol.encode_pong(data, &mut self.write_buf);
+                    if let Err(error) = self.flush().await {
+                        self.heartbeat.stop();
+                        self.state = CompioStreamState::Closed;
+                        return Err(error);
+                    }
                 }
             }
             Message::Close(reason) => {
@@ -2968,6 +3025,13 @@ where
                         self.state = CompioStreamState::Closed;
                         return Err(error);
                     }
+                }
+                if !self.write_shutdown_complete {
+                    if let Err(error) = self.inner.shutdown().await {
+                        self.state = CompioStreamState::Closed;
+                        return Err(error.into());
+                    }
+                    self.write_shutdown_complete = true;
                 }
                 self.state = CompioStreamState::Closed;
                 return Ok(Message::Close(reason.clone()));

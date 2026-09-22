@@ -73,6 +73,8 @@ pin_project! {
         has_unprocessed_read_data: bool,
         write_buf: CorkBuffer,
         state: StreamState,
+        immediate_write_shutdown: bool,
+        write_shutdown_complete: bool,
         config: Config,
         // Pending messages from last process() call
         pending_messages: Vec<Message>,
@@ -141,6 +143,8 @@ where
             has_unprocessed_read_data,
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
             state: StreamState::Open,
+            immediate_write_shutdown: false,
+            write_shutdown_complete: false,
             config,
             pending_messages: Vec::new(),
             pending_parse_error: None,
@@ -166,6 +170,16 @@ where
     /// Create a client-side WebSocket stream
     pub fn client(inner: S, config: Config) -> Self {
         Self::from_raw(inner, Role::Client, config)
+    }
+
+    /// End the transport send half immediately after an explicit WebSocket Close.
+    ///
+    /// Use this for multiplexed transports such as HTTP/2 and HTTP/3, where a
+    /// stream released without END_STREAM can discard its queued Close frame.
+    /// TCP and TLS streams should keep the default and wait for the peer Close.
+    pub fn with_immediate_write_shutdown(mut self) -> Self {
+        self.immediate_write_shutdown = true;
+        self
     }
 
     /// Get a reference to the underlying stream
@@ -266,8 +280,10 @@ where
         self.low_water_mark
     }
 
-    /// Send a close frame and shut down the transport write half.
+    /// Send a close frame.
     ///
+    /// TCP/TLS keep the write half open until the peer's Close; multiplexed
+    /// transports configured with `with_immediate_write_shutdown` end it now.
     /// The read half remains available for the peer's closing response.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         if self.state != StreamState::Open {
@@ -278,11 +294,16 @@ where
         self.protocol
             .encode_message(&close, self.write_buf.buffer_mut())?;
         self.state = StreamState::CloseSent;
+        self.heartbeat.stop();
+        self.heartbeat_sleep = None;
 
         // Flush the close frame
         self.flush_write_buf().await?;
-        // Finish the send half so multiplexed transports retain queued frames.
-        self.inner.shutdown().await?;
+        if self.immediate_write_shutdown {
+            // Finish the send half so multiplexed transports retain queued frames.
+            self.inner.shutdown().await?;
+            self.write_shutdown_complete = true;
+        }
         Ok(())
     }
 
@@ -452,7 +473,6 @@ where
                 match self.as_mut().poll_write_out(cx) {
                     Poll::Ready(Ok(())) => {
                         let this = self.as_mut().get_mut();
-                        this.flush_on_read = false;
                         if this.ping_flush_pending {
                             this.ping_flush_pending = false;
                             let now = this.clock_epoch.elapsed().as_millis() as u64;
@@ -461,10 +481,21 @@ where
                             this.heartbeat.ping_flushed(now);
                         }
 
+                        if this.close_after_flush && !this.write_shutdown_complete {
+                            match Pin::new(&mut this.inner).poll_shutdown(cx) {
+                                Poll::Ready(Ok(())) => this.write_shutdown_complete = true,
+                                Poll::Ready(Err(error)) => {
+                                    this.state = StreamState::Closed;
+                                    return Poll::Ready(Some(Err(error.into())));
+                                }
+                                Poll::Pending => return Poll::Pending,
+                            }
+                        }
                         if this.close_after_flush {
                             this.close_after_flush = false;
                             this.state = StreamState::Closed;
                         }
+                        this.flush_on_read = false;
 
                         if let Some(error) = this.pending_terminal_error.take() {
                             return Poll::Ready(Some(Err(error)));
@@ -587,6 +618,11 @@ where
                     Message::Ping(data) => {
                         // Queue pong response
                         let this = self.as_mut().get_mut();
+                        if this.write_shutdown_complete {
+                            // END_STREAM forbids a Pong, but the read half must
+                            // still deliver this Ping and the following Close.
+                            return Poll::Ready(Some(Ok(msg)));
+                        }
                         this.protocol.encode_pong(data, this.write_buf.buffer_mut());
                         this.pending_control_message = Some(msg);
                         this.flush_on_read = true;
@@ -767,6 +803,10 @@ where
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if self.write_shutdown_complete {
+            self.as_mut().get_mut().state = StreamState::Closed;
+            return Poll::Ready(Ok(()));
+        }
         // Send close frame if not already sent
         if self.state == StreamState::Open {
             let close = Message::Close(Some(CloseReason::new(1000, "")));
@@ -785,7 +825,11 @@ where
         // Shutdown the underlying stream
         match Pin::new(&mut self.as_mut().get_mut().inner).poll_shutdown(cx) {
             Poll::Ready(Ok(())) => {
-                self.as_mut().get_mut().state = StreamState::Closed;
+                let this = self.as_mut().get_mut();
+                this.write_shutdown_complete = true;
+                this.state = StreamState::Closed;
+                this.heartbeat.stop();
+                this.heartbeat_sleep = None;
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
@@ -1925,6 +1969,8 @@ pin_project! {
         read_buf: BytesMut,
         write_buf: CorkBuffer,
         state: StreamState,
+        immediate_write_shutdown: bool,
+        write_shutdown_complete: bool,
         config: Config,
         pending_messages: Vec<Message>,
         // Deliver successfully parsed messages before a later parse failure.
@@ -1965,6 +2011,8 @@ where
             read_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
             state: StreamState::Open,
+            immediate_write_shutdown: false,
+            write_shutdown_complete: false,
             config,
             pending_messages: Vec::new(),
             pending_parse_error: None,
@@ -1998,6 +2046,8 @@ where
             read_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
             state: StreamState::Open,
+            immediate_write_shutdown: false,
+            write_shutdown_complete: false,
             config,
             pending_messages: Vec::new(),
             pending_parse_error: None,
@@ -2021,6 +2071,15 @@ where
         self.state == StreamState::Closed || self.protocol.is_closed()
     }
 
+    /// End the transport send half immediately after an explicit WebSocket Close.
+    ///
+    /// Use this for multiplexed transports such as HTTP/2 and HTTP/3. TCP and
+    /// TLS streams should keep the default and wait for the peer Close.
+    pub fn with_immediate_write_shutdown(mut self) -> Self {
+        self.immediate_write_shutdown = true;
+        self
+    }
+
     /// Check if backpressure should be applied
     #[inline]
     pub fn is_backpressured(&self) -> bool {
@@ -2033,8 +2092,10 @@ where
         self.write_buf.pending_bytes()
     }
 
-    /// Send a close frame and shut down the transport write half.
+    /// Send a close frame.
     ///
+    /// TCP/TLS keep the write half open until the peer's Close; multiplexed
+    /// transports configured with `with_immediate_write_shutdown` end it now.
     /// The read half remains available for the peer's closing response.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         if self.state != StreamState::Open {
@@ -2045,10 +2106,15 @@ where
         self.protocol
             .encode_message(&close, self.write_buf.buffer_mut())?;
         self.state = StreamState::CloseSent;
+        self.heartbeat.stop();
+        self.heartbeat_sleep = None;
 
         self.flush_write_buf().await?;
-        // Finish the send half so multiplexed transports retain queued frames.
-        self.inner.shutdown().await?;
+        if self.immediate_write_shutdown {
+            // Finish the send half so multiplexed transports retain queued frames.
+            self.inner.shutdown().await?;
+            self.write_shutdown_complete = true;
+        }
         Ok(())
     }
 
@@ -2210,7 +2276,6 @@ where
                 match self.as_mut().poll_write_out(cx) {
                     Poll::Ready(Ok(())) => {
                         let this = self.as_mut().get_mut();
-                        this.flush_on_read = false;
                         if this.ping_flush_pending {
                             this.ping_flush_pending = false;
                             let now = this.clock_epoch.elapsed().as_millis() as u64;
@@ -2219,10 +2284,21 @@ where
                             this.heartbeat.ping_flushed(now);
                         }
 
+                        if this.close_after_flush && !this.write_shutdown_complete {
+                            match Pin::new(&mut this.inner).poll_shutdown(cx) {
+                                Poll::Ready(Ok(())) => this.write_shutdown_complete = true,
+                                Poll::Ready(Err(error)) => {
+                                    this.state = StreamState::Closed;
+                                    return Poll::Ready(Some(Err(error.into())));
+                                }
+                                Poll::Pending => return Poll::Pending,
+                            }
+                        }
                         if this.close_after_flush {
                             this.close_after_flush = false;
                             this.state = StreamState::Closed;
                         }
+                        this.flush_on_read = false;
 
                         if let Some(error) = this.pending_terminal_error.take() {
                             return Poll::Ready(Some(Err(error)));
@@ -2339,6 +2415,11 @@ where
                 match &msg {
                     Message::Ping(data) => {
                         let this = self.as_mut().get_mut();
+                        if this.write_shutdown_complete {
+                            // END_STREAM forbids a Pong, but the read half must
+                            // still deliver this Ping and the following Close.
+                            return Poll::Ready(Some(Ok(msg)));
+                        }
                         this.protocol.encode_pong(data, this.write_buf.buffer_mut());
                         this.pending_control_message = Some(msg);
                         this.flush_on_read = true;
@@ -2470,6 +2551,10 @@ where
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if self.write_shutdown_complete {
+            self.as_mut().get_mut().state = StreamState::Closed;
+            return Poll::Ready(Ok(()));
+        }
         if self.state == StreamState::Open {
             let close = Message::Close(Some(CloseReason::new(1000, "")));
             if let Err(e) = self.as_mut().start_send(close) {
@@ -2485,7 +2570,11 @@ where
 
         match Pin::new(&mut self.as_mut().get_mut().inner).poll_shutdown(cx) {
             Poll::Ready(Ok(())) => {
-                self.as_mut().get_mut().state = StreamState::Closed;
+                let this = self.as_mut().get_mut();
+                this.write_shutdown_complete = true;
+                this.state = StreamState::Closed;
+                this.heartbeat.stop();
+                this.heartbeat_sleep = None;
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),

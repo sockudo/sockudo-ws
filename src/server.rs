@@ -523,7 +523,8 @@ where
         let h2_stream = Stream::<Http2>::from_h2(send_stream, recv_stream);
 
         // Create WebSocketStream over Stream<Http2>
-        let ws = WebSocketStream::from_raw(h2_stream, Role::Server, config);
+        let ws = WebSocketStream::from_raw(h2_stream, Role::Server, config)
+            .with_immediate_write_shutdown();
 
         // Call user handler
         handler(ws, ws_req).await;
@@ -576,7 +577,8 @@ where
 
         let recv_stream = request.into_body();
         let h2_stream = Stream::<Http2>::from_h2(send_stream, recv_stream);
-        let ws = WebSocketStream::from_raw(h2_stream, Role::Server, config);
+        let ws = WebSocketStream::from_raw(h2_stream, Role::Server, config)
+            .with_immediate_write_shutdown();
 
         handler(ws, ws_req).await;
 
@@ -884,7 +886,8 @@ where
     stream.send_response(response).await.map_err(Error::from)?;
 
     let h3_stream = Stream::<Http3>::from_h3_server(stream);
-    let ws = WebSocketStream::from_raw(h3_stream, Role::Server, config);
+    let ws =
+        WebSocketStream::from_raw(h3_stream, Role::Server, config).with_immediate_write_shutdown();
 
     handler(ws, ws_req).await;
 
@@ -946,7 +949,8 @@ where
     stream.send_response(response).await.ok();
 
     let h3_stream = Stream::<Http3>::from_h3_server(stream);
-    let ws = WebSocketStream::from_raw(h3_stream, Role::Server, config);
+    let ws =
+        WebSocketStream::from_raw(h3_stream, Role::Server, config).with_immediate_write_shutdown();
 
     handler(ws, ws_req).await;
 
