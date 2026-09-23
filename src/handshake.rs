@@ -52,8 +52,10 @@ pub struct HandshakeRequest<'a> {
 pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut headers);
+    // A valid header fits within the limit; one more byte detects an oversized partial header.
+    let parse_buf = &buf[..buf.len().min(MAX_HEADER_SIZE + 1)];
 
-    match req.parse(buf) {
+    match req.parse(parse_buf) {
         Ok(httparse::Status::Complete(len)) => {
             if len > MAX_HEADER_SIZE {
                 return Err(Error::InvalidHttp("request too large"));
@@ -528,8 +530,10 @@ pub struct HandshakeResponse<'a> {
 pub fn parse_response(buf: &[u8]) -> Result<Option<(HandshakeResponse<'_>, usize)>> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut res = httparse::Response::new(&mut headers);
+    // A valid header fits within the limit; one more byte detects an oversized partial header.
+    let parse_buf = &buf[..buf.len().min(MAX_HEADER_SIZE + 1)];
 
-    match res.parse(buf) {
+    match res.parse(parse_buf) {
         Ok(httparse::Status::Complete(len)) => {
             if len > MAX_HEADER_SIZE {
                 return Err(Error::InvalidHttp("response too large"));
@@ -909,12 +913,36 @@ mod tests {
     }
 
     #[test]
+    fn oversized_request_stops_parsing_at_the_header_limit() {
+        let mut input = b"GET /chat HTTP/1.1\r\nX-Pad: ".to_vec();
+        input.resize(MAX_HEADER_SIZE + 1, b'a');
+        input.push(0); // Invalid HTTP syntax beyond the size boundary must not be parsed.
+
+        assert!(matches!(
+            parse_request(&input),
+            Err(Error::InvalidHttp("request too large"))
+        ));
+    }
+
+    #[test]
     fn partial_response_still_observes_the_header_limit() {
         let mut input = b"HTTP/1.1 101 Switching Protocols\r\nX-Pad: ".to_vec();
         input.resize(MAX_HEADER_SIZE, b'a');
         assert!(parse_response(&input).unwrap().is_none());
 
         input.push(b'a');
+        assert!(matches!(
+            parse_response(&input),
+            Err(Error::InvalidHttp("response too large"))
+        ));
+    }
+
+    #[test]
+    fn oversized_response_stops_parsing_at_the_header_limit() {
+        let mut input = b"HTTP/1.1 101 Switching Protocols\r\nX-Pad: ".to_vec();
+        input.resize(MAX_HEADER_SIZE + 1, b'a');
+        input.push(0); // Invalid HTTP syntax beyond the size boundary must not be parsed.
+
         assert!(matches!(
             parse_response(&input),
             Err(Error::InvalidHttp("response too large"))
