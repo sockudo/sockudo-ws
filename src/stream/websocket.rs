@@ -92,6 +92,7 @@ pin_project! {
         flush_on_read: bool,
         close_after_flush: bool,
         ping_flush_pending: bool,
+        ready_flush_pending: bool,
         clock_epoch: tokio::time::Instant,
         heartbeat: Heartbeat,
         heartbeat_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
@@ -161,6 +162,7 @@ where
             flush_on_read: false,
             close_after_flush: false,
             ping_flush_pending: false,
+            ready_flush_pending: false,
             clock_epoch,
             heartbeat,
             heartbeat_sleep: None,
@@ -828,9 +830,22 @@ where
 {
     type Error = Error;
 
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         if self.state != StreamState::Open {
             return Poll::Ready(Err(Error::ConnectionClosed));
+        }
+        // Drain before accepting more data; a single message may exceed the
+        // threshold. Bypass batch coalescing so readiness applies backpressure.
+        if self.write_buf.has_data()
+            && self.write_buf.pending_bytes() >= self.config.max_backpressure
+        {
+            self.ready_flush_pending = true;
+        }
+        // Partial writes may bring queued bytes below the threshold before the
+        // transport is drained. Continue that flush across subsequent polls.
+        if self.ready_flush_pending {
+            std::task::ready!(self.as_mut().poll_write_out(cx))?;
+            self.ready_flush_pending = false;
         }
         Poll::Ready(Ok(()))
     }
@@ -2100,6 +2115,7 @@ pin_project! {
         flush_on_read: bool,
         close_after_flush: bool,
         ping_flush_pending: bool,
+        ready_flush_pending: bool,
         clock_epoch: tokio::time::Instant,
         heartbeat: Heartbeat,
         heartbeat_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
@@ -2143,6 +2159,7 @@ where
             flush_on_read: false,
             close_after_flush: false,
             ping_flush_pending: false,
+            ready_flush_pending: false,
             clock_epoch,
             heartbeat,
             heartbeat_sleep: None,
@@ -2181,6 +2198,7 @@ where
             flush_on_read: false,
             close_after_flush: false,
             ping_flush_pending: false,
+            ready_flush_pending: false,
             clock_epoch,
             heartbeat,
             heartbeat_sleep: None,
@@ -2722,9 +2740,22 @@ where
 {
     type Error = Error;
 
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         if self.state != StreamState::Open {
             return Poll::Ready(Err(Error::ConnectionClosed));
+        }
+        // Drain before accepting more data; a single message may exceed the
+        // threshold. Bypass batch coalescing so readiness applies backpressure.
+        if self.write_buf.has_data()
+            && self.write_buf.pending_bytes() >= self.config.max_backpressure
+        {
+            self.ready_flush_pending = true;
+        }
+        // Partial writes may bring queued bytes below the threshold before the
+        // transport is drained. Continue that flush across subsequent polls.
+        if self.ready_flush_pending {
+            std::task::ready!(self.as_mut().poll_write_out(cx))?;
+            self.ready_flush_pending = false;
         }
         Poll::Ready(Ok(()))
     }
