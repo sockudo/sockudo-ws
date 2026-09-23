@@ -3501,7 +3501,18 @@ impl<W> Drop for CompioCompressedSplitWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handshake::build_request;
     use ::compio::net::{TcpListener, TcpStream};
+
+    fn pad_header_to(mut header: Vec<u8>, len: usize) -> Vec<u8> {
+        assert!(header.ends_with(b"\r\n\r\n"));
+        header.truncate(header.len() - 2);
+        header.extend_from_slice(b"X-Pad: ");
+        header.resize(len - 4, b'a');
+        header.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(header.len(), len);
+        header
+    }
 
     #[cfg(feature = "http3")]
     fn install_test_crypto_provider() {
@@ -3542,6 +3553,66 @@ mod tests {
         let echoed = client.next().await.unwrap().unwrap();
         assert!(matches!(echoed, Message::Text(text) if text == "hello"));
 
+        server.await.unwrap();
+    }
+
+    #[compio::test]
+    async fn compio_server_accepts_frame_after_large_valid_request_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::compio::runtime::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut websocket, _) = accept_async(stream, Config::default()).await.unwrap();
+            let message = websocket.next().await.unwrap().unwrap();
+            assert!(
+                matches!(message, Message::Binary(payload) if payload.len() == 4096 && payload.iter().all(|byte| *byte == b'x'))
+            );
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let request = build_request("example.com", "/ws", "dGhlIHNhbXBsZSBub25jZQ==", None, None);
+        let mut request_and_frame = pad_header_to(request.to_vec(), 6000);
+        request_and_frame.extend_from_slice(b"\x82\xfe\x10\x00\x01\x02\x03\x04");
+        request_and_frame.extend((0..4096).map(|i| b'x' ^ [1, 2, 3, 4][i % 4]));
+        write_all_owned(&mut client, Bytes::from(request_and_frame))
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[compio::test]
+    async fn compio_client_accepts_frame_after_large_valid_response_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::compio::runtime::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = BytesMut::with_capacity(4096);
+            let key = loop {
+                assert!(read_more(&mut stream, &mut request).await.unwrap() > 0);
+                if let Some((parsed, _)) = parse_request(&request).unwrap() {
+                    break parsed.key.to_string();
+                }
+            };
+            let response = build_response(&generate_accept_key(&key), None, None);
+            let mut response_and_frame = pad_header_to(response.to_vec(), 6000);
+            response_and_frame.extend_from_slice(b"\x82\x7e\x10\x00");
+            response_and_frame.extend(std::iter::repeat_n(b'x', 4096));
+            write_all_owned(&mut stream, Bytes::from(response_and_frame))
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (mut websocket, _) =
+            connect_async(stream, &addr.to_string(), "/ws", None, Config::default())
+                .await
+                .unwrap();
+        let message = websocket.next().await.unwrap().unwrap();
+        assert!(
+            matches!(message, Message::Binary(payload) if payload.len() == 4096 && payload.iter().all(|byte| *byte == b'x'))
+        );
         server.await.unwrap();
     }
 
