@@ -340,14 +340,16 @@ impl Protocol {
         }
 
         if self.partial_checked == 0 {
-            self.utf8.reset();
             // Raw calls can leave an unvalidated suffix, not just a split code point.
-            if pending.opcode == OpCode::Continuation
-                && !self
+            if pending.opcode == OpCode::Continuation {
+                if !self
                     .utf8
-                    .push(&self.fragment_buf[self.fragment_validated_len..])
-            {
-                return Err(Error::InvalidUtf8);
+                    .resume(&self.fragment_buf[self.fragment_validated_len..])
+                {
+                    return Err(Error::InvalidUtf8);
+                }
+            } else {
+                self.utf8.reset();
             }
         }
         let ready = pending.ready.min(buf.len());
@@ -566,14 +568,12 @@ impl Protocol {
         // validation linear in message size. Re-seed from the unvalidated suffix
         // after raw processing or a code point split across frames.
         if opcode == OpCode::Text {
-            if prevalidated == 0 {
-                self.utf8.reset();
-                if !self
+            if prevalidated == 0
+                && !self
                     .utf8
-                    .push(&self.fragment_buf[self.fragment_validated_len..])
-                {
-                    return Err(Error::InvalidUtf8);
-                }
+                    .resume(&self.fragment_buf[self.fragment_validated_len..])
+            {
+                return Err(Error::InvalidUtf8);
             }
             let prevalidated = prevalidated.min(frame.payload.len());
             if !self.utf8.push(&frame.payload[prevalidated..]) {

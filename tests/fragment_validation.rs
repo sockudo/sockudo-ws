@@ -5,6 +5,52 @@ use sockudo_ws::protocol::{Protocol, Role};
 use sockudo_ws::utf8::validate_utf8_incomplete;
 
 #[test]
+fn raw_message_reuses_matching_carry_from_previous_message() {
+    for chunk_size in [1, usize::MAX] {
+        let mut protocol = Protocol::new(Role::Client, 1024, 1024);
+        let mut wire = BytesMut::new();
+        encode_frame(&mut wire, OpCode::Text, b"a\xe2", false, None);
+        assert!(protocol.process(&mut wire).unwrap().is_empty());
+        encode_frame(&mut wire, OpCode::Continuation, b"\x82\xac", true, None);
+        assert_eq!(protocol.process_raw(&mut wire).unwrap().len(), 1);
+        encode_frame(&mut wire, OpCode::Text, b"\xe2", false, None);
+        assert!(protocol.process_raw(&mut wire).unwrap().is_empty());
+
+        let mut tail = BytesMut::new();
+        encode_frame(&mut tail, OpCode::Continuation, b"\x82\xac", true, None);
+        let mut messages = Vec::new();
+        for chunk in tail.chunks(chunk_size) {
+            wire.extend_from_slice(chunk);
+            messages.extend(protocol.process(&mut wire).unwrap());
+        }
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].as_bytes(), "€".as_bytes());
+    }
+}
+
+#[test]
+fn raw_message_does_not_reuse_different_carry_of_same_length() {
+    for chunk_size in [1, usize::MAX] {
+        let mut protocol = Protocol::new(Role::Client, 1024, 1024);
+        let mut wire = BytesMut::new();
+        encode_frame(&mut wire, OpCode::Text, b"a\xe2", false, None);
+        assert!(protocol.process(&mut wire).unwrap().is_empty());
+        encode_frame(&mut wire, OpCode::Continuation, b"\x82\xac", true, None);
+        assert_eq!(protocol.process_raw(&mut wire).unwrap().len(), 1);
+        encode_frame(&mut wire, OpCode::Text, b"\xff", false, None);
+        assert!(protocol.process_raw(&mut wire).unwrap().is_empty());
+
+        let mut tail = BytesMut::new();
+        encode_frame(&mut tail, OpCode::Continuation, b"\x82\xac", true, None);
+        let result = tail.chunks(chunk_size).try_for_each(|chunk| {
+            wire.extend_from_slice(chunk);
+            protocol.process(&mut wire).map(|_| ())
+        });
+        assert!(matches!(result, Err(Error::InvalidUtf8)));
+    }
+}
+
+#[test]
 fn partial_utf8_validation_preserves_suffixes_after_ascii_prefixes() {
     for length in [0, 1, 15, 16, 31, 32, 63, 64, 65, 4096] {
         for (suffix, expected) in [
