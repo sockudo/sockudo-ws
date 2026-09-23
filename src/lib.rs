@@ -505,6 +505,19 @@ pub struct Config {
     /// the transport (default: 5 seconds). A Tokio split `close()` starts this
     /// budget when local closing begins, including time waiting for the shared
     /// sink. Zero makes that path try the sink and write once without waiting.
+    /// Unified streams start one absolute budget when a local Close is queued
+    /// or a peer Close is received. It covers Close/control writes, waiting for
+    /// the peer Close, and transport shutdown; incoming traffic never resets it.
+    /// After expiry, every budget permits at most one nonwaiting transport read
+    /// across subsequent unified `next()` calls. A cancelled owned read is never
+    /// restarted. Zero also limits closing writes and shutdown to a single poll.
+    /// Deadline expiry alone preserves parsed messages in wire order. A control
+    /// write failure or timeout instead terminates immediately and may discard
+    /// undelivered Ping/data messages; accepted Close remains protected.
+    /// A poll does not guarantee completion: Compio drivers may need a runtime
+    /// turn even to write Close or shut down an otherwise writable socket.
+    /// No minimum grace period is added. Cleanup cannot
+    /// replace an accepted peer Close or an existing idle/Pong timeout error.
     pub close_timeout: u32,
     /// Coalesce outbound frames while inbound messages are still queued
     /// (default: true).

@@ -30,7 +30,8 @@ pin_project! {
     ///
     /// // After HTTP/3 handshake and Extended CONNECT negotiation
     /// let stream = Http3Stream::new(send_stream, recv_stream);
-    /// let mut ws = WebSocketStream::server(stream, Config::default());
+    /// let mut ws = WebSocketStream::server(stream, Config::default())
+    ///     .with_immediate_write_shutdown();
     ///
     /// // Use the exact same API as HTTP/1.1 or HTTP/2!
     /// while let Some(msg) = ws.next().await {

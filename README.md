@@ -706,10 +706,10 @@ All transports use the same `WebSocketStream<S>` API:
 let ws = WebSocketStream::server(tcp_stream, config);
 
 // HTTP/2
-let ws = WebSocketStream::server(h2_stream, config);
+let ws = WebSocketStream::server(h2_stream, config).with_immediate_write_shutdown();
 
 // HTTP/3
-let ws = WebSocketStream::server(h3_stream, config);
+let ws = WebSocketStream::server(h3_stream, config).with_immediate_write_shutdown();
 
 // io_uring
 let ws = WebSocketStream::server(uring_stream, config);
@@ -719,6 +719,10 @@ while let Some(msg) = ws.next().await {
     ws.send(msg?).await?;
 }
 ```
+
+The built-in HTTP/2 and HTTP/3 client/server entry points enable immediate send-side shutdown automatically. When constructing a unified stream directly over a multiplexed transport, call `with_immediate_write_shutdown()` so `close()` sends END_STREAM after the WebSocket Close frame. TCP/TLS streams keep their write half open until the peer's Close.
+
+Unified closing uses one absolute `close_timeout` budget, starting when a local Close is queued or a peer Close is received. Continue polling `next()` after local `close()` to receive the peer's response; a silent peer produces `ConnectionClosed` once, then the stream ends. Crossing Pings do not reset the budget. Cleanup errors or expiration do not replace an accepted Close or an existing idle/Pong timeout. Deadline expiry alone leaves parsed messages deliverable in wire order. A control write failure or timeout instead terminates immediately and may discard undelivered Ping/data messages; an accepted Close remains protected. No new Pong is started after expiry or when Close is already accepted. Every budget permits at most one nonwaiting transport read after expiry across subsequent `next()` calls; a cancelled Compio owned read is never restarted. Zero also limits closing writes and shutdown to one poll. This does not guarantee completion or transmission of Close: Compio drivers may require a runtime turn even for an otherwise writable socket. No hidden grace period is added. Compio `next()` is not generally cancellation-safe: cancelling it during Close cleanup can lose that Close; these delivery guarantees assume the receive future is driven to completion.
 
 ## Configuration
 
