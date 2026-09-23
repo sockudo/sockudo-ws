@@ -1,7 +1,7 @@
 #![cfg(feature = "permessage-deflate")]
 
 use bytes::BytesMut;
-use sockudo_ws::frame::encode_frame_with_rsv;
+use sockudo_ws::frame::{FrameParser, encode_frame_with_rsv};
 use sockudo_ws::{CompressedProtocol, DeflateConfig, Error, Message, OpCode, Role};
 
 fn protocol(role: Role) -> CompressedProtocol {
@@ -138,5 +138,37 @@ fn compressed_readers_reject_rsv1_after_a_partial_frame() {
             unified.process(&mut wire),
             Err(Error::Protocol("RSV1 on control or continuation frame"))
         ));
+    }
+}
+
+#[test]
+fn compressed_readers_reject_invalid_rsv1_from_the_base_header() {
+    for role in [Role::Client, Role::Server] {
+        let masked = role == Role::Server;
+        for opcode in [OpCode::Continuation, OpCode::Ping] {
+            let payload_len = if opcode == OpCode::Ping { 125 } else { 126 };
+            let mut wire = BytesMut::from(
+                &[
+                    0xC0 | opcode as u8,
+                    payload_len | if masked { 0x80 } else { 0 },
+                ][..],
+            );
+
+            let mut parser = FrameParser::with_compression(1024, masked);
+            assert!(matches!(
+                parser.parse(&mut wire.clone()),
+                Err(Error::Protocol("RSV1 on control or continuation frame"))
+            ));
+
+            let (mut reader, _) = protocol(role).split(1024, 1024);
+            assert!(matches!(
+                reader.process(&mut wire.clone()),
+                Err(Error::Protocol("RSV1 on control or continuation frame"))
+            ));
+            assert!(matches!(
+                protocol(role).process(&mut wire),
+                Err(Error::Protocol("RSV1 on control or continuation frame"))
+            ));
+        }
     }
 }
