@@ -772,7 +772,8 @@ let config = Config::builder()
 | `max_message_size` | 64MB | Maximum message size |
 | `max_frame_size` | 16MB | Maximum single frame size |
 | `idle_timeout` | 120s | Hard inbound-idle deadline, independent of Pong detection (0 = disabled) |
-| `max_backpressure` | 1 MiB | Soft queued-write threshold: Tokio Sink readiness drains at this threshold; not a message-size limit or a disconnect condition (0 = drain any pending output) |
+| `max_backpressure` | 1 MiB | Soft queued-write threshold: with coalescing enabled, Tokio Sink readiness drains at the smaller of this and the high-water mark (default 64 KiB); not a message-size limit or a disconnect condition (0 = drain any pending output) |
+| `write_coalescing` | true | Allow Tokio Sink `feed` batching up to the readiness threshold; false drains any pending output before accepting another frame; `send` and `flush` always flush |
 | `auto_ping` | true | Enable proactive native Ping; automatic Pong/Close responses remain enabled when false |
 | `ping_interval` | 30s | Inbound inactivity before one native Ping (0 = disabled) |
 | `pong_timeout` | 10s | Matching Pong deadline after Ping flush (0 = no deadline and no second Ping until a match) |
@@ -783,11 +784,39 @@ let config = Config::builder()
 
 ### Queued-write backpressure
 
-`feed`, `send_all`, and `forward` may wait when queued output reaches `max_backpressure`. A single message may exceed this soft threshold; large messages do not cause a disconnect. A pending drain continues until the transport flush finishes, even if fewer bytes remain than the threshold.
+`feed`, `send_all`, and `forward` may wait when queued output reaches the effective readiness threshold: the smaller of the high-water mark and `max_backpressure` with coalescing enabled, or any pending output with coalescing disabled. A single message may exceed this soft threshold; large messages do not cause a disconnect. A pending drain continues until the transport flush finishes, even if fewer bytes remain than the threshold.
 
 On a unified stream, waiting for writable capacity does not poll the read side, so automatic Pong and inbound heartbeat/idle processing do not advance during that wait. An open connection has no write deadline from `close_timeout`. A peer that never reads can therefore stall a sequential fan-out loop. Monitor `write_buffer_len()` / `is_backpressured()` to choose an application-level slow-consumer policy; these observations do not guarantee that a later send cannot wait. Native `split()` lets reading/control processing progress independently, but sequentially awaiting each split writer still permits head-of-line blocking.
 
-`is_backpressured()` reports the separate high-water mark (64 KiB by default), which also controls read-batch coalescing. It is not the Sink readiness threshold: it can be true while `poll_ready` succeeds. `max_backpressure` defaults to 1 MiB and controls readiness draining independently.
+With `write_coalescing=true` (the default), Tokio Sink readiness drains at the smaller of the high-water mark (default 64 KiB) and `max_backpressure` (default 1 MiB). `is_backpressured()` reports whether queued bytes exceed the high-water mark; readiness starts draining when a threshold is reached. With `write_coalescing=false`, readiness drains any pending output before accepting another frame. Zero thresholds never flush an empty buffer merely to become ready.
+
+`SinkExt::send()` and `SinkExt::flush()` always complete the transport flush, even while parsed inbound messages remain unread. Applications previously relying on implicit batching across `send()` calls should use `feed()` and then `flush()` at each batch boundary. Flush before waiting for a reply or pausing reads; the read path also drains output before waiting for more input. A successful flush does not mean the peer has received or processed the message.
+
+For a Tokio unified echo loop, explicitly queue data replies with `feed`. When the parsed input batch is exhausted, `next()` drains queued output before reading more input:
+
+```rust
+use futures_util::{SinkExt, StreamExt};
+use sockudo_ws::{Message, WebSocketStream};
+use tokio::io::{AsyncRead, AsyncWrite};
+
+async fn echo<S>(ws: &mut WebSocketStream<S>) -> sockudo_ws::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    while let Some(message) = ws.next().await {
+        match message? {
+            message @ (Message::Text(_) | Message::Binary(_)) => {
+                ws.feed(message).await?;
+            }
+            Message::Close(_) => return Ok(()),
+            _ => {} // Ping/Pong are handled by the stream.
+        }
+    }
+    Ok(())
+}
+```
+
+Do not add an unconditional final `flush()` after Close, EOF or a stream error: the stream may already be closed. If the application stops this loop while the connection is still open, or pauses it to await a database/channel operation, explicitly flush queued replies before that break or await. This example batches replies; keep `send()` when each reply must be flushed before proceeding. Read-batch batching does not guarantee delivery of queued replies if a Close or error terminates the stream.
 
 ### Native keepalive semantics
 

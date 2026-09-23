@@ -220,9 +220,9 @@ where
     /// Returns `true` when the write buffer has exceeded the high water mark.
     /// Producers should pause sending new messages until `is_write_buffer_low()`
     /// returns `true` or until the buffer is flushed.
-    /// This monitoring/coalescing threshold is separate from
-    /// [`Config::max_backpressure`], which controls Sink readiness; a true
-    /// result does not necessarily mean `poll_ready` will wait.
+    /// With batching enabled, Sink readiness drains at the smaller of this
+    /// high-water mark and [`Config::max_backpressure`]. A true result does
+    /// not necessarily mean `poll_ready` will wait: a drain may finish immediately.
     ///
     /// # Example
     ///
@@ -265,7 +265,8 @@ where
     /// Set the high water mark for backpressure
     ///
     /// When the write buffer exceeds this threshold, `is_backpressured()` returns `true`.
-    /// Default is 64KB.
+    /// Sink readiness also drains at this mark when batching is enabled,
+    /// unless [`Config::max_backpressure`] triggers earlier. Default is 64KB.
     #[inline]
     pub fn set_high_water_mark(&mut self, size: usize) {
         self.high_water_mark = size;
@@ -774,9 +775,8 @@ where
                 }
                 return Poll::Ready(this.finish_read_close(Some(Error::ConnectionClosed)));
             }
-            // Write out frames coalesced from earlier sends before waiting on
-            // the transport, so batch-scoped corking never delays a reply past
-            // the end of the read batch.
+            // Write out frames queued by feed() before waiting on the transport,
+            // so replies do not wait for new input after this read batch ends.
             if self.write_buf.has_data() {
                 match self.as_mut().poll_write_out(cx) {
                     Poll::Ready(Ok(())) => {}
@@ -852,12 +852,17 @@ where
             return Poll::Ready(Err(Error::ConnectionClosed));
         }
         // Drain before accepting more data; a single message may exceed the
-        // threshold. Bypass batch coalescing so readiness applies backpressure.
+        // threshold. Readiness, rather than flush, controls batching.
         // CorkBuffer never retains empty segments: pending_bytes() > 0 is
         // equivalent to has_data(), so max(1) also handles a zero threshold.
-        if self.ready_flush_pending
-            || self.write_buf.pending_bytes() >= self.config.max_backpressure.max(1)
-        {
+        let threshold = if self.config.write_coalescing {
+            self.high_water_mark
+                .min(self.config.max_backpressure)
+                .max(1)
+        } else {
+            1
+        };
+        if self.ready_flush_pending || self.write_buf.pending_bytes() >= threshold {
             return self.poll_ready_drain(cx);
         }
         Poll::Ready(Ok(()))
@@ -912,21 +917,6 @@ where
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         if self.state == StreamState::Closed {
             return Poll::Ready(Err(Error::ConnectionClosed));
-        }
-        {
-            let this = self.as_mut().get_mut();
-            // Batch-scoped corking: while inbound messages that were already
-            // parsed are still queued for the application, keep the encoded
-            // frames buffered. poll_next writes them all in one vectored write
-            // before it next waits on the transport, so a read batch answered
-            // with N sends costs one syscall instead of N.
-            if this.config.write_coalescing
-                && this.state == StreamState::Open
-                && !this.pending_messages.is_empty()
-                && this.write_buf.pending_bytes() < this.high_water_mark
-            {
-                return Poll::Ready(Ok(()));
-            }
         }
         let result = self.as_mut().poll_write_out(cx);
         if result.is_pending() && self.as_mut().get_mut().poll_closing_expired(cx) {
@@ -1026,7 +1016,10 @@ impl WebSocketStreamBuilder {
     /// Set the high water mark for backpressure
     ///
     /// When the write buffer exceeds this threshold, `is_backpressured()` returns `true`.
-    /// Default is 64KB.
+    /// With write coalescing enabled, Sink readiness drains at the smaller of
+    /// this threshold and `Config::max_backpressure`; a zero threshold drains
+    /// any pending output. With coalescing disabled, readiness always drains
+    /// pending output before accepting another frame. Default is 64 KiB.
     pub fn high_water_mark(mut self, size: usize) -> Self {
         self.high_water_mark = size;
         self
@@ -2699,9 +2692,8 @@ where
                 }
                 return Poll::Ready(this.finish_read_close(Some(Error::ConnectionClosed)));
             }
-            // Write out frames coalesced from earlier sends before waiting on
-            // the transport, so batch-scoped corking never delays a reply past
-            // the end of the read batch.
+            // Write out frames queued by feed() before waiting on the transport,
+            // so replies do not wait for new input after this read batch ends.
             if self.write_buf.has_data() {
                 match self.as_mut().poll_write_out(cx) {
                     Poll::Ready(Ok(())) => {}
@@ -2775,12 +2767,17 @@ where
             return Poll::Ready(Err(Error::ConnectionClosed));
         }
         // Drain before accepting more data; a single message may exceed the
-        // threshold. Bypass batch coalescing so readiness applies backpressure.
+        // threshold. Readiness, rather than flush, controls batching.
         // CorkBuffer never retains empty segments: pending_bytes() > 0 is
         // equivalent to has_data(), so max(1) also handles a zero threshold.
-        if self.ready_flush_pending
-            || self.write_buf.pending_bytes() >= self.config.max_backpressure.max(1)
-        {
+        let threshold = if self.config.write_coalescing {
+            self.high_water_mark
+                .min(self.config.max_backpressure)
+                .max(1)
+        } else {
+            1
+        };
+        if self.ready_flush_pending || self.write_buf.pending_bytes() >= threshold {
             return self.poll_ready_drain(cx);
         }
         Poll::Ready(Ok(()))
@@ -2806,21 +2803,6 @@ where
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         if self.state == StreamState::Closed {
             return Poll::Ready(Err(Error::ConnectionClosed));
-        }
-        {
-            let this = self.as_mut().get_mut();
-            // Batch-scoped corking: while inbound messages that were already
-            // parsed are still queued for the application, keep the encoded
-            // frames buffered. poll_next writes them all in one vectored write
-            // before it next waits on the transport, so a read batch answered
-            // with N sends costs one syscall instead of N.
-            if this.config.write_coalescing
-                && this.state == StreamState::Open
-                && !this.pending_messages.is_empty()
-                && this.write_buf.pending_bytes() < this.high_water_mark
-            {
-                return Poll::Ready(Ok(()));
-            }
         }
         let result = self.as_mut().poll_write_out(cx);
         if result.is_pending() && self.as_mut().get_mut().poll_closing_expired(cx) {
@@ -3682,8 +3664,9 @@ mod tests {
             let task = tokio::spawn(async move {
                 for _ in 0..3 {
                     let msg = server.next().await.unwrap().unwrap();
-                    server.send(msg).await.unwrap();
+                    server.feed(msg).await.unwrap();
                 }
+                server.flush().await.unwrap();
                 server
             });
             (client_io, task)
@@ -3698,8 +3681,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_batch_answered_with_sends_is_one_write_when_coalescing() {
-        // Three frames arrive in one read; three send() calls answer them.
+    async fn read_batch_answered_with_feeds_is_one_write_when_coalescing() {
+        // Three frames arrive in one read; three feed() calls and a flush answer them.
         assert_eq!(echo_batch_write_count(true).await, 1);
         assert_eq!(echo_batch_write_count(false).await, 3);
     }
@@ -3719,7 +3702,7 @@ mod tests {
         let task = tokio::spawn(async move {
             for _ in 0..2 {
                 let msg = server.next().await.unwrap().unwrap();
-                server.send(msg).await.unwrap();
+                server.feed(msg).await.unwrap();
             }
             // Wait for a third message that only arrives after the client saw
             // both echoes.
@@ -3764,9 +3747,9 @@ mod tests {
         let big_for_task = big.clone();
         let task = tokio::spawn(async move {
             let _ = server.next().await.unwrap().unwrap();
-            server.send(Message::Binary(big_for_task)).await.unwrap();
+            server.feed(Message::Binary(big_for_task)).await.unwrap();
             let _ = server.next().await.unwrap().unwrap();
-            server.send(Message::text("small")).await.unwrap();
+            server.feed(Message::text("small")).await.unwrap();
             server
                 .send(Message::Binary(Bytes::from_static(b"tail")))
                 .await

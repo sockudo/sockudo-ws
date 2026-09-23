@@ -493,8 +493,9 @@ pub struct Config {
     ///
     /// Tokio `feed`, `send_all`, and `forward` may wait here. A blocked unified
     /// write does not drive reads or inbound deadlines; applications must choose
-    /// their slow-consumer policy. This threshold is separate from the high-water
-    /// mark reported by `WebSocketStream::is_backpressured`.
+    /// their slow-consumer policy. With [`Config::write_coalescing`] enabled,
+    /// readiness drains at the smaller of this threshold and the high-water
+    /// mark (default: 64 KiB); disabling batching drains any pending output.
     pub max_backpressure: usize,
     /// Send native Pings after inbound inactivity (default: true).
     ///
@@ -528,17 +529,15 @@ pub struct Config {
     /// No minimum grace period is added. Cleanup cannot
     /// replace an accepted peer Close or an existing idle/Pong timeout error.
     pub close_timeout: u32,
-    /// Coalesce outbound frames while inbound messages are still queued
-    /// (default: true).
+    /// Enable batching across Tokio `SinkExt::feed` calls (default: true).
     ///
-    /// When the stream has already parsed more inbound messages than the
-    /// application has consumed, `poll_flush` keeps the encoded frames in the
-    /// write buffer instead of issuing a write per `send()`. Everything is
-    /// written in one vectored write before the stream next waits for the
-    /// transport, or as soon as the buffer reaches the high water mark. This
-    /// turns a read batch of N messages answered with N `send()` calls into
-    /// one syscall instead of N. Disable for strict "returned means written"
-    /// semantics on every `send()`.
+    /// Readiness drains at the smaller of the high-water mark and
+    /// [`Config::max_backpressure`] before accepting another message. Disabling
+    /// batching drains any pending output before accepting another message.
+    /// `SinkExt::send` and `SinkExt::flush` always flush regardless of this
+    /// setting. Use `feed` followed by `flush` at batch boundaries, before
+    /// waiting for replies or pausing reads. The read path also flushes before
+    /// waiting for more transport input. One message may exceed either threshold.
     pub write_coalescing: bool,
     /// Per-message deflate configuration (requires `permessage-deflate` feature)
     #[cfg(feature = "permessage-deflate")]
@@ -715,8 +714,7 @@ impl ConfigBuilder {
         self
     }
 
-    /// Enable or disable coalescing of outbound frames across `send()` calls
-    /// while inbound messages are still queued (see
+    /// Enable or disable batching across Tokio `SinkExt::feed` calls (see
     /// [`Config::write_coalescing`]).
     pub fn write_coalescing(mut self, enabled: bool) -> Self {
         self.config.write_coalescing = enabled;
