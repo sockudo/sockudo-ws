@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Frame parsers with compression enabled, including unified and split readers, now reject RSV1 on continuation and control frames as soon as the base header arrives, without waiting for the payload; RSV1 remains valid on the first text or binary frame of a compressed message.
 - Splitting a Tokio or Compio stream now preserves partially parsed frames and receive-side fragment/UTF-8 state. Compressed protocol splitting retains parser progress while applying the supplied frame and message limits, including a lowered frame limit for an already accepted header.
 - Frame size limits now apply equally to complete and partially received short frames. Single-frame text and binary messages honor the message size limit in typed, raw, and compression-capable protocols, including uncompressed input to compressed readers. Exact-limit payloads remain accepted.
 - Resuming typed protocol processing during a fragmented text message now validates bytes accumulated by raw calls without losing split UTF-8 code points. Messages completed through the raw API remain unvalidated.

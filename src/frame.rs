@@ -275,7 +275,7 @@ pub struct FrameParser {
     max_frame_size: usize,
     /// Whether to expect masked frames (server mode)
     expect_masked: bool,
-    /// Whether RSV1 is allowed (compression enabled)
+    /// Whether RSV1 is allowed on text and binary frames (compression enabled)
     allow_rsv1: bool,
     /// Number of payload bytes at the front of the caller's buffer that have
     /// already been unmasked while waiting for the rest of the frame.
@@ -317,7 +317,10 @@ impl FrameParser {
         }
     }
 
-    /// Create a new frame parser with compression support
+    /// Create a new frame parser with compression support.
+    ///
+    /// RSV1 is accepted only on text and binary frames; control and continuation
+    /// frames with RSV1 are rejected as soon as the base header is available.
     pub fn with_compression(max_frame_size: usize, expect_masked: bool) -> Self {
         Self {
             state: ParseState::Header,
@@ -366,7 +369,7 @@ impl FrameParser {
         }
     }
 
-    /// Enable or disable RSV1 (compression) support
+    /// Enable or disable RSV1 (compression) support on text and binary frames.
     pub fn set_compression(&mut self, enabled: bool) {
         self.allow_rsv1 = enabled;
     }
@@ -408,7 +411,10 @@ impl FrameParser {
                     let rsv3 = b0 & 0x10 != 0;
 
                     // Quick RSV validation
-                    if (rsv1 && !self.allow_rsv1) || rsv2 || rsv3 {
+                    if (rsv1 && (!self.allow_rsv1 || !matches!(b0 & 0x0F, 0x1 | 0x2)))
+                        || rsv2
+                        || rsv3
+                    {
                         return self.parse_slow(buf);
                     }
 
@@ -464,7 +470,10 @@ impl FrameParser {
                     let rsv3 = b0 & 0x10 != 0;
 
                     // Quick RSV validation
-                    if (rsv1 && !self.allow_rsv1) || rsv2 || rsv3 {
+                    if (rsv1 && (!self.allow_rsv1 || !matches!(b0 & 0x0F, 0x1 | 0x2)))
+                        || rsv2
+                        || rsv3
+                    {
                         return self.parse_slow(buf);
                     }
 
@@ -538,7 +547,7 @@ impl FrameParser {
                     let rsv3 = b0 & 0x10 != 0;
 
                     // Check RSV bits (must be 0 unless extension negotiated)
-                    // RSV1 is allowed when compression is enabled
+                    // RSV1 is allowed only on the first data frame when compression is enabled.
                     if rsv1 && !self.allow_rsv1 {
                         return Err(Error::Protocol(
                             "RSV1 must be 0 (compression not negotiated)",
@@ -550,6 +559,9 @@ impl FrameParser {
 
                     let opcode =
                         OpCode::from_u8(b0 & 0x0F).ok_or(Error::InvalidFrame("invalid opcode"))?;
+                    if rsv1 && !matches!(opcode, OpCode::Text | OpCode::Binary) {
+                        return Err(Error::Protocol("RSV1 on control or continuation frame"));
+                    }
 
                     // Control frames must not be fragmented
                     if opcode.is_control() && !fin {

@@ -6,8 +6,8 @@
 use bytes::BytesMut;
 use criterion::measurement::WallTime;
 use criterion::{BatchSize, BenchmarkGroup, Criterion, criterion_group, criterion_main};
-use sockudo_ws::deflate::DeflateConfig;
-use sockudo_ws::frame::{FrameParser, OpCode, encode_frame};
+use sockudo_ws::deflate::{DeflateConfig, DeflateEncoder, MAX_WINDOW_BITS};
+use sockudo_ws::frame::{FrameParser, OpCode, encode_frame, encode_frame_with_rsv};
 use sockudo_ws::protocol::{
     CompressedProtocol, CompressedReaderProtocol, Message, Protocol, RawMessage, Role,
 };
@@ -132,6 +132,133 @@ fn bench_receive_limits(c: &mut Criterion) {
                 );
             }
         }
+
+        for size in [64, 4096] {
+            let payload = vec![b'x'; size];
+            let mut encoder = DeflateEncoder::new(MAX_WINDOW_BITS, true, 6, 0);
+            let compressed = encoder.compress(&payload).unwrap().unwrap();
+            let mut wire = BytesMut::new();
+            encode_frame_with_rsv(&mut wire, OpCode::Binary, &compressed, true, mask, true);
+            let config = DeflateConfig::default();
+            let mut unified = if masked {
+                CompressedProtocol::server(1 << 20, 1 << 20, config.clone())
+            } else {
+                CompressedProtocol::client(1 << 20, 1 << 20, config.clone())
+            };
+            measure(
+                &mut group,
+                format!("{direction}_compressed_rsv1_binary_{size}"),
+                &wire,
+                |input| unified.process(input).unwrap(),
+                |messages| verify_messages(messages, OpCode::Binary, &payload),
+            );
+            let mut reader = if masked {
+                CompressedReaderProtocol::server(1 << 20, 1 << 20, &config)
+            } else {
+                CompressedReaderProtocol::client(1 << 20, 1 << 20, &config)
+            };
+            measure(
+                &mut group,
+                format!("{direction}_reader_rsv1_binary_{size}"),
+                &wire,
+                |input| reader.process(input).unwrap(),
+                |messages| verify_messages(messages, OpCode::Binary, &payload),
+            );
+        }
+
+        let mut wire = BytesMut::new();
+        encode_frame(&mut wire, OpCode::Ping, b"ping", true, mask);
+        let config = DeflateConfig::default();
+        let mut unified = if masked {
+            CompressedProtocol::server(1 << 20, 1 << 20, config.clone())
+        } else {
+            CompressedProtocol::client(1 << 20, 1 << 20, config.clone())
+        };
+        measure(
+            &mut group,
+            format!("{direction}_compressed_ping"),
+            &wire,
+            |input| unified.process(input).unwrap(),
+            |messages| {
+                assert_eq!(messages.len(), 1);
+                assert!(matches!(&messages[0], Message::Ping(bytes) if bytes.as_ref() == b"ping"));
+            },
+        );
+        let mut reader = if masked {
+            CompressedReaderProtocol::server(1 << 20, 1 << 20, &config)
+        } else {
+            CompressedReaderProtocol::client(1 << 20, 1 << 20, &config)
+        };
+        measure(
+            &mut group,
+            format!("{direction}_reader_ping"),
+            &wire,
+            |input| reader.process(input).unwrap(),
+            |messages| {
+                assert_eq!(messages.len(), 1);
+                assert!(matches!(&messages[0], Message::Ping(bytes) if bytes.as_ref() == b"ping"));
+            },
+        );
+
+        let payload = b"fragmented compressed payload ".repeat(8);
+        let mut encoder = DeflateEncoder::new(MAX_WINDOW_BITS, true, 6, 0);
+        let compressed = encoder.compress(&payload).unwrap().unwrap();
+        let midpoint = compressed.len() / 2;
+        assert!(midpoint > 0);
+        let mut wire = BytesMut::new();
+        encode_frame_with_rsv(
+            &mut wire,
+            OpCode::Binary,
+            &compressed[..midpoint],
+            false,
+            mask,
+            true,
+        );
+        encode_frame(&mut wire, OpCode::Ping, b"ping", true, mask);
+        encode_frame(
+            &mut wire,
+            OpCode::Continuation,
+            &compressed[midpoint..],
+            true,
+            mask,
+        );
+        let config = DeflateConfig::default();
+        let mut unified = if masked {
+            CompressedProtocol::server(1 << 20, 1 << 20, config.clone())
+        } else {
+            CompressedProtocol::client(1 << 20, 1 << 20, config.clone())
+        };
+        measure(
+            &mut group,
+            format!("{direction}_compressed_fragmented_ping"),
+            &wire,
+            |input| unified.process(input).unwrap(),
+            |messages| {
+                assert_eq!(messages.len(), 2);
+                assert!(matches!(&messages[0], Message::Ping(bytes) if bytes.as_ref() == b"ping"));
+                assert!(
+                    matches!(&messages[1], Message::Binary(bytes) if bytes.as_ref() == payload)
+                );
+            },
+        );
+        let mut reader = if masked {
+            CompressedReaderProtocol::server(1 << 20, 1 << 20, &config)
+        } else {
+            CompressedReaderProtocol::client(1 << 20, 1 << 20, &config)
+        };
+        measure(
+            &mut group,
+            format!("{direction}_reader_fragmented_ping"),
+            &wire,
+            |input| reader.process(input).unwrap(),
+            |messages| {
+                assert_eq!(messages.len(), 2);
+                assert!(matches!(&messages[0], Message::Ping(bytes) if bytes.as_ref() == b"ping"));
+                assert!(
+                    matches!(&messages[1], Message::Binary(bytes) if bytes.as_ref() == payload)
+                );
+            },
+        );
     }
     group.finish();
 }
