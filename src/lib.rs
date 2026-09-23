@@ -490,6 +490,11 @@ pub struct Config {
     /// this is not an outbound message size limit or a peak memory bound.
     /// Zero drains any pending output before accepting another message.
     /// Split and Compio sends already drain each message before returning.
+    ///
+    /// Tokio `feed`, `send_all`, and `forward` may wait here. A blocked unified
+    /// write does not drive reads or inbound deadlines; applications must choose
+    /// their slow-consumer policy. This threshold is separate from the high-water
+    /// mark reported by `WebSocketStream::is_backpressured`.
     pub max_backpressure: usize,
     /// Send native Pings after inbound inactivity (default: true).
     ///

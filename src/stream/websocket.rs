@@ -220,6 +220,9 @@ where
     /// Returns `true` when the write buffer has exceeded the high water mark.
     /// Producers should pause sending new messages until `is_write_buffer_low()`
     /// returns `true` or until the buffer is flushed.
+    /// This monitoring/coalescing threshold is separate from
+    /// [`Config::max_backpressure`], which controls Sink readiness; a true
+    /// result does not necessarily mean `poll_ready` will wait.
     ///
     /// # Example
     ///
@@ -473,6 +476,16 @@ where
             .poll(cx)
     }
 
+    // Keep the transport write/flush machinery out of the readiness fast path.
+    #[cold]
+    #[inline(never)]
+    fn poll_ready_drain(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        // Partial writes may bring queued bytes below the threshold before the
+        // transport is drained. Continue that flush across subsequent polls.
+        self.ready_flush_pending = true;
+        self.poll_write_out(cx)
+    }
+
     /// Write every pending frame to the transport and flush it.
     fn poll_write_out(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         let this = self.as_mut().get_mut();
@@ -510,7 +523,11 @@ where
         // Flush underlying stream
         let this = self.as_mut().get_mut();
         match Pin::new(&mut this.inner).poll_flush(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Ok(())) => {
+                // A read-side or explicit flush can finish a cancelled readiness drain.
+                this.ready_flush_pending = false;
+                Poll::Ready(Ok(()))
+            }
             Poll::Ready(Err(e)) => {
                 this.state = StreamState::Closed;
                 this.heartbeat.stop();
@@ -830,22 +847,18 @@ where
 {
     type Error = Error;
 
-    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         if self.state != StreamState::Open {
             return Poll::Ready(Err(Error::ConnectionClosed));
         }
         // Drain before accepting more data; a single message may exceed the
         // threshold. Bypass batch coalescing so readiness applies backpressure.
-        if self.write_buf.has_data()
-            && self.write_buf.pending_bytes() >= self.config.max_backpressure
+        // CorkBuffer never retains empty segments: pending_bytes() > 0 is
+        // equivalent to has_data(), so max(1) also handles a zero threshold.
+        if self.ready_flush_pending
+            || self.write_buf.pending_bytes() >= self.config.max_backpressure.max(1)
         {
-            self.ready_flush_pending = true;
-        }
-        // Partial writes may bring queued bytes below the threshold before the
-        // transport is drained. Continue that flush across subsequent polls.
-        if self.ready_flush_pending {
-            std::task::ready!(self.as_mut().poll_write_out(cx))?;
-            self.ready_flush_pending = false;
+            return self.poll_ready_drain(cx);
         }
         Poll::Ready(Ok(()))
     }
@@ -2223,6 +2236,9 @@ where
     }
 
     /// Check if backpressure should be applied
+    ///
+    /// Uses the high-water mark, not [`Config::max_backpressure`]. This is a
+    /// monitoring/coalescing signal, not a prediction that Sink readiness will wait.
     #[inline]
     pub fn is_backpressured(&self) -> bool {
         self.write_buf.pending_bytes() > self.high_water_mark
@@ -2411,6 +2427,16 @@ where
             .poll(cx)
     }
 
+    // Keep the transport write/flush machinery out of the readiness fast path.
+    #[cold]
+    #[inline(never)]
+    fn poll_ready_drain(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        // Partial writes may bring queued bytes below the threshold before the
+        // transport is drained. Continue that flush across subsequent polls.
+        self.ready_flush_pending = true;
+        self.poll_write_out(cx)
+    }
+
     /// Write every pending frame to the transport and flush it.
     fn poll_write_out(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         let this = self.as_mut().get_mut();
@@ -2446,7 +2472,11 @@ where
 
         let this = self.as_mut().get_mut();
         match Pin::new(&mut this.inner).poll_flush(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Ok(())) => {
+                // A read-side or explicit flush can finish a cancelled readiness drain.
+                this.ready_flush_pending = false;
+                Poll::Ready(Ok(()))
+            }
             Poll::Ready(Err(e)) => {
                 this.state = StreamState::Closed;
                 this.heartbeat.stop();
@@ -2740,22 +2770,18 @@ where
 {
     type Error = Error;
 
-    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         if self.state != StreamState::Open {
             return Poll::Ready(Err(Error::ConnectionClosed));
         }
         // Drain before accepting more data; a single message may exceed the
         // threshold. Bypass batch coalescing so readiness applies backpressure.
-        if self.write_buf.has_data()
-            && self.write_buf.pending_bytes() >= self.config.max_backpressure
+        // CorkBuffer never retains empty segments: pending_bytes() > 0 is
+        // equivalent to has_data(), so max(1) also handles a zero threshold.
+        if self.ready_flush_pending
+            || self.write_buf.pending_bytes() >= self.config.max_backpressure.max(1)
         {
-            self.ready_flush_pending = true;
-        }
-        // Partial writes may bring queued bytes below the threshold before the
-        // transport is drained. Continue that flush across subsequent polls.
-        if self.ready_flush_pending {
-            std::task::ready!(self.as_mut().poll_write_out(cx))?;
-            self.ready_flush_pending = false;
+            return self.poll_ready_drain(cx);
         }
         Poll::Ready(Ok(()))
     }

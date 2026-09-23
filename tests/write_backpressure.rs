@@ -9,6 +9,7 @@ struct WriteState {
     allowance: usize,
     flush_ready: bool,
     written: Vec<u8>,
+    flush_polls: usize,
 }
 
 struct ControlledIo(std::rc::Rc<std::cell::RefCell<WriteState>>);
@@ -43,7 +44,9 @@ impl tokio::io::AsyncWrite for ControlledIo {
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        if self.0.borrow().flush_ready {
+        let mut state = self.0.borrow_mut();
+        state.flush_polls += 1;
+        if state.flush_ready {
             std::task::Poll::Ready(Ok(()))
         } else {
             std::task::Poll::Pending
@@ -99,6 +102,160 @@ partial_drain_case!(
     compressed_partial_drain_waits_for_transport_flush,
     |io, config| {
         sockudo_ws::CompressedWebSocketStream::server(
+            io,
+            config,
+            sockudo_ws::DeflateConfig::default(),
+        )
+    }
+);
+
+macro_rules! completed_drain_case {
+    ($name:ident, $make:expr) => {
+        #[tokio::test]
+        async fn $name() {
+            let state = std::rc::Rc::new(std::cell::RefCell::new(WriteState::default()));
+            let mut ws = ($make)(
+                ControlledIo(state.clone()),
+                Config::builder().max_backpressure(10).build(),
+            );
+            ws.feed(Message::Ping(bytes::Bytes::from_static(&[1; 8])))
+                .await
+                .unwrap();
+            {
+                let next = ws.feed(Message::Ping(bytes::Bytes::from_static(&[2; 8])));
+                let mut next = std::pin::pin!(next);
+                assert!(futures_util::poll!(next.as_mut()).is_pending());
+            }
+            state.borrow_mut().allowance = 10;
+            state.borrow_mut().flush_ready = true;
+            ws.flush().await.unwrap();
+            let polls = state.borrow().flush_polls;
+            state.borrow_mut().flush_ready = false;
+            let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+            assert!(matches!(
+                std::pin::Pin::new(&mut ws).poll_ready(&mut cx),
+                std::task::Poll::Ready(Ok(()))
+            ));
+            assert_eq!(state.borrow().flush_polls, polls);
+            assert_eq!(state.borrow().written, [0x89, 8, 1, 1, 1, 1, 1, 1, 1, 1]);
+        }
+    };
+}
+completed_drain_case!(
+    flush_completes_cancelled_readiness_drain,
+    WebSocketStream::server
+);
+#[cfg(feature = "permessage-deflate")]
+completed_drain_case!(
+    compressed_flush_completes_cancelled_readiness_drain,
+    |io, config| {
+        sockudo_ws::CompressedWebSocketStream::server(
+            io,
+            config,
+            sockudo_ws::DeflateConfig::default(),
+        )
+    }
+);
+
+macro_rules! bulk_readiness_case {
+    ($name:ident, $make:expr, $forward:expr) => {
+        #[tokio::test]
+        async fn $name() {
+            let state = std::rc::Rc::new(std::cell::RefCell::new(WriteState::default()));
+            let mut ws = ($make)(
+                ControlledIo(state.clone()),
+                Config::builder().max_backpressure(10).build(),
+            );
+            let mut input = futures_util::stream::iter([
+                Ok::<_, sockudo_ws::Error>(Message::Ping(bytes::Bytes::from_static(&[1; 8]))),
+                Ok(Message::Ping(bytes::Bytes::from_static(&[2; 8]))),
+            ]);
+            {
+                let transfer = async {
+                    if $forward {
+                        input.forward(&mut ws).await
+                    } else {
+                        ws.send_all(&mut input).await
+                    }
+                };
+                let mut transfer = std::pin::pin!(transfer);
+                assert!(futures_util::poll!(transfer.as_mut()).is_pending());
+            }
+            // The second message was not accepted while the first frame was blocked.
+            assert_eq!(ws.write_buffer_len(), 10);
+            state.borrow_mut().allowance = 10;
+            state.borrow_mut().flush_ready = true;
+            ws.flush().await.unwrap();
+            assert_eq!(state.borrow().written, [0x89, 8, 1, 1, 1, 1, 1, 1, 1, 1]);
+        }
+    };
+}
+bulk_readiness_case!(send_all_respects_readiness, WebSocketStream::server, false);
+bulk_readiness_case!(forward_respects_readiness, WebSocketStream::server, true);
+#[cfg(feature = "permessage-deflate")]
+bulk_readiness_case!(
+    compressed_send_all_respects_readiness,
+    |io, config| {
+        sockudo_ws::CompressedWebSocketStream::server(
+            io,
+            config,
+            sockudo_ws::DeflateConfig::default(),
+        )
+    },
+    false
+);
+#[cfg(feature = "permessage-deflate")]
+bulk_readiness_case!(
+    compressed_forward_respects_readiness,
+    |io, config| {
+        sockudo_ws::CompressedWebSocketStream::server(
+            io,
+            config,
+            sockudo_ws::DeflateConfig::default(),
+        )
+    },
+    true
+);
+
+macro_rules! coalesced_readiness_case {
+    ($name:ident, $make:expr) => {
+        #[tokio::test]
+        async fn $name() {
+            use tokio::io::AsyncWriteExt;
+            let (io, mut peer) = tokio::io::duplex(128);
+            let mut ws = ($make)(io, Config::builder().max_backpressure(8).build());
+            peer.write_all(&[0x82, 1, 1, 0x82, 1, 2]).await.unwrap();
+            assert_eq!(ws.next().await.unwrap().unwrap().as_bytes(), &[1]);
+            ws.send(Message::Ping(bytes::Bytes::from_static(&[3; 2])))
+                .await
+                .unwrap();
+            assert_eq!(ws.write_buffer_len(), 8);
+            ws.feed(Message::Ping(bytes::Bytes::from_static(&[4; 2])))
+                .await
+                .unwrap();
+            let mut wire = [0; 8];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                peer.read_exact(&mut wire),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(&wire[..2], &[0x89, 0x82]);
+            assert_eq!([wire[6] ^ wire[2], wire[7] ^ wire[3]], [3, 3]);
+            assert_eq!(ws.next().await.unwrap().unwrap().as_bytes(), &[2]);
+        }
+    };
+}
+coalesced_readiness_case!(
+    readiness_drains_during_coalesced_read_batch,
+    WebSocketStream::client
+);
+#[cfg(feature = "permessage-deflate")]
+coalesced_readiness_case!(
+    compressed_readiness_drains_during_coalesced_read_batch,
+    |io, config| {
+        sockudo_ws::CompressedWebSocketStream::client(
             io,
             config,
             sockudo_ws::DeflateConfig::default(),
