@@ -308,6 +308,11 @@ required-features = ["tokio-runtime", "permessage-deflate"]
 name = "fragment_validation"
 harness = false
 
+[[bench]]
+name = "receive_limits"
+harness = false
+required-features = ["permessage-deflate"]
+
 [profile.release]
 opt-level = 3
 lto = "fat"
