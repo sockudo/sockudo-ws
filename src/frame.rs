@@ -400,6 +400,10 @@ impl FrameParser {
                             return Err(Error::Protocol("control frame must not be fragmented"));
                         }
 
+                        if payload_len > self.max_frame_size {
+                            return Err(Error::FrameTooLarge);
+                        }
+
                         // Extract payload
                         buf.advance(2);
                         let payload = buf.split_to(payload_len).freeze();
@@ -450,6 +454,10 @@ impl FrameParser {
                         // Control frame fragmentation check
                         if opcode.is_control() && !fin {
                             return Err(Error::Protocol("control frame must not be fragmented"));
+                        }
+
+                        if payload_len > self.max_frame_size {
+                            return Err(Error::FrameTooLarge);
                         }
 
                         // Extract mask
