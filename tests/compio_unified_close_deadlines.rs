@@ -15,6 +15,7 @@ struct TestIo {
     pending_shutdown: bool,
     fail_flush: bool,
     block_write: bool,
+    block_after_local_close: bool,
     repeat_ping: bool,
     writes: Rc<Cell<usize>>,
 }
@@ -26,6 +27,7 @@ impl TestIo {
             pending_shutdown,
             fail_flush: false,
             block_write: false,
+            block_after_local_close: false,
             repeat_ping: false,
             writes: Rc::new(Cell::new(0)),
         }
@@ -47,6 +49,9 @@ impl AsyncRead for TestIo {
 impl AsyncWrite for TestIo {
     async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
         self.writes.set(self.writes.get() + 1);
+        if self.block_after_local_close && self.writes.get() > 1 {
+            return pending().await;
+        }
         if self.block_write {
             return if self.writes.get() == 1 {
                 BufResult(Ok(buf.as_init().len().min(3)), buf)
@@ -84,6 +89,59 @@ macro_rules! close_cases {
     ($module:ident, $make:expr) => {
         mod $module {
             use super::*;
+
+            #[compio::test]
+            async fn post_expiry_read_is_not_renewed_after_pre_expiry_input() {
+                let mut io = TestIo::new(None, false);
+                io.repeat_ping = true;
+                let mut ws = ($make)(io, config(1));
+                ws.close(1000, "").await.unwrap();
+                assert!(ws.next().await.unwrap().unwrap().is_ping());
+                compio::time::sleep(Duration::from_millis(1100)).await;
+                assert!(ws.next().await.unwrap().unwrap().is_ping());
+                assert!(matches!(
+                    ws.next().await,
+                    Some(Err(Error::ConnectionClosed))
+                ));
+                assert!(ws.next().await.is_none());
+            }
+
+            #[compio::test]
+            async fn pong_write_timeout_terminates_without_draining_data() {
+                let mut io = TestIo::new(Some(b"\x89\x01p\x82\x01d"), false);
+                io.block_after_local_close = true;
+                let mut ws = ($make)(io, config(1));
+                ws.close(1000, "").await.unwrap();
+                assert!(matches!(
+                    compio::time::timeout(Duration::from_secs(3), ws.next())
+                        .await
+                        .unwrap(),
+                    Some(Err(Error::ConnectionClosed))
+                ));
+                assert!(ws.next().await.is_none());
+            }
+
+            #[compio::test]
+            async fn accepted_close_before_parse_error_suppresses_all_pongs() {
+                let io = TestIo::new(Some(b"\x89\x01p\x89\x01q\x88\x02\x03\xe8\x83\x00"), false);
+                let writes = io.writes.clone();
+                let mut ws = ($make)(io, config(1));
+                assert!(ws.next().await.unwrap().unwrap().is_ping());
+                assert!(ws.next().await.unwrap().unwrap().is_ping());
+                assert_eq!(writes.get(), 0);
+                assert!(ws.next().await.unwrap().unwrap().is_close());
+                assert!(ws.next().await.is_none());
+            }
+
+            #[compio::test]
+            async fn expired_nonzero_budget_reads_ready_close_once() {
+                let mut ws = ($make)(TestIo::new(Some(b"\x88\x02\x03\xe8"), true), config(1));
+                ws.close(1000, "").await.unwrap();
+
+                compio::time::sleep(Duration::from_millis(1100)).await;
+                assert!(ws.next().await.unwrap().unwrap().is_close());
+                assert!(ws.next().await.is_none());
+            }
 
             #[compio::test]
             async fn zero_budget_tcp_close_does_not_wait_for_driver_completion() {
@@ -213,6 +271,8 @@ macro_rules! close_cases {
                     assert!(ws.next().await.unwrap().unwrap().is_ping());
                 }
                 compio::time::sleep(Duration::from_millis(300)).await;
+                // All budgets permit exactly one ready read after expiry.
+                assert!(ws.next().await.unwrap().unwrap().is_ping());
                 assert!(matches!(
                     ws.next().await,
                     Some(Err(Error::ConnectionClosed))

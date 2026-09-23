@@ -1344,7 +1344,9 @@ pub struct CompioWebSocketStream<S> {
     write_buf: BytesMut,
     state: CompioStreamState,
     closing_deadline: Option<Instant>,
-    closing_read_attempted: bool,
+    post_expiry_read_attempted: bool,
+    // Cached once per parsed batch, including prefixes before parse errors.
+    batch_has_close: bool,
     immediate_write_shutdown: bool,
     write_shutdown_complete: bool,
     config: Config,
@@ -1387,7 +1389,8 @@ where
             write_buf: BytesMut::with_capacity(config.write_buffer_size),
             state: CompioStreamState::Open,
             closing_deadline: None,
-            closing_read_attempted: false,
+            post_expiry_read_attempted: false,
+            batch_has_close: false,
             immediate_write_shutdown: false,
             write_shutdown_complete: false,
             config,
@@ -1556,10 +1559,10 @@ where
             }
 
             // Accepted messages are drained before enforcing the new-I/O budget.
-            // A zero-budget close gets at most one read poll, not one per next().
+            // Every budget gets one nonwaiting post-expiry read, not one per next().
             if let Some(deadline) = self.closing_deadline
                 && Instant::now() >= deadline
-                && (self.config.close_timeout != 0 || self.closing_read_attempted)
+                && self.post_expiry_read_attempted
             {
                 self.state = CompioStreamState::Closed;
                 if !self.write_shutdown_complete && self.write_buf.is_empty() {
@@ -1572,7 +1575,9 @@ where
             }
 
             let read_result = if let Some(deadline) = self.closing_deadline {
-                self.closing_read_attempted = true;
+                if Instant::now() >= deadline {
+                    self.post_expiry_read_attempted = true;
+                }
                 match compio_until(deadline, read_more(&mut self.inner, &mut self.read_buf)).await {
                     Some(result) => Some(result),
                     None => {
@@ -1781,6 +1786,8 @@ where
         let result = self
             .protocol
             .process_into(&mut self.read_buf, &mut self.pending_messages);
+        // Refresh even on error: the accepted prefix may already contain Close.
+        self.batch_has_close = self.pending_messages.iter().any(Message::is_close);
         self.pending_messages.reverse();
         result.map(|()| !self.pending_messages.is_empty())
     }
@@ -1799,7 +1806,7 @@ where
                 // Do not let that write hide the queued Close, or start a new
                 // control write after the closing budget has expired.
                 if !self.write_shutdown_complete
-                    && !self.pending_messages.iter().any(Message::is_close)
+                    && !self.batch_has_close
                     && !self.closing_deadline.is_some_and(|at| Instant::now() >= at)
                 {
                     self.protocol.encode_pong(data, &mut self.write_buf);
@@ -2715,7 +2722,9 @@ pub struct CompioCompressedWebSocketStream<S> {
     write_buf: BytesMut,
     state: CompioStreamState,
     closing_deadline: Option<Instant>,
-    closing_read_attempted: bool,
+    post_expiry_read_attempted: bool,
+    // Cached once per parsed batch, including prefixes before parse errors.
+    batch_has_close: bool,
     immediate_write_shutdown: bool,
     write_shutdown_complete: bool,
     config: Config,
@@ -2763,7 +2772,8 @@ where
             write_buf: BytesMut::with_capacity(config.write_buffer_size),
             state: CompioStreamState::Open,
             closing_deadline: None,
-            closing_read_attempted: false,
+            post_expiry_read_attempted: false,
+            batch_has_close: false,
             immediate_write_shutdown: false,
             write_shutdown_complete: false,
             config,
@@ -2806,7 +2816,8 @@ where
             write_buf: BytesMut::with_capacity(config.write_buffer_size),
             state: CompioStreamState::Open,
             closing_deadline: None,
-            closing_read_attempted: false,
+            post_expiry_read_attempted: false,
+            batch_has_close: false,
             immediate_write_shutdown: false,
             write_shutdown_complete: false,
             config,
@@ -2894,10 +2905,10 @@ where
             }
 
             // Accepted messages are drained before enforcing the new-I/O budget.
-            // A zero-budget close gets at most one read poll, not one per next().
+            // Every budget gets one nonwaiting post-expiry read, not one per next().
             if let Some(deadline) = self.closing_deadline
                 && Instant::now() >= deadline
-                && (self.config.close_timeout != 0 || self.closing_read_attempted)
+                && self.post_expiry_read_attempted
             {
                 self.state = CompioStreamState::Closed;
                 if !self.write_shutdown_complete && self.write_buf.is_empty() {
@@ -2910,7 +2921,9 @@ where
             }
 
             let read_result = if let Some(deadline) = self.closing_deadline {
-                self.closing_read_attempted = true;
+                if Instant::now() >= deadline {
+                    self.post_expiry_read_attempted = true;
+                }
                 match compio_until(deadline, read_more(&mut self.inner, &mut self.read_buf)).await {
                     Some(result) => Some(result),
                     None => {
@@ -3143,6 +3156,8 @@ where
         let result = self
             .protocol
             .process_into(&mut self.read_buf, &mut self.pending_messages);
+        // Refresh even on error: the accepted prefix may already contain Close.
+        self.batch_has_close = self.pending_messages.iter().any(Message::is_close);
         self.pending_messages.reverse();
         result.map(|()| !self.pending_messages.is_empty())
     }
@@ -3161,7 +3176,7 @@ where
                 // Do not let that write hide the queued Close, or start a new
                 // control write after the closing budget has expired.
                 if !self.write_shutdown_complete
-                    && !self.pending_messages.iter().any(Message::is_close)
+                    && !self.batch_has_close
                     && !self.closing_deadline.is_some_and(|at| Instant::now() >= at)
                 {
                     self.protocol.encode_pong(data, &mut self.write_buf);

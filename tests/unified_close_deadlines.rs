@@ -16,6 +16,7 @@ struct ShutdownIo {
     pending_shutdown: bool,
     fail_flush: bool,
     block_write: bool,
+    block_after_local_close: bool,
     writes: Rc<Cell<usize>>,
     shutdowns: Rc<Cell<usize>>,
 }
@@ -37,6 +38,9 @@ impl AsyncWrite for ShutdownIo {
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
         self.writes.set(self.writes.get() + 1);
+        if self.block_after_local_close && self.writes.get() > 1 {
+            return Poll::Pending;
+        }
         if self.block_write {
             return if self.writes.get() == 1 {
                 Poll::Ready(Ok(bytes.len().min(3)))
@@ -73,6 +77,7 @@ fn connection(pending_shutdown: bool, fail_flush: bool) -> (ShutdownIo, DuplexSt
             pending_shutdown,
             fail_flush,
             block_write: false,
+            block_after_local_close: false,
             writes: Rc::new(Cell::new(0)),
             shutdowns: Rc::new(Cell::new(0)),
         },
@@ -92,6 +97,64 @@ macro_rules! close_cases {
     ($module:ident, $make:expr) => {
         mod $module {
             use super::*;
+
+            #[tokio::test(start_paused = true)]
+            async fn post_expiry_read_is_not_renewed_after_pre_expiry_input() {
+                let (io, mut peer) = connection(false, false);
+                let mut ws = ($make)(io, config());
+                ws.close(1000, "").await.unwrap();
+                peer.write_all(b"\x89\x01p").await.unwrap();
+                assert!(ws.next().await.unwrap().unwrap().is_ping());
+                tokio::time::advance(Duration::from_secs(2)).await;
+                peer.write_all(b"\x89\x01p").await.unwrap();
+                assert!(ws.next().await.unwrap().unwrap().is_ping());
+                peer.write_all(b"\x89\x01p").await.unwrap();
+                assert!(matches!(
+                    ws.next().await,
+                    Some(Err(Error::ConnectionClosed))
+                ));
+                assert!(ws.next().await.is_none());
+            }
+
+            #[tokio::test(start_paused = true)]
+            async fn pong_write_timeout_terminates_without_draining_data() {
+                let (mut io, mut peer) = connection(false, false);
+                io.block_after_local_close = true;
+                let mut ws = ($make)(io, config());
+                ws.close(1000, "").await.unwrap();
+                peer.write_all(b"\x89\x01p\x82\x01d").await.unwrap();
+                assert!(matches!(
+                    ws.next().await,
+                    Some(Err(Error::ConnectionClosed))
+                ));
+                assert!(ws.next().await.is_none());
+            }
+
+            #[tokio::test(start_paused = true)]
+            async fn accepted_close_before_parse_error_suppresses_all_pongs() {
+                let (io, mut peer) = connection(false, false);
+                let writes = io.writes.clone();
+                let mut ws = ($make)(io, config());
+                peer.write_all(b"\x89\x01p\x89\x01q\x88\x02\x03\xe8\x83\x00")
+                    .await
+                    .unwrap();
+                assert!(ws.next().await.unwrap().unwrap().is_ping());
+                assert!(ws.next().await.unwrap().unwrap().is_ping());
+                assert_eq!(writes.get(), 0);
+                assert!(ws.next().await.unwrap().unwrap().is_close());
+                assert!(ws.next().await.is_none());
+            }
+
+            #[tokio::test(start_paused = true)]
+            async fn expired_nonzero_budget_reads_ready_close_once() {
+                let (io, mut peer) = connection(true, false);
+                let mut ws = ($make)(io, config());
+                ws.close(1000, "").await.unwrap();
+                peer.write_all(b"\x88\x02\x03\xe8").await.unwrap();
+                tokio::time::advance(Duration::from_secs(2)).await;
+                assert!(ws.next().await.unwrap().unwrap().is_close());
+                assert!(ws.next().await.is_none());
+            }
 
             #[tokio::test(start_paused = true)]
             async fn zero_budget_pending_read_terminates_on_first_poll() {

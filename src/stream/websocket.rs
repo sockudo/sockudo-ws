@@ -74,7 +74,9 @@ pin_project! {
         write_buf: CorkBuffer,
         state: StreamState,
         closing_deadline: Option<u64>,
-        closing_read_attempted: bool,
+        post_expiry_read_attempted: bool,
+        // Cached once per parsed batch, including prefixes before parse errors.
+        batch_has_close: bool,
         immediate_write_shutdown: bool,
         write_shutdown_complete: bool,
         config: Config,
@@ -146,7 +148,8 @@ where
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
             state: StreamState::Open,
             closing_deadline: None,
-            closing_read_attempted: false,
+            post_expiry_read_attempted: false,
+            batch_has_close: false,
             immediate_write_shutdown: false,
             write_shutdown_complete: false,
             config,
@@ -388,6 +391,7 @@ where
             .protocol
             .process_into(&mut self.read_buf, &mut self.pending_messages);
         // process_into preserves accepted messages even when a later frame fails.
+        self.batch_has_close = self.pending_messages.iter().any(Message::is_close);
         self.pending_messages.reverse();
         result
     }
@@ -677,7 +681,7 @@ where
                         // Queue pong response
                         let this = self.as_mut().get_mut();
                         if this.write_shutdown_complete
-                            || this.pending_messages.iter().any(Message::is_close)
+                            || this.batch_has_close
                             || this.poll_closing_expired(cx)
                         {
                             // END_STREAM forbids a Pong, but the read half must
@@ -736,11 +740,10 @@ where
 
             // Try to read more data
             // Drain the finite accepted batch before checking the I/O budget.
-            // Only zero-budget closing gets one read poll after expiry, and that
-            // opportunity is shared across all subsequent next() calls.
-            if self.as_mut().get_mut().poll_closing_expired(cx)
-                && (self.config.close_timeout != 0 || self.closing_read_attempted)
-            {
+            // Every budget permits one nonwaiting read poll after expiry, shared
+            // across subsequent next() calls rather than renewed by each call.
+            let closing_expired = self.as_mut().get_mut().poll_closing_expired(cx);
+            if closing_expired && self.post_expiry_read_attempted {
                 let this = self.as_mut().get_mut();
                 // No pending frame may be flushed through transport cleanup.
                 // At expiry shutdown gets one poll, without a new waiting budget.
@@ -777,8 +780,8 @@ where
                 }
             }
 
-            if self.closing_deadline.is_some() {
-                self.closing_read_attempted = true;
+            if closing_expired {
+                self.post_expiry_read_attempted = true;
             }
             match self.as_mut().poll_read_more(cx) {
                 Poll::Ready(Ok(0)) => {
@@ -806,7 +809,7 @@ where
                     return Poll::Ready(Some(Err(e.into())));
                 }
                 Poll::Pending => {
-                    // No more data available right now. A zero-budget attempt
+                    // No more data available right now. A post-expiry attempt
                     // must terminate instead of waiting for another wakeup.
                     let this = self.as_mut().get_mut();
                     if this.poll_closing_expired(cx) {
@@ -2081,7 +2084,9 @@ pin_project! {
         write_buf: CorkBuffer,
         state: StreamState,
         closing_deadline: Option<u64>,
-        closing_read_attempted: bool,
+        post_expiry_read_attempted: bool,
+        // Cached once per parsed batch, including prefixes before parse errors.
+        batch_has_close: bool,
         immediate_write_shutdown: bool,
         write_shutdown_complete: bool,
         config: Config,
@@ -2125,7 +2130,8 @@ where
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
             state: StreamState::Open,
             closing_deadline: None,
-            closing_read_attempted: false,
+            post_expiry_read_attempted: false,
+            batch_has_close: false,
             immediate_write_shutdown: false,
             write_shutdown_complete: false,
             config,
@@ -2162,7 +2168,8 @@ where
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
             state: StreamState::Open,
             closing_deadline: None,
-            closing_read_attempted: false,
+            post_expiry_read_attempted: false,
+            batch_has_close: false,
             immediate_write_shutdown: false,
             write_shutdown_complete: false,
             config,
@@ -2310,6 +2317,7 @@ where
             .protocol
             .process_into(&mut self.read_buf, &mut self.pending_messages);
         // process_into preserves accepted messages even when a later frame fails.
+        self.batch_has_close = self.pending_messages.iter().any(Message::is_close);
         self.pending_messages.reverse();
         result
     }
@@ -2588,7 +2596,7 @@ where
                     Message::Ping(data) => {
                         let this = self.as_mut().get_mut();
                         if this.write_shutdown_complete
-                            || this.pending_messages.iter().any(Message::is_close)
+                            || this.batch_has_close
                             || this.poll_closing_expired(cx)
                         {
                             // END_STREAM forbids a Pong, but the read half must
@@ -2628,11 +2636,10 @@ where
             }
 
             // Drain the finite accepted batch before checking the I/O budget.
-            // Only zero-budget closing gets one read poll after expiry, and that
-            // opportunity is shared across all subsequent next() calls.
-            if self.as_mut().get_mut().poll_closing_expired(cx)
-                && (self.config.close_timeout != 0 || self.closing_read_attempted)
-            {
+            // Every budget permits one nonwaiting read poll after expiry, shared
+            // across subsequent next() calls rather than renewed by each call.
+            let closing_expired = self.as_mut().get_mut().poll_closing_expired(cx);
+            if closing_expired && self.post_expiry_read_attempted {
                 let this = self.as_mut().get_mut();
                 // No pending frame may be flushed through transport cleanup.
                 // At expiry shutdown gets one poll, without a new waiting budget.
@@ -2669,8 +2676,8 @@ where
                 }
             }
 
-            if self.closing_deadline.is_some() {
-                self.closing_read_attempted = true;
+            if closing_expired {
+                self.post_expiry_read_attempted = true;
             }
             match self.as_mut().poll_read_more(cx) {
                 Poll::Ready(Ok(0)) => {
