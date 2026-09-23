@@ -505,6 +505,11 @@ pub struct Config {
     /// the transport (default: 5 seconds). A Tokio split `close()` starts this
     /// budget when local closing begins, including time waiting for the shared
     /// sink. Zero makes that path try the sink and write once without waiting.
+    /// Unified streams start one absolute budget when a local Close is queued
+    /// or a peer Close is received. It covers Close/control writes, waiting for
+    /// the peer Close, and transport shutdown; incoming traffic never resets it.
+    /// Zero allows one immediately ready attempt without waiting. Cleanup cannot
+    /// replace an accepted peer Close or an existing idle/Pong timeout error.
     pub close_timeout: u32,
     /// Coalesce outbound frames while inbound messages are still queued
     /// (default: true).

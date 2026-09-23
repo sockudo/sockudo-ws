@@ -722,6 +722,8 @@ while let Some(msg) = ws.next().await {
 
 The built-in HTTP/2 and HTTP/3 client/server entry points enable immediate send-side shutdown automatically. When constructing a unified stream directly over a multiplexed transport, call `with_immediate_write_shutdown()` so `close()` sends END_STREAM after the WebSocket Close frame. TCP/TLS streams keep their write half open until the peer's Close.
 
+Unified closing uses one absolute `close_timeout` budget, starting when a local Close is queued or a peer Close is received. Continue polling `next()` after local `close()` to receive the peer's response; a silent peer produces `ConnectionClosed` once, then the stream ends. Crossing Pings do not reset the budget. Cleanup errors or expiration do not replace a received Close or an existing idle/Pong timeout. A zero budget permits one immediately ready attempt without waiting.
+
 ## Configuration
 
 ### Basic Configuration

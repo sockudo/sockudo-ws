@@ -73,6 +73,7 @@ pin_project! {
         has_unprocessed_read_data: bool,
         write_buf: CorkBuffer,
         state: StreamState,
+        closing_deadline: Option<u64>,
         immediate_write_shutdown: bool,
         write_shutdown_complete: bool,
         config: Config,
@@ -143,6 +144,7 @@ where
             has_unprocessed_read_data,
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
             state: StreamState::Open,
+            closing_deadline: None,
             immediate_write_shutdown: false,
             write_shutdown_complete: false,
             config,
@@ -285,6 +287,9 @@ where
     /// TCP/TLS keep the write half open until the peer's Close; multiplexed
     /// transports configured with `with_immediate_write_shutdown` end it now.
     /// The read half remains available for the peer's closing response.
+    /// Keep polling `next()` to drive the handshake. One `close_timeout`
+    /// budget covers writes, the peer response, and best-effort shutdown;
+    /// a silent peer yields `ConnectionClosed` once and then ends the stream.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         if self.state != StreamState::Open {
             return Ok(());
@@ -294,17 +299,25 @@ where
         self.protocol
             .encode_message(&close, self.write_buf.buffer_mut())?;
         self.state = StreamState::CloseSent;
-        self.heartbeat.stop();
-        self.heartbeat_sleep = None;
+        let closing_at = self.begin_closing();
 
         // Flush the close frame
-        self.flush_write_buf().await?;
-        if self.immediate_write_shutdown {
-            // Finish the send half so multiplexed transports retain queued frames.
-            self.inner.shutdown().await?;
-            self.write_shutdown_complete = true;
+        let deadline = self.clock_epoch + Duration::from_millis(closing_at);
+        let result = tokio::time::timeout_at(deadline, async {
+            self.flush_write_buf().await?;
+            if self.immediate_write_shutdown {
+                // Finish the send half so multiplexed transports retain queued frames.
+                self.inner.shutdown().await?;
+                self.write_shutdown_complete = true;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap_or(Err(Error::ConnectionClosed));
+        if result.is_err() {
+            self.finish_read_close(None);
         }
-        Ok(())
+        result
     }
 
     /// Flush the write buffer to the underlying stream
@@ -381,6 +394,47 @@ where
     #[inline]
     fn next_pending_message(&mut self) -> Option<Message> {
         self.pending_messages.pop()
+    }
+
+    fn begin_closing(&mut self) -> u64 {
+        self.heartbeat.stop();
+        if self.closing_deadline.is_none() {
+            // Replace, rather than lazily reuse, the old heartbeat deadline.
+            self.heartbeat_sleep = None;
+        }
+        *self.closing_deadline.get_or_insert_with(|| {
+            self.clock_epoch.elapsed().as_millis() as u64
+                + u64::from(self.config.close_timeout) * 1000
+        })
+    }
+
+    // Cleanup cannot replace an accepted Close or the original timeout cause.
+    fn finish_read_close(&mut self, fallback: Option<Error>) -> Option<Result<Message>> {
+        self.state = StreamState::Closed;
+        self.heartbeat.stop();
+        self.heartbeat_sleep = None;
+        self.flush_on_read = false;
+        self.close_after_flush = false;
+        self.ping_flush_pending = false;
+        self.pending_messages.clear();
+        let close = self
+            .pending_control_message
+            .take()
+            .filter(Message::is_close);
+        self.pending_terminal_error
+            .take()
+            .map(Err)
+            .or_else(|| close.map(Ok))
+            .or_else(|| fallback.map(Err))
+    }
+
+    fn poll_closing_expired(&mut self, cx: &mut Context<'_>) -> bool {
+        let Some(deadline) = self.closing_deadline else {
+            return false;
+        };
+        // Ready inbound traffic must not starve the timer driver's turn.
+        self.clock_epoch.elapsed().as_millis() as u64 >= deadline
+            || self.poll_heartbeat_timer(cx, deadline).is_ready()
     }
 
     /// Poll the heartbeat timer for `deadline_ms`, (re)arming it only when needed.
@@ -468,6 +522,22 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
+            // Check for connection closed before retrying any cleanup.
+            if self.state == StreamState::Closed {
+                return Poll::Ready(None);
+            }
+            if !self.flush_on_read && self.as_mut().get_mut().poll_closing_expired(cx) {
+                let this = self.as_mut().get_mut();
+                // No pending frame may be flushed through transport cleanup.
+                // At expiry shutdown gets one poll, without a new waiting budget.
+                if !this.write_shutdown_complete
+                    && !this.write_buf.has_data()
+                    && let Poll::Ready(Ok(())) = Pin::new(&mut this.inner).poll_shutdown(cx)
+                {
+                    this.write_shutdown_complete = true;
+                }
+                return Poll::Ready(this.finish_read_close(Some(Error::ConnectionClosed)));
+            }
             // Control responses and automatic pings must be driven by the read path.
             if self.flush_on_read {
                 match self.as_mut().poll_write_out(cx) {
@@ -484,40 +554,37 @@ where
                         if this.close_after_flush && !this.write_shutdown_complete {
                             match Pin::new(&mut this.inner).poll_shutdown(cx) {
                                 Poll::Ready(Ok(())) => this.write_shutdown_complete = true,
-                                Poll::Ready(Err(error)) => {
-                                    this.state = StreamState::Closed;
-                                    return Poll::Ready(Some(Err(error.into())));
+                                Poll::Ready(Err(_)) => {}
+                                Poll::Pending => {
+                                    if this.poll_closing_expired(cx) {
+                                        return Poll::Ready(this.finish_read_close(None));
+                                    }
+                                    return Poll::Pending;
                                 }
-                                Poll::Pending => return Poll::Pending,
                             }
                         }
                         if this.close_after_flush {
-                            this.close_after_flush = false;
-                            this.state = StreamState::Closed;
+                            return Poll::Ready(this.finish_read_close(None));
                         }
                         this.flush_on_read = false;
 
-                        if let Some(error) = this.pending_terminal_error.take() {
-                            return Poll::Ready(Some(Err(error)));
-                        }
                         if let Some(msg) = this.pending_control_message.take() {
                             return Poll::Ready(Some(Ok(msg)));
                         }
                     }
                     Poll::Ready(Err(e)) => {
-                        let this = self.as_mut().get_mut();
-                        this.state = StreamState::Closed;
-                        this.heartbeat.stop();
-                        this.heartbeat_sleep = None;
-                        return Poll::Ready(Some(Err(e)));
+                        return Poll::Ready(self.as_mut().get_mut().finish_read_close(Some(e)));
                     }
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        let this = self.as_mut().get_mut();
+                        if this.poll_closing_expired(cx) {
+                            return Poll::Ready(
+                                this.finish_read_close(Some(Error::ConnectionClosed)),
+                            );
+                        }
+                        return Poll::Pending;
+                    }
                 }
-            }
-
-            // Check for connection closed
-            if self.state == StreamState::Closed {
-                return Poll::Ready(None);
             }
 
             if self.pending_messages.is_empty()
@@ -579,7 +646,7 @@ where
                                 this.heartbeat.stop();
                                 return Poll::Ready(Some(Err(e)));
                             }
-                            this.heartbeat.stop();
+                            this.begin_closing();
                             this.state = StreamState::CloseSent;
                             this.pending_terminal_error = Some(error);
                             this.flush_on_read = true;
@@ -630,8 +697,7 @@ where
                     }
                     Message::Close(reason) => {
                         let this = self.as_mut().get_mut();
-                        this.heartbeat.stop();
-                        this.heartbeat_sleep = None;
+                        this.begin_closing();
                         this.pending_messages.clear();
                         this.pending_parse_error = None;
                         this.read_buf.clear();
@@ -746,8 +812,7 @@ where
         // Track close frame sending
         if item.is_close() {
             this.state = StreamState::CloseSent;
-            this.heartbeat.stop();
-            this.heartbeat_sleep = None;
+            this.begin_closing();
         }
 
         // Large unmasked data payloads are queued by reference behind their
@@ -784,6 +849,9 @@ where
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if self.state == StreamState::Closed {
+            return Poll::Ready(Err(Error::ConnectionClosed));
+        }
         {
             let this = self.as_mut().get_mut();
             // Batch-scoped corking: while inbound messages that were already
@@ -799,12 +867,17 @@ where
                 return Poll::Ready(Ok(()));
             }
         }
-        self.poll_write_out(cx)
+        let result = self.as_mut().poll_write_out(cx);
+        if result.is_pending() && self.as_mut().get_mut().poll_closing_expired(cx) {
+            self.as_mut().get_mut().finish_read_close(None);
+            return Poll::Ready(Err(Error::ConnectionClosed));
+        }
+        result
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if self.write_shutdown_complete {
-            self.as_mut().get_mut().state = StreamState::Closed;
+        if self.state == StreamState::Closed || self.write_shutdown_complete {
+            self.as_mut().get_mut().finish_read_close(None);
             return Poll::Ready(Ok(()));
         }
         // Send close frame if not already sent
@@ -814,26 +887,34 @@ where
                 return Poll::Ready(Err(e));
             }
         }
+        self.as_mut().get_mut().begin_closing();
 
         // Flush pending data
-        match self.as_mut().poll_write_out(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => return Poll::Pending,
-        }
-
-        // Shutdown the underlying stream
-        match Pin::new(&mut self.as_mut().get_mut().inner).poll_shutdown(cx) {
+        let result = match self.as_mut().poll_write_out(cx) {
             Poll::Ready(Ok(())) => {
-                let this = self.as_mut().get_mut();
-                this.write_shutdown_complete = true;
-                this.state = StreamState::Closed;
-                this.heartbeat.stop();
-                this.heartbeat_sleep = None;
-                Poll::Ready(Ok(()))
+                // Shutdown the underlying stream
+                Pin::new(&mut self.as_mut().get_mut().inner)
+                    .poll_shutdown(cx)
+                    .map_err(Into::into)
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
-            Poll::Pending => Poll::Pending,
+            other => other,
+        };
+        match result {
+            Poll::Ready(result) => {
+                let this = self.as_mut().get_mut();
+                this.write_shutdown_complete = result.is_ok();
+                this.finish_read_close(None);
+                Poll::Ready(result)
+            }
+            Poll::Pending => {
+                let this = self.as_mut().get_mut();
+                if this.poll_closing_expired(cx) {
+                    this.finish_read_close(None);
+                    Poll::Ready(Err(Error::ConnectionClosed))
+                } else {
+                    Poll::Pending
+                }
+            }
         }
     }
 }
@@ -1969,6 +2050,7 @@ pin_project! {
         read_buf: BytesMut,
         write_buf: CorkBuffer,
         state: StreamState,
+        closing_deadline: Option<u64>,
         immediate_write_shutdown: bool,
         write_shutdown_complete: bool,
         config: Config,
@@ -2011,6 +2093,7 @@ where
             read_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
             state: StreamState::Open,
+            closing_deadline: None,
             immediate_write_shutdown: false,
             write_shutdown_complete: false,
             config,
@@ -2046,6 +2129,7 @@ where
             read_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
             state: StreamState::Open,
+            closing_deadline: None,
             immediate_write_shutdown: false,
             write_shutdown_complete: false,
             config,
@@ -2097,6 +2181,9 @@ where
     /// TCP/TLS keep the write half open until the peer's Close; multiplexed
     /// transports configured with `with_immediate_write_shutdown` end it now.
     /// The read half remains available for the peer's closing response.
+    /// Keep polling `next()` to drive the handshake. One `close_timeout`
+    /// budget covers writes, the peer response, and best-effort shutdown;
+    /// a silent peer yields `ConnectionClosed` once and then ends the stream.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         if self.state != StreamState::Open {
             return Ok(());
@@ -2106,16 +2193,24 @@ where
         self.protocol
             .encode_message(&close, self.write_buf.buffer_mut())?;
         self.state = StreamState::CloseSent;
-        self.heartbeat.stop();
-        self.heartbeat_sleep = None;
+        let closing_at = self.begin_closing();
 
-        self.flush_write_buf().await?;
-        if self.immediate_write_shutdown {
-            // Finish the send half so multiplexed transports retain queued frames.
-            self.inner.shutdown().await?;
-            self.write_shutdown_complete = true;
+        let deadline = self.clock_epoch + Duration::from_millis(closing_at);
+        let result = tokio::time::timeout_at(deadline, async {
+            self.flush_write_buf().await?;
+            if self.immediate_write_shutdown {
+                // Finish the send half so multiplexed transports retain queued frames.
+                self.inner.shutdown().await?;
+                self.write_shutdown_complete = true;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap_or(Err(Error::ConnectionClosed));
+        if result.is_err() {
+            self.finish_read_close(None);
         }
-        Ok(())
+        result
     }
 
     /// Flush the write buffer to the underlying stream
@@ -2190,6 +2285,47 @@ where
     #[inline]
     fn next_pending_message(&mut self) -> Option<Message> {
         self.pending_messages.pop()
+    }
+
+    fn begin_closing(&mut self) -> u64 {
+        self.heartbeat.stop();
+        if self.closing_deadline.is_none() {
+            // Replace, rather than lazily reuse, the old heartbeat deadline.
+            self.heartbeat_sleep = None;
+        }
+        *self.closing_deadline.get_or_insert_with(|| {
+            self.clock_epoch.elapsed().as_millis() as u64
+                + u64::from(self.config.close_timeout) * 1000
+        })
+    }
+
+    // Cleanup cannot replace an accepted Close or the original timeout cause.
+    fn finish_read_close(&mut self, fallback: Option<Error>) -> Option<Result<Message>> {
+        self.state = StreamState::Closed;
+        self.heartbeat.stop();
+        self.heartbeat_sleep = None;
+        self.flush_on_read = false;
+        self.close_after_flush = false;
+        self.ping_flush_pending = false;
+        self.pending_messages.clear();
+        let close = self
+            .pending_control_message
+            .take()
+            .filter(Message::is_close);
+        self.pending_terminal_error
+            .take()
+            .map(Err)
+            .or_else(|| close.map(Ok))
+            .or_else(|| fallback.map(Err))
+    }
+
+    fn poll_closing_expired(&mut self, cx: &mut Context<'_>) -> bool {
+        let Some(deadline) = self.closing_deadline else {
+            return false;
+        };
+        // Ready inbound traffic must not starve the timer driver's turn.
+        self.clock_epoch.elapsed().as_millis() as u64 >= deadline
+            || self.poll_heartbeat_timer(cx, deadline).is_ready()
     }
 
     /// See [`WebSocketStream::poll_heartbeat_timer`].
@@ -2272,6 +2408,22 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
+            // Check for connection closed before retrying any cleanup.
+            if self.state == StreamState::Closed {
+                return Poll::Ready(None);
+            }
+            if !self.flush_on_read && self.as_mut().get_mut().poll_closing_expired(cx) {
+                let this = self.as_mut().get_mut();
+                // No pending frame may be flushed through transport cleanup.
+                // At expiry shutdown gets one poll, without a new waiting budget.
+                if !this.write_shutdown_complete
+                    && !this.write_buf.has_data()
+                    && let Poll::Ready(Ok(())) = Pin::new(&mut this.inner).poll_shutdown(cx)
+                {
+                    this.write_shutdown_complete = true;
+                }
+                return Poll::Ready(this.finish_read_close(Some(Error::ConnectionClosed)));
+            }
             if self.flush_on_read {
                 match self.as_mut().poll_write_out(cx) {
                     Poll::Ready(Ok(())) => {
@@ -2287,39 +2439,37 @@ where
                         if this.close_after_flush && !this.write_shutdown_complete {
                             match Pin::new(&mut this.inner).poll_shutdown(cx) {
                                 Poll::Ready(Ok(())) => this.write_shutdown_complete = true,
-                                Poll::Ready(Err(error)) => {
-                                    this.state = StreamState::Closed;
-                                    return Poll::Ready(Some(Err(error.into())));
+                                Poll::Ready(Err(_)) => {}
+                                Poll::Pending => {
+                                    if this.poll_closing_expired(cx) {
+                                        return Poll::Ready(this.finish_read_close(None));
+                                    }
+                                    return Poll::Pending;
                                 }
-                                Poll::Pending => return Poll::Pending,
                             }
                         }
                         if this.close_after_flush {
-                            this.close_after_flush = false;
-                            this.state = StreamState::Closed;
+                            return Poll::Ready(this.finish_read_close(None));
                         }
                         this.flush_on_read = false;
 
-                        if let Some(error) = this.pending_terminal_error.take() {
-                            return Poll::Ready(Some(Err(error)));
-                        }
                         if let Some(msg) = this.pending_control_message.take() {
                             return Poll::Ready(Some(Ok(msg)));
                         }
                     }
                     Poll::Ready(Err(e)) => {
-                        let this = self.as_mut().get_mut();
-                        this.state = StreamState::Closed;
-                        this.heartbeat.stop();
-                        this.heartbeat_sleep = None;
-                        return Poll::Ready(Some(Err(e)));
+                        return Poll::Ready(self.as_mut().get_mut().finish_read_close(Some(e)));
                     }
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        let this = self.as_mut().get_mut();
+                        if this.poll_closing_expired(cx) {
+                            return Poll::Ready(
+                                this.finish_read_close(Some(Error::ConnectionClosed)),
+                            );
+                        }
+                        return Poll::Pending;
+                    }
                 }
-            }
-
-            if self.state == StreamState::Closed {
-                return Poll::Ready(None);
             }
 
             if self.pending_messages.is_empty()
@@ -2379,7 +2529,7 @@ where
                                 this.heartbeat.stop();
                                 return Poll::Ready(Some(Err(e)));
                             }
-                            this.heartbeat.stop();
+                            this.begin_closing();
                             this.state = StreamState::CloseSent;
                             this.pending_terminal_error = Some(error);
                             this.flush_on_read = true;
@@ -2427,8 +2577,7 @@ where
                     }
                     Message::Close(reason) => {
                         let this = self.as_mut().get_mut();
-                        this.heartbeat.stop();
-                        this.heartbeat_sleep = None;
+                        this.begin_closing();
                         this.pending_messages.clear();
                         this.pending_parse_error = None;
                         this.read_buf.clear();
@@ -2522,8 +2671,7 @@ where
 
         if item.is_close() {
             this.state = StreamState::CloseSent;
-            this.heartbeat.stop();
-            this.heartbeat_sleep = None;
+            this.begin_closing();
         }
 
         this.protocol
@@ -2532,6 +2680,9 @@ where
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if self.state == StreamState::Closed {
+            return Poll::Ready(Err(Error::ConnectionClosed));
+        }
         {
             let this = self.as_mut().get_mut();
             // Batch-scoped corking: while inbound messages that were already
@@ -2547,38 +2698,54 @@ where
                 return Poll::Ready(Ok(()));
             }
         }
-        self.poll_write_out(cx)
+        let result = self.as_mut().poll_write_out(cx);
+        if result.is_pending() && self.as_mut().get_mut().poll_closing_expired(cx) {
+            self.as_mut().get_mut().finish_read_close(None);
+            return Poll::Ready(Err(Error::ConnectionClosed));
+        }
+        result
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if self.write_shutdown_complete {
-            self.as_mut().get_mut().state = StreamState::Closed;
+        if self.state == StreamState::Closed || self.write_shutdown_complete {
+            self.as_mut().get_mut().finish_read_close(None);
             return Poll::Ready(Ok(()));
         }
+        // Send close frame if not already sent
         if self.state == StreamState::Open {
             let close = Message::Close(Some(CloseReason::new(1000, "")));
             if let Err(e) = self.as_mut().start_send(close) {
                 return Poll::Ready(Err(e));
             }
         }
+        self.as_mut().get_mut().begin_closing();
 
-        match self.as_mut().poll_write_out(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => return Poll::Pending,
-        }
-
-        match Pin::new(&mut self.as_mut().get_mut().inner).poll_shutdown(cx) {
+        // Flush pending data
+        let result = match self.as_mut().poll_write_out(cx) {
             Poll::Ready(Ok(())) => {
-                let this = self.as_mut().get_mut();
-                this.write_shutdown_complete = true;
-                this.state = StreamState::Closed;
-                this.heartbeat.stop();
-                this.heartbeat_sleep = None;
-                Poll::Ready(Ok(()))
+                // Shutdown the underlying stream
+                Pin::new(&mut self.as_mut().get_mut().inner)
+                    .poll_shutdown(cx)
+                    .map_err(Into::into)
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
-            Poll::Pending => Poll::Pending,
+            other => other,
+        };
+        match result {
+            Poll::Ready(result) => {
+                let this = self.as_mut().get_mut();
+                this.write_shutdown_complete = result.is_ok();
+                this.finish_read_close(None);
+                Poll::Ready(result)
+            }
+            Poll::Pending => {
+                let this = self.as_mut().get_mut();
+                if this.poll_closing_expired(cx) {
+                    this.finish_read_close(None);
+                    Poll::Ready(Err(Error::ConnectionClosed))
+                } else {
+                    Poll::Pending
+                }
+            }
         }
     }
 }

@@ -170,6 +170,38 @@ impl CompioSplitShared {
     }
 }
 
+// Poll once even with a zero budget. Once a pending operation times out, its
+// caller must terminate the stream: completion I/O may have consumed its buffer.
+async fn compio_until<F: Future>(deadline: Instant, future: F) -> Option<F::Output> {
+    let future = future.fuse();
+    futures_util::pin_mut!(future);
+    if let std::task::Poll::Ready(output) = futures_util::poll!(&mut future) {
+        return Some(output);
+    }
+    let timer = ::compio::time::sleep(deadline.saturating_duration_since(Instant::now())).fuse();
+    futures_util::pin_mut!(timer);
+    futures_util::select_biased! {
+        _ = timer => None,
+        output = future => Some(output),
+    }
+}
+
+async fn compio_finish_close<W: AsyncWrite>(
+    writer: &mut W,
+    buf: &mut BytesMut,
+    deadline: Instant,
+) -> bool {
+    // A failed or cancelled flush must not be restarted by shutdown.
+    matches!(
+        compio_until(deadline, async {
+            flush_bytes(writer, buf).await?;
+            writer.shutdown().await
+        })
+        .await,
+        Some(Ok(()))
+    )
+}
+
 async fn read_more<R>(reader: &mut R, buf: &mut BytesMut) -> io::Result<usize>
 where
     R: AsyncRead + ?Sized,
@@ -1311,6 +1343,7 @@ pub struct CompioWebSocketStream<S> {
     read_buf: BytesMut,
     write_buf: BytesMut,
     state: CompioStreamState,
+    closing_deadline: Option<Instant>,
     immediate_write_shutdown: bool,
     write_shutdown_complete: bool,
     config: Config,
@@ -1352,6 +1385,7 @@ where
             read_buf,
             write_buf: BytesMut::with_capacity(config.write_buffer_size),
             state: CompioStreamState::Open,
+            closing_deadline: None,
             immediate_write_shutdown: false,
             write_shutdown_complete: false,
             config,
@@ -1392,6 +1426,13 @@ where
     pub fn with_immediate_write_shutdown(mut self) -> Self {
         self.immediate_write_shutdown = true;
         self
+    }
+
+    fn begin_closing(&mut self) -> Instant {
+        self.heartbeat.stop();
+        *self.closing_deadline.get_or_insert_with(|| {
+            Instant::now() + Duration::from_secs(self.config.close_timeout.into())
+        })
     }
 
     /// Get a reference to the underlying stream.
@@ -1468,6 +1509,18 @@ where
             if self.state == CompioStreamState::Closed {
                 return None;
             }
+            if let Some(deadline) = self.closing_deadline
+                && Instant::now() >= deadline
+            {
+                self.state = CompioStreamState::Closed;
+                if !self.write_shutdown_complete && self.write_buf.is_empty() {
+                    self.write_shutdown_complete = matches!(
+                        compio_until(deadline, self.inner.shutdown()).await,
+                        Some(Ok(()))
+                    );
+                }
+                return Some(Err(Error::ConnectionClosed));
+            }
 
             if let Some(msg) = self.next_pending_message() {
                 let now = self.clock_epoch.elapsed().as_millis() as u64;
@@ -1509,7 +1562,16 @@ where
                 }
             }
 
-            let read_result = if let Some(deadline) = self.heartbeat.next_deadline() {
+            let read_result = if let Some(deadline) = self.closing_deadline {
+                match compio_until(deadline, read_more(&mut self.inner, &mut self.read_buf)).await {
+                    Some(result) => Some(result),
+                    None => {
+                        // The cancelled owned read must never be resumed or re-parsed.
+                        self.state = CompioStreamState::Closed;
+                        return Some(Err(Error::ConnectionClosed));
+                    }
+                }
+            } else if let Some(deadline) = self.heartbeat.next_deadline() {
                 match read_more_until(
                     &mut self.inner,
                     &mut self.read_buf,
@@ -1585,34 +1647,28 @@ where
                 None
             }
             Deadline::Pong(at) if at <= now => {
-                self.heartbeat.stop();
+                let deadline = self.begin_closing();
                 self.state = CompioStreamState::CloseSent;
                 let close = Message::Close(Some(CloseReason::new(
                     self.config.pong_timeout_close_code,
                     bounded_close_reason(&self.config.pong_timeout_close_reason),
                 )));
                 let _ = self.protocol.encode_message(&close, &mut self.write_buf);
-                let _ = ::compio::time::timeout(
-                    Duration::from_secs(self.config.close_timeout.into()),
-                    self.flush(),
-                )
-                .await;
+                self.write_shutdown_complete =
+                    compio_finish_close(&mut self.inner, &mut self.write_buf, deadline).await;
                 self.state = CompioStreamState::Closed;
                 Some(Error::HeartbeatTimeout)
             }
             Deadline::Idle(at) if at <= now => {
-                self.heartbeat.stop();
+                let deadline = self.begin_closing();
                 self.state = CompioStreamState::CloseSent;
                 let close = Message::Close(Some(CloseReason::new(
                     CloseReason::GOING_AWAY,
                     "Connection idle timeout",
                 )));
                 let _ = self.protocol.encode_message(&close, &mut self.write_buf);
-                let _ = ::compio::time::timeout(
-                    Duration::from_secs(self.config.close_timeout.into()),
-                    self.flush(),
-                )
-                .await;
+                self.write_shutdown_complete =
+                    compio_finish_close(&mut self.inner, &mut self.write_buf, deadline).await;
                 self.state = CompioStreamState::Closed;
                 Some(Error::IdleTimeout)
             }
@@ -1622,16 +1678,13 @@ where
 
     /// Send a WebSocket message.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
-        if matches!(
-            self.state,
-            CompioStreamState::Closed | CompioStreamState::ReadErrorPending
-        ) {
+        if self.state != CompioStreamState::Open {
             return Err(Error::ConnectionClosed);
         }
 
         if msg.is_close() {
             self.state = CompioStreamState::CloseSent;
-            self.heartbeat.stop();
+            self.begin_closing();
         }
 
         self.protocol.encode_message(&msg, &mut self.write_buf)?;
@@ -1658,6 +1711,9 @@ where
     /// TCP/TLS keep the write half open until the peer's Close; multiplexed
     /// transports configured with `with_immediate_write_shutdown` end it now.
     /// The read half remains available for the peer's closing response.
+    /// Keep polling `next()` to drive the handshake. One `close_timeout`
+    /// budget covers writes, the peer response, and best-effort shutdown;
+    /// a silent peer yields `ConnectionClosed` once and then ends the stream.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         if self.state != CompioStreamState::Open {
             return Ok(());
@@ -1667,15 +1723,41 @@ where
             .await?;
         if self.immediate_write_shutdown {
             // Finish the send half so multiplexed transports retain queued frames.
-            self.inner.shutdown().await?;
-            self.write_shutdown_complete = true;
+            let deadline = self
+                .closing_deadline
+                .expect("Close starts its budget before writing");
+            match compio_until(deadline, self.inner.shutdown()).await {
+                Some(Ok(())) => self.write_shutdown_complete = true,
+                Some(Err(error)) => {
+                    self.state = CompioStreamState::Closed;
+                    return Err(error.into());
+                }
+                None => {
+                    self.state = CompioStreamState::Closed;
+                    return Err(Error::ConnectionClosed);
+                }
+            }
         }
         Ok(())
     }
 
     /// Flush pending writes to the underlying Compio stream.
     pub async fn flush(&mut self) -> Result<()> {
-        flush_bytes(&mut self.inner, &mut self.write_buf).await
+        if self.state == CompioStreamState::Closed {
+            return Err(Error::ConnectionClosed);
+        }
+        let result = if let Some(deadline) = self.closing_deadline {
+            compio_until(deadline, flush_bytes(&mut self.inner, &mut self.write_buf))
+                .await
+                .unwrap_or(Err(Error::ConnectionClosed))
+        } else {
+            flush_bytes(&mut self.inner, &mut self.write_buf).await
+        };
+        if result.is_err() {
+            self.state = CompioStreamState::Closed;
+            self.heartbeat.stop();
+        }
+        result
     }
 
     fn process_read_buf(&mut self) -> Result<bool> {
@@ -1713,7 +1795,7 @@ where
                 }
             }
             Message::Close(reason) => {
-                self.heartbeat.stop();
+                let deadline = self.begin_closing();
                 self.pending_messages.clear();
                 self.pending_parse_error = None;
                 self.read_buf.clear();
@@ -1722,19 +1804,14 @@ where
                     CompioStreamState::Open | CompioStreamState::ReadErrorPending
                 ) {
                     self.protocol.encode_close_response(&mut self.write_buf);
-                    if let Err(error) = self.flush().await {
-                        self.state = CompioStreamState::Closed;
-                        return Err(error);
-                    }
                 }
-                if !self.write_shutdown_complete {
-                    if let Err(error) = self.inner.shutdown().await {
-                        self.state = CompioStreamState::Closed;
-                        return Err(error.into());
-                    }
-                    self.write_shutdown_complete = true;
-                }
+                // Publish the terminal state before awaiting cleanup, so dropping
+                // next() during owned I/O cannot resume a partially written frame.
                 self.state = CompioStreamState::Closed;
+                if !self.write_shutdown_complete {
+                    self.write_shutdown_complete =
+                        compio_finish_close(&mut self.inner, &mut self.write_buf, deadline).await;
+                }
                 return Ok(Message::Close(reason.clone()));
             }
             _ => {}
@@ -2621,6 +2698,7 @@ pub struct CompioCompressedWebSocketStream<S> {
     read_buf: BytesMut,
     write_buf: BytesMut,
     state: CompioStreamState,
+    closing_deadline: Option<Instant>,
     immediate_write_shutdown: bool,
     write_shutdown_complete: bool,
     config: Config,
@@ -2667,6 +2745,7 @@ where
             read_buf,
             write_buf: BytesMut::with_capacity(config.write_buffer_size),
             state: CompioStreamState::Open,
+            closing_deadline: None,
             immediate_write_shutdown: false,
             write_shutdown_complete: false,
             config,
@@ -2708,6 +2787,7 @@ where
             read_buf,
             write_buf: BytesMut::with_capacity(config.write_buffer_size),
             state: CompioStreamState::Open,
+            closing_deadline: None,
             immediate_write_shutdown: false,
             write_shutdown_complete: false,
             config,
@@ -2729,6 +2809,13 @@ where
         self
     }
 
+    fn begin_closing(&mut self) -> Instant {
+        self.heartbeat.stop();
+        *self.closing_deadline.get_or_insert_with(|| {
+            Instant::now() + Duration::from_secs(self.config.close_timeout.into())
+        })
+    }
+
     /// Receive the next WebSocket message.
     ///
     /// With automatic Ping enabled, custom `AsyncRead` implementations must
@@ -2742,6 +2829,18 @@ where
         loop {
             if self.state == CompioStreamState::Closed {
                 return None;
+            }
+            if let Some(deadline) = self.closing_deadline
+                && Instant::now() >= deadline
+            {
+                self.state = CompioStreamState::Closed;
+                if !self.write_shutdown_complete && self.write_buf.is_empty() {
+                    self.write_shutdown_complete = matches!(
+                        compio_until(deadline, self.inner.shutdown()).await,
+                        Some(Ok(()))
+                    );
+                }
+                return Some(Err(Error::ConnectionClosed));
             }
 
             if let Some(msg) = self.next_pending_message() {
@@ -2784,7 +2883,16 @@ where
                 }
             }
 
-            let read_result = if let Some(deadline) = self.heartbeat.next_deadline() {
+            let read_result = if let Some(deadline) = self.closing_deadline {
+                match compio_until(deadline, read_more(&mut self.inner, &mut self.read_buf)).await {
+                    Some(result) => Some(result),
+                    None => {
+                        // The cancelled owned read must never be resumed or re-parsed.
+                        self.state = CompioStreamState::Closed;
+                        return Some(Err(Error::ConnectionClosed));
+                    }
+                }
+            } else if let Some(deadline) = self.heartbeat.next_deadline() {
                 match read_more_until(
                     &mut self.inner,
                     &mut self.read_buf,
@@ -2859,34 +2967,28 @@ where
                 None
             }
             Deadline::Pong(at) if at <= now => {
-                self.heartbeat.stop();
+                let deadline = self.begin_closing();
                 self.state = CompioStreamState::CloseSent;
                 let close = Message::Close(Some(CloseReason::new(
                     self.config.pong_timeout_close_code,
                     bounded_close_reason(&self.config.pong_timeout_close_reason),
                 )));
                 let _ = self.protocol.encode_message(&close, &mut self.write_buf);
-                let _ = ::compio::time::timeout(
-                    Duration::from_secs(self.config.close_timeout.into()),
-                    self.flush(),
-                )
-                .await;
+                self.write_shutdown_complete =
+                    compio_finish_close(&mut self.inner, &mut self.write_buf, deadline).await;
                 self.state = CompioStreamState::Closed;
                 Some(Error::HeartbeatTimeout)
             }
             Deadline::Idle(at) if at <= now => {
-                self.heartbeat.stop();
+                let deadline = self.begin_closing();
                 self.state = CompioStreamState::CloseSent;
                 let close = Message::Close(Some(CloseReason::new(
                     CloseReason::GOING_AWAY,
                     "Connection idle timeout",
                 )));
                 let _ = self.protocol.encode_message(&close, &mut self.write_buf);
-                let _ = ::compio::time::timeout(
-                    Duration::from_secs(self.config.close_timeout.into()),
-                    self.flush(),
-                )
-                .await;
+                self.write_shutdown_complete =
+                    compio_finish_close(&mut self.inner, &mut self.write_buf, deadline).await;
                 self.state = CompioStreamState::Closed;
                 Some(Error::IdleTimeout)
             }
@@ -2896,16 +2998,13 @@ where
 
     /// Send a WebSocket message.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
-        if matches!(
-            self.state,
-            CompioStreamState::Closed | CompioStreamState::ReadErrorPending
-        ) {
+        if self.state != CompioStreamState::Open {
             return Err(Error::ConnectionClosed);
         }
 
         if msg.is_close() {
             self.state = CompioStreamState::CloseSent;
-            self.heartbeat.stop();
+            self.begin_closing();
         }
 
         self.protocol.encode_message(&msg, &mut self.write_buf)?;
@@ -2932,6 +3031,9 @@ where
     /// TCP/TLS keep the write half open until the peer's Close; multiplexed
     /// transports configured with `with_immediate_write_shutdown` end it now.
     /// The read half remains available for the peer's closing response.
+    /// Keep polling `next()` to drive the handshake. One `close_timeout`
+    /// budget covers writes, the peer response, and best-effort shutdown;
+    /// a silent peer yields `ConnectionClosed` once and then ends the stream.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         if self.state != CompioStreamState::Open {
             return Ok(());
@@ -2941,15 +3043,41 @@ where
             .await?;
         if self.immediate_write_shutdown {
             // Finish the send half so multiplexed transports retain queued frames.
-            self.inner.shutdown().await?;
-            self.write_shutdown_complete = true;
+            let deadline = self
+                .closing_deadline
+                .expect("Close starts its budget before writing");
+            match compio_until(deadline, self.inner.shutdown()).await {
+                Some(Ok(())) => self.write_shutdown_complete = true,
+                Some(Err(error)) => {
+                    self.state = CompioStreamState::Closed;
+                    return Err(error.into());
+                }
+                None => {
+                    self.state = CompioStreamState::Closed;
+                    return Err(Error::ConnectionClosed);
+                }
+            }
         }
         Ok(())
     }
 
     /// Flush pending writes.
     pub async fn flush(&mut self) -> Result<()> {
-        flush_bytes(&mut self.inner, &mut self.write_buf).await
+        if self.state == CompioStreamState::Closed {
+            return Err(Error::ConnectionClosed);
+        }
+        let result = if let Some(deadline) = self.closing_deadline {
+            compio_until(deadline, flush_bytes(&mut self.inner, &mut self.write_buf))
+                .await
+                .unwrap_or(Err(Error::ConnectionClosed))
+        } else {
+            flush_bytes(&mut self.inner, &mut self.write_buf).await
+        };
+        if result.is_err() {
+            self.state = CompioStreamState::Closed;
+            self.heartbeat.stop();
+        }
+        result
     }
 
     /// Check whether the stream is closed.
@@ -3012,7 +3140,7 @@ where
                 }
             }
             Message::Close(reason) => {
-                self.heartbeat.stop();
+                let deadline = self.begin_closing();
                 self.pending_messages.clear();
                 self.pending_parse_error = None;
                 self.read_buf.clear();
@@ -3021,19 +3149,14 @@ where
                     CompioStreamState::Open | CompioStreamState::ReadErrorPending
                 ) {
                     self.protocol.encode_close_response(&mut self.write_buf);
-                    if let Err(error) = self.flush().await {
-                        self.state = CompioStreamState::Closed;
-                        return Err(error);
-                    }
                 }
-                if !self.write_shutdown_complete {
-                    if let Err(error) = self.inner.shutdown().await {
-                        self.state = CompioStreamState::Closed;
-                        return Err(error.into());
-                    }
-                    self.write_shutdown_complete = true;
-                }
+                // Publish the terminal state before awaiting cleanup, so dropping
+                // next() during owned I/O cannot resume a partially written frame.
                 self.state = CompioStreamState::Closed;
+                if !self.write_shutdown_complete {
+                    self.write_shutdown_complete =
+                        compio_finish_close(&mut self.inner, &mut self.write_buf, deadline).await;
+                }
                 return Ok(Message::Close(reason.clone()));
             }
             _ => {}
