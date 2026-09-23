@@ -405,3 +405,67 @@ fn compressed_protocol_split_can_lower_a_pending_frame_limit() {
         Err(Error::FrameTooLarge)
     ));
 }
+
+#[cfg(feature = "permessage-deflate")]
+#[test]
+fn compressed_split_rejects_an_oversized_header_before_the_remaining_mask() {
+    use bytes::BytesMut;
+    use sockudo_ws::{CompressedProtocol, DeflateConfig, Error};
+    let mut receiver = CompressedProtocol::server(8192, 8192, DeflateConfig::default());
+    let mut buf = BytesMut::from(&b"\x82\x85\x00"[..]);
+    assert!(receiver.process(&mut buf).unwrap().is_empty());
+    let (mut reader, _) = receiver.split(4, 8192);
+    // process() invokes the parser only for nonempty input; the mask is still incomplete.
+    buf.extend_from_slice(b"\x00");
+    assert!(matches!(
+        reader.process(&mut buf),
+        Err(Error::FrameTooLarge)
+    ));
+}
+
+#[cfg(feature = "permessage-deflate")]
+#[test]
+fn compressed_split_applies_limits_after_an_incomplete_extended_length() {
+    use bytes::BytesMut;
+    use sockudo_ws::frame::encode_frame;
+    use sockudo_ws::{CompressedProtocol, DeflateConfig, Error, OpCode};
+    for (size, cut) in [(126, 3), (65536, 6)] {
+        let mut receiver = CompressedProtocol::client(131072, 131072, DeflateConfig::default());
+        let mut wire = BytesMut::new();
+        encode_frame(&mut wire, OpCode::Binary, &vec![b'x'; size], true, None);
+        let mut buf = wire.split_to(cut);
+        assert!(receiver.process(&mut buf).unwrap().is_empty());
+        let (mut reader, _) = receiver.split(size - 1, 131072);
+        buf.extend_from_slice(&wire);
+        assert!(matches!(
+            reader.process(&mut buf),
+            Err(Error::FrameTooLarge)
+        ));
+    }
+}
+
+#[cfg(feature = "permessage-deflate")]
+#[test]
+fn compressed_split_accepts_a_pending_frame_at_the_new_limit() {
+    use bytes::BytesMut;
+    use sockudo_ws::frame::encode_frame;
+    use sockudo_ws::{CompressedProtocol, DeflateConfig, OpCode};
+    for cut in [3, 7] {
+        let mut receiver = CompressedProtocol::server(8192, 8192, DeflateConfig::default());
+        let mut wire = BytesMut::new();
+        encode_frame(
+            &mut wire,
+            OpCode::Binary,
+            b"abcde",
+            true,
+            Some([1, 2, 3, 4]),
+        );
+        let mut buf = wire.split_to(cut);
+        assert!(receiver.process(&mut buf).unwrap().is_empty());
+        let (mut reader, _) = receiver.split(5, 8192);
+        buf.extend_from_slice(&wire);
+        let messages = reader.process(&mut buf).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].as_bytes(), b"abcde");
+    }
+}

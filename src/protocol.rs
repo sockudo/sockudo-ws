@@ -317,6 +317,8 @@ impl Protocol {
     }
 
     /// Keep receive progress in the reader and only copy control state to the writer.
+    /// The limits only initialize the fresh writer protocol; the reader retains
+    /// its existing limits, unlike the public compressed split operation.
     #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
     pub(crate) fn split(self, max_frame_size: usize, max_message_size: usize) -> (Self, Self) {
         let mut writer = Self::new(self.role, max_frame_size, max_message_size);

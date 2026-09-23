@@ -1851,6 +1851,9 @@ where
     S::WriteHalf: AsyncWrite + 'static,
 {
     /// Split the WebSocket stream into independent Compio read and write halves.
+    ///
+    /// Buffered output is not transferred. Finish pending writes before splitting;
+    /// this operation does not make cancelled owned I/O safe to resume.
     pub fn split(
         self,
     ) -> (
@@ -3221,6 +3224,9 @@ where
     S::WriteHalf: AsyncWrite + 'static,
 {
     /// Split the compressed WebSocket stream into Compio read and write halves.
+    ///
+    /// Buffered output is not transferred. Finish pending writes before splitting;
+    /// this operation does not make cancelled owned I/O safe to resume.
     pub fn split(
         self,
     ) -> (

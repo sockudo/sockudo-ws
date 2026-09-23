@@ -255,6 +255,9 @@ enum ParseState {
     Mask,
     /// Waiting for payload
     Payload,
+    /// A limit change rejected an already accepted header.
+    #[cfg(feature = "permessage-deflate")]
+    FrameTooLarge,
 }
 
 /// High-performance frame parser
@@ -352,6 +355,15 @@ impl FrameParser {
     #[cfg(feature = "permessage-deflate")]
     pub(crate) fn set_max_frame_size(&mut self, max_frame_size: usize) {
         self.max_frame_size = max_frame_size;
+        // Splitting a compressed protocol can lower the frame limit after a
+        // header was accepted. Check once here, not on every payload read.
+        if self
+            .header
+            .as_ref()
+            .is_some_and(|header| header.payload_len > max_frame_size as u64)
+        {
+            self.state = ParseState::FrameTooLarge;
+        }
     }
 
     /// Enable or disable RSV1 (compression) support
@@ -508,6 +520,8 @@ impl FrameParser {
                 );
             }
             match self.state {
+                #[cfg(feature = "permessage-deflate")]
+                ParseState::FrameTooLarge => return Err(Error::FrameTooLarge),
                 ParseState::Header => {
                     if buf.len() < 2 {
                         return Ok(None);
@@ -793,11 +807,6 @@ impl FrameParser {
 
                 ParseState::Payload => {
                     let header = self.header.as_ref().unwrap();
-                    // Splitting a compressed protocol can lower the frame limit
-                    // after this header has already been accepted.
-                    if header.payload_len > self.max_frame_size as u64 {
-                        return Err(Error::FrameTooLarge);
-                    }
                     let payload_len = header.payload_len as usize;
 
                     if DEBUG {

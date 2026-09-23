@@ -1440,6 +1440,10 @@ where
     ///
     /// This starts one connection-scoped Tokio task that exclusively owns the
     /// transport writer. Dropping either returned half cancels that task.
+    ///
+    /// Queued output is not transferred: finish flushing any fed messages before
+    /// splitting. A control message retained by a cancelled read is not transferred
+    /// either; flushing output alone does not recover that pending delivery.
     pub fn split(self) -> (SplitReader<S>, SplitWriter<S>) {
         let (reader, writer) = SplitTransport::pair(self.inner);
         let transport = reader.clone();
@@ -2921,6 +2925,10 @@ where
     /// Both halves maintain compression/decompression state independently:
     /// - Reader has the decoder for decompressing incoming messages
     /// - Writer has the encoder for compressing outgoing messages
+    ///
+    /// Queued output is not transferred: finish flushing any fed messages before
+    /// splitting. A control message retained by a cancelled read is not transferred
+    /// either; flushing output alone does not recover that pending delivery.
     ///
     /// # Example
     ///
