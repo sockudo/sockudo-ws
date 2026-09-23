@@ -52,6 +52,21 @@ impl Utf8Stream {
         self.carry_len = 0;
     }
 
+    /// Resume from a message's unvalidated suffix before any validation error.
+    ///
+    /// After successful validation the carry is the entire pending state, so
+    /// matching bytes already represent the result of resetting and re-pushing
+    /// the suffix. Compare contents, not just length: raw processing may have
+    /// started another message while leaving this validator unchanged.
+    #[inline]
+    pub(crate) fn resume(&mut self, suffix: &[u8]) -> bool {
+        if suffix == &self.carry[..self.carry_len as usize] {
+            return true;
+        }
+        self.reset();
+        self.push(suffix)
+    }
+
     /// Validate the next chunk of the message.
     ///
     /// Returns `false` as soon as an invalid sequence is complete enough to be

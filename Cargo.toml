@@ -304,6 +304,10 @@ name = "sink_backpressure"
 harness = false
 required-features = ["tokio-runtime", "permessage-deflate"]
 
+[[bench]]
+name = "fragment_validation"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "fat"

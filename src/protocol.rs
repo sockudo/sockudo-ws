@@ -284,11 +284,13 @@ pub struct Protocol {
     pub(crate) fragment_buf: BytesMut,
     /// Opcode of current fragmented message
     pub(crate) fragment_opcode: Option<OpCode>,
+    /// Bytes before this offset form complete, validated UTF-8 code points.
+    fragment_validated_len: usize,
     /// Maximum message size
     pub(crate) max_message_size: usize,
     /// Pending close reason (if we received a close frame)
     pending_close: Option<CloseReason>,
-    /// Incremental UTF-8 validator for the text message currently being received
+    /// Validator for the current text frame, including any preceding incomplete code point.
     pub(crate) utf8: Utf8Stream,
     /// Payload bytes of the frame currently being received that were already
     /// fed to `utf8` before the frame completed
@@ -306,6 +308,7 @@ impl Protocol {
             parser: FrameParser::new(max_frame_size, expect_masked),
             fragment_buf: BytesMut::new(),
             fragment_opcode: None,
+            fragment_validated_len: 0,
             max_message_size,
             pending_close: None,
             utf8: Utf8Stream::new(),
@@ -336,8 +339,18 @@ impl Protocol {
             return Ok(());
         }
 
-        if self.partial_checked == 0 && pending.opcode == OpCode::Text {
-            self.utf8.reset();
+        if self.partial_checked == 0 {
+            // Raw calls can leave an unvalidated suffix, not just a split code point.
+            if pending.opcode == OpCode::Continuation {
+                if !self
+                    .utf8
+                    .resume(&self.fragment_buf[self.fragment_validated_len..])
+                {
+                    return Err(Error::InvalidUtf8);
+                }
+            } else {
+                self.utf8.reset();
+            }
         }
         let ready = pending.ready.min(buf.len());
         if !self.utf8.push(&buf[self.partial_checked..ready]) {
@@ -400,7 +413,10 @@ impl Protocol {
     ///
     /// Unlike [`Protocol::process`], this path does not validate text payloads
     /// as UTF-8. It is useful for low-level adapters that only need to proxy or
-    /// echo frames and want to avoid extra payload scans.
+    /// echo frames and want to avoid extra payload scans. If typed processing
+    /// resumes before a fragmented text message ends, it validates the bytes
+    /// accumulated by raw calls as well as the new typed input. A message
+    /// completed through the raw API remains unvalidated.
     #[inline]
     pub fn process_raw(&mut self, buf: &mut BytesMut) -> Result<Vec<RawMessage>> {
         let mut messages = Vec::new();
@@ -548,10 +564,17 @@ impl Protocol {
             return Err(Error::MessageTooLarge);
         }
 
-        // Text fragments are validated incrementally: only the bytes that were
-        // not already checked while the frame was incomplete are scanned, so a
-        // message costs one linear pass no matter how many fragments it has.
+        // Text fragments scan only new or previously unvalidated bytes, keeping
+        // validation linear in message size. Re-seed from the unvalidated suffix
+        // after raw processing or a code point split across frames.
         if opcode == OpCode::Text {
+            if prevalidated == 0
+                && !self
+                    .utf8
+                    .resume(&self.fragment_buf[self.fragment_validated_len..])
+            {
+                return Err(Error::InvalidUtf8);
+            }
             let prevalidated = prevalidated.min(frame.payload.len());
             if !self.utf8.push(&frame.payload[prevalidated..]) {
                 return Err(Error::InvalidUtf8);
@@ -564,6 +587,9 @@ impl Protocol {
             // Complete the fragmented message
             self.complete_fragment(opcode)
         } else {
+            if opcode == OpCode::Text {
+                self.fragment_validated_len = self.fragment_buf.len() - self.utf8.pending();
+            }
             Ok(None)
         }
     }
@@ -579,6 +605,7 @@ impl Protocol {
             return Err(Error::MessageTooLarge);
         }
 
+        // Leave the validated prefix unchanged for the next typed call.
         self.fragment_buf.extend_from_slice(&frame.payload);
 
         if frame.header.fin {
@@ -617,6 +644,12 @@ impl Protocol {
         self.fragment_buf.clear();
         self.fragment_buf.extend_from_slice(&payload);
 
+        self.fragment_validated_len = if opcode == OpCode::Text {
+            self.fragment_buf.len() - self.utf8.pending()
+        } else {
+            0
+        };
+
         Ok(())
     }
 
@@ -627,6 +660,7 @@ impl Protocol {
         }
 
         self.fragment_opcode = Some(opcode);
+        self.fragment_validated_len = 0;
         self.fragment_buf.clear();
         self.fragment_buf.extend_from_slice(&payload);
         Ok(())
