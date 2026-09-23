@@ -775,9 +775,8 @@ where
                 }
                 return Poll::Ready(this.finish_read_close(Some(Error::ConnectionClosed)));
             }
-            // Write out frames coalesced from earlier sends before waiting on
-            // the transport, so batch-scoped corking never delays a reply past
-            // the end of the read batch.
+            // Write out frames queued by feed() before waiting on the transport,
+            // so replies do not wait for new input after this read batch ends.
             if self.write_buf.has_data() {
                 match self.as_mut().poll_write_out(cx) {
                     Poll::Ready(Ok(())) => {}
@@ -1017,7 +1016,10 @@ impl WebSocketStreamBuilder {
     /// Set the high water mark for backpressure
     ///
     /// When the write buffer exceeds this threshold, `is_backpressured()` returns `true`.
-    /// Default is 64KB.
+    /// With write coalescing enabled, Sink readiness drains at the smaller of
+    /// this threshold and `Config::max_backpressure`; a zero threshold drains
+    /// any pending output. With coalescing disabled, readiness always drains
+    /// pending output before accepting another frame. Default is 64 KiB.
     pub fn high_water_mark(mut self, size: usize) -> Self {
         self.high_water_mark = size;
         self
@@ -2690,9 +2692,8 @@ where
                 }
                 return Poll::Ready(this.finish_read_close(Some(Error::ConnectionClosed)));
             }
-            // Write out frames coalesced from earlier sends before waiting on
-            // the transport, so batch-scoped corking never delays a reply past
-            // the end of the read batch.
+            // Write out frames queued by feed() before waiting on the transport,
+            // so replies do not wait for new input after this read batch ends.
             if self.write_buf.has_data() {
                 match self.as_mut().poll_write_out(cx) {
                     Poll::Ready(Ok(())) => {}
