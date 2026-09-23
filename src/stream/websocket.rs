@@ -1454,13 +1454,12 @@ where
             shared.begin_read_error();
         }
         let terminal_rx = shared.terminal_tx.subscribe();
-        let reader_protocol = Protocol::new(
-            self.protocol.role,
-            self.config.max_frame_size,
-            self.config.max_message_size,
-        );
+        // Receive progress, including partial UTF-8 validation, belongs to the reader.
+        let (reader_protocol, writer_protocol) = self
+            .protocol
+            .split(self.config.max_frame_size, self.config.max_message_size);
         let sink: SharedSink<SplitTransport<S>, Protocol> = Arc::new(tokio::sync::Mutex::new(
-            SplitSink::new(writer, self.protocol, self.config.write_buffer_size),
+            SplitSink::new(writer, writer_protocol, self.config.write_buffer_size),
         ));
         let close_timeout = Duration::from_secs(self.config.close_timeout.into());
 

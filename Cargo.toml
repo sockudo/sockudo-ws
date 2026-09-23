@@ -313,6 +313,11 @@ name = "receive_limits"
 harness = false
 required-features = ["permessage-deflate"]
 
+[[bench]]
+name = "split_receive"
+harness = false
+required-features = ["tokio-runtime", "compio-runtime", "permessage-deflate"]
+
 [profile.release]
 opt-level = 3
 lto = "fat"

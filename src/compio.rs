@@ -1872,15 +1872,14 @@ where
             shared.begin_closing();
         }
 
-        let reader_protocol = Protocol::new(
-            self.protocol.role,
-            self.config.max_frame_size,
-            self.config.max_message_size,
-        );
+        // Receive progress, including partial UTF-8 validation, belongs to the reader.
+        let (reader_protocol, writer_protocol) = self
+            .protocol
+            .split(self.config.max_frame_size, self.config.max_message_size);
 
         ::compio::runtime::spawn(compio_split_writer_driver(
             writer,
-            self.protocol,
+            writer_protocol,
             self.config,
             CompioDriverChannels {
                 control_rx,
