@@ -169,12 +169,15 @@ macro_rules! unified_close_cases {
                     b"\x03\xe8"
                 );
 
-                peer.write_all(b"\x89\x01p\x88\x02\x03\xe8".to_vec())
+                // Keep Close separate: Pong is required only until Close has
+                // actually been received (RFC 6455 §5.5.2).
+                peer.write_all(b"\x89\x01p".to_vec()).await.0.unwrap();
+                assert!(stream.next().await.unwrap().unwrap().is_ping());
+                assert_eq!(read_masked_control_payload(&mut peer, 0x0a).await, b"p");
+                peer.write_all(b"\x88\x02\x03\xe8".to_vec())
                     .await
                     .0
                     .unwrap();
-                assert!(stream.next().await.unwrap().unwrap().is_ping());
-                assert_eq!(read_masked_control_payload(&mut peer, 0x0a).await, b"p");
                 assert!(stream.next().await.unwrap().unwrap().is_close());
                 let result = peer.read(vec![0; 1]).await;
                 assert_eq!(result.0.unwrap(), 0);

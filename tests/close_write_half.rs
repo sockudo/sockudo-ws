@@ -19,17 +19,16 @@ async fn peer() -> (tokio::net::TcpStream, tokio::task::JoinHandle<()>) {
         let mut payload = vec![0; usize::from(header[1] & 0x7f)];
         server.read_exact(&mut payload).await.unwrap();
         // TCP must remain writable until the peer's Close, including the
-        // automatic Pong required for a crossing Ping.
-        server
-            .write_all(b"\x89\x01p\x88\x02\x03\xe8")
-            .await
-            .unwrap();
+        // automatic Pong required for a crossing Ping. Send Close only after
+        // Pong: RFC 6455 permits omitting Pong once Close has been received.
+        server.write_all(b"\x89\x01p").await.unwrap();
         server.read_exact(&mut header).await.unwrap();
         assert_eq!(header[0], 0x8a);
         server.read_exact(&mut mask).await.unwrap();
         let mut pong = [0; 1];
         server.read_exact(&mut pong).await.unwrap();
         assert_eq!(pong[0] ^ mask[0], b'p');
+        server.write_all(b"\x88\x02\x03\xe8").await.unwrap();
         assert_eq!(server.read(&mut pong).await.unwrap(), 0);
     });
     (client, task)

@@ -508,7 +508,12 @@ pub struct Config {
     /// Unified streams start one absolute budget when a local Close is queued
     /// or a peer Close is received. It covers Close/control writes, waiting for
     /// the peer Close, and transport shutdown; incoming traffic never resets it.
-    /// Zero allows one immediately ready attempt without waiting. Cleanup cannot
+    /// Zero permits one poll of each closing operation without waiting, including
+    /// at most one transport read across subsequent unified `next()` calls.
+    /// Already parsed messages remain deliverable in wire order after expiry.
+    /// A poll does not guarantee completion: Compio drivers may need a runtime
+    /// turn even to write Close or shut down an otherwise writable socket.
+    /// No minimum grace period is added. Cleanup cannot
     /// replace an accepted peer Close or an existing idle/Pong timeout error.
     pub close_timeout: u32,
     /// Coalesce outbound frames while inbound messages are still queued

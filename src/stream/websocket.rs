@@ -74,6 +74,7 @@ pin_project! {
         write_buf: CorkBuffer,
         state: StreamState,
         closing_deadline: Option<u64>,
+        closing_read_attempted: bool,
         immediate_write_shutdown: bool,
         write_shutdown_complete: bool,
         config: Config,
@@ -145,6 +146,7 @@ where
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
             state: StreamState::Open,
             closing_deadline: None,
+            closing_read_attempted: false,
             immediate_write_shutdown: false,
             write_shutdown_complete: false,
             config,
@@ -526,18 +528,7 @@ where
             if self.state == StreamState::Closed {
                 return Poll::Ready(None);
             }
-            if !self.flush_on_read && self.as_mut().get_mut().poll_closing_expired(cx) {
-                let this = self.as_mut().get_mut();
-                // No pending frame may be flushed through transport cleanup.
-                // At expiry shutdown gets one poll, without a new waiting budget.
-                if !this.write_shutdown_complete
-                    && !this.write_buf.has_data()
-                    && let Poll::Ready(Ok(())) = Pin::new(&mut this.inner).poll_shutdown(cx)
-                {
-                    this.write_shutdown_complete = true;
-                }
-                return Poll::Ready(this.finish_read_close(Some(Error::ConnectionClosed)));
-            }
+
             // Control responses and automatic pings must be driven by the read path.
             if self.flush_on_read {
                 match self.as_mut().poll_write_out(cx) {
@@ -685,9 +676,15 @@ where
                     Message::Ping(data) => {
                         // Queue pong response
                         let this = self.as_mut().get_mut();
-                        if this.write_shutdown_complete {
+                        if this.write_shutdown_complete
+                            || this.pending_messages.iter().any(Message::is_close)
+                            || this.poll_closing_expired(cx)
+                        {
                             // END_STREAM forbids a Pong, but the read half must
                             // still deliver this Ping and the following Close.
+                            // RFC 6455 §5.5.2 also permits skipping Pong once Close
+                            // has been received; a blocked Pong must not hide it.
+                            // Expiry permits draining accepted input, not new writes.
                             return Poll::Ready(Some(Ok(msg)));
                         }
                         this.protocol.encode_pong(data, this.write_buf.buffer_mut());
@@ -738,6 +735,23 @@ where
             }
 
             // Try to read more data
+            // Drain the finite accepted batch before checking the I/O budget.
+            // Only zero-budget closing gets one read poll after expiry, and that
+            // opportunity is shared across all subsequent next() calls.
+            if self.as_mut().get_mut().poll_closing_expired(cx)
+                && (self.config.close_timeout != 0 || self.closing_read_attempted)
+            {
+                let this = self.as_mut().get_mut();
+                // No pending frame may be flushed through transport cleanup.
+                // At expiry shutdown gets one poll, without a new waiting budget.
+                if !this.write_shutdown_complete
+                    && !this.write_buf.has_data()
+                    && let Poll::Ready(Ok(())) = Pin::new(&mut this.inner).poll_shutdown(cx)
+                {
+                    this.write_shutdown_complete = true;
+                }
+                return Poll::Ready(this.finish_read_close(Some(Error::ConnectionClosed)));
+            }
             // Write out frames coalesced from earlier sends before waiting on
             // the transport, so batch-scoped corking never delays a reply past
             // the end of the read batch.
@@ -751,10 +765,21 @@ where
                         this.heartbeat_sleep = None;
                         return Poll::Ready(Some(Err(e)));
                     }
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        let this = self.as_mut().get_mut();
+                        if this.poll_closing_expired(cx) {
+                            return Poll::Ready(
+                                this.finish_read_close(Some(Error::ConnectionClosed)),
+                            );
+                        }
+                        return Poll::Pending;
+                    }
                 }
             }
 
+            if self.closing_deadline.is_some() {
+                self.closing_read_attempted = true;
+            }
             match self.as_mut().poll_read_more(cx) {
                 Poll::Ready(Ok(0)) => {
                     // EOF - connection closed
@@ -781,7 +806,12 @@ where
                     return Poll::Ready(Some(Err(e.into())));
                 }
                 Poll::Pending => {
-                    // No more data available right now
+                    // No more data available right now. A zero-budget attempt
+                    // must terminate instead of waiting for another wakeup.
+                    let this = self.as_mut().get_mut();
+                    if this.poll_closing_expired(cx) {
+                        return Poll::Ready(this.finish_read_close(Some(Error::ConnectionClosed)));
+                    }
                     return Poll::Pending;
                 }
             }
@@ -2051,6 +2081,7 @@ pin_project! {
         write_buf: CorkBuffer,
         state: StreamState,
         closing_deadline: Option<u64>,
+        closing_read_attempted: bool,
         immediate_write_shutdown: bool,
         write_shutdown_complete: bool,
         config: Config,
@@ -2094,6 +2125,7 @@ where
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
             state: StreamState::Open,
             closing_deadline: None,
+            closing_read_attempted: false,
             immediate_write_shutdown: false,
             write_shutdown_complete: false,
             config,
@@ -2130,6 +2162,7 @@ where
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
             state: StreamState::Open,
             closing_deadline: None,
+            closing_read_attempted: false,
             immediate_write_shutdown: false,
             write_shutdown_complete: false,
             config,
@@ -2412,18 +2445,7 @@ where
             if self.state == StreamState::Closed {
                 return Poll::Ready(None);
             }
-            if !self.flush_on_read && self.as_mut().get_mut().poll_closing_expired(cx) {
-                let this = self.as_mut().get_mut();
-                // No pending frame may be flushed through transport cleanup.
-                // At expiry shutdown gets one poll, without a new waiting budget.
-                if !this.write_shutdown_complete
-                    && !this.write_buf.has_data()
-                    && let Poll::Ready(Ok(())) = Pin::new(&mut this.inner).poll_shutdown(cx)
-                {
-                    this.write_shutdown_complete = true;
-                }
-                return Poll::Ready(this.finish_read_close(Some(Error::ConnectionClosed)));
-            }
+
             if self.flush_on_read {
                 match self.as_mut().poll_write_out(cx) {
                     Poll::Ready(Ok(())) => {
@@ -2565,9 +2587,15 @@ where
                 match &msg {
                     Message::Ping(data) => {
                         let this = self.as_mut().get_mut();
-                        if this.write_shutdown_complete {
+                        if this.write_shutdown_complete
+                            || this.pending_messages.iter().any(Message::is_close)
+                            || this.poll_closing_expired(cx)
+                        {
                             // END_STREAM forbids a Pong, but the read half must
                             // still deliver this Ping and the following Close.
+                            // RFC 6455 §5.5.2 also permits skipping Pong once Close
+                            // has been received; a blocked Pong must not hide it.
+                            // Expiry permits draining accepted input, not new writes.
                             return Poll::Ready(Some(Ok(msg)));
                         }
                         this.protocol.encode_pong(data, this.write_buf.buffer_mut());
@@ -2599,6 +2627,23 @@ where
                 return Poll::Ready(Some(Ok(msg)));
             }
 
+            // Drain the finite accepted batch before checking the I/O budget.
+            // Only zero-budget closing gets one read poll after expiry, and that
+            // opportunity is shared across all subsequent next() calls.
+            if self.as_mut().get_mut().poll_closing_expired(cx)
+                && (self.config.close_timeout != 0 || self.closing_read_attempted)
+            {
+                let this = self.as_mut().get_mut();
+                // No pending frame may be flushed through transport cleanup.
+                // At expiry shutdown gets one poll, without a new waiting budget.
+                if !this.write_shutdown_complete
+                    && !this.write_buf.has_data()
+                    && let Poll::Ready(Ok(())) = Pin::new(&mut this.inner).poll_shutdown(cx)
+                {
+                    this.write_shutdown_complete = true;
+                }
+                return Poll::Ready(this.finish_read_close(Some(Error::ConnectionClosed)));
+            }
             // Write out frames coalesced from earlier sends before waiting on
             // the transport, so batch-scoped corking never delays a reply past
             // the end of the read batch.
@@ -2612,10 +2657,21 @@ where
                         this.heartbeat_sleep = None;
                         return Poll::Ready(Some(Err(e)));
                     }
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        let this = self.as_mut().get_mut();
+                        if this.poll_closing_expired(cx) {
+                            return Poll::Ready(
+                                this.finish_read_close(Some(Error::ConnectionClosed)),
+                            );
+                        }
+                        return Poll::Pending;
+                    }
                 }
             }
 
+            if self.closing_deadline.is_some() {
+                self.closing_read_attempted = true;
+            }
             match self.as_mut().poll_read_more(cx) {
                 Poll::Ready(Ok(0)) => {
                     self.as_mut().get_mut().state = StreamState::Closed;
@@ -2641,6 +2697,10 @@ where
                     return Poll::Ready(Some(Err(e.into())));
                 }
                 Poll::Pending => {
+                    let this = self.as_mut().get_mut();
+                    if this.poll_closing_expired(cx) {
+                        return Poll::Ready(this.finish_read_close(Some(Error::ConnectionClosed)));
+                    }
                     return Poll::Pending;
                 }
             }

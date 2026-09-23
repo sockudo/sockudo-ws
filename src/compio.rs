@@ -1344,6 +1344,7 @@ pub struct CompioWebSocketStream<S> {
     write_buf: BytesMut,
     state: CompioStreamState,
     closing_deadline: Option<Instant>,
+    closing_read_attempted: bool,
     immediate_write_shutdown: bool,
     write_shutdown_complete: bool,
     config: Config,
@@ -1386,6 +1387,7 @@ where
             write_buf: BytesMut::with_capacity(config.write_buffer_size),
             state: CompioStreamState::Open,
             closing_deadline: None,
+            closing_read_attempted: false,
             immediate_write_shutdown: false,
             write_shutdown_complete: false,
             config,
@@ -1497,6 +1499,9 @@ where
 
     /// Receive the next WebSocket message.
     ///
+    /// This future is not cancellation-safe. Cancelling it during Close cleanup
+    /// can lose the accepted Close; drive it to completion for ordered delivery.
+    ///
     /// With automatic Ping enabled, custom `AsyncRead` implementations must
     /// cooperate with Compio's current `CancelToken` so a pending read can return
     /// its owned buffer before Ping is sent. The built-in transports do this.
@@ -1508,18 +1513,6 @@ where
         loop {
             if self.state == CompioStreamState::Closed {
                 return None;
-            }
-            if let Some(deadline) = self.closing_deadline
-                && Instant::now() >= deadline
-            {
-                self.state = CompioStreamState::Closed;
-                if !self.write_shutdown_complete && self.write_buf.is_empty() {
-                    self.write_shutdown_complete = matches!(
-                        compio_until(deadline, self.inner.shutdown()).await,
-                        Some(Ok(()))
-                    );
-                }
-                return Some(Err(Error::ConnectionClosed));
             }
 
             if let Some(msg) = self.next_pending_message() {
@@ -1562,7 +1555,24 @@ where
                 }
             }
 
+            // Accepted messages are drained before enforcing the new-I/O budget.
+            // A zero-budget close gets at most one read poll, not one per next().
+            if let Some(deadline) = self.closing_deadline
+                && Instant::now() >= deadline
+                && (self.config.close_timeout != 0 || self.closing_read_attempted)
+            {
+                self.state = CompioStreamState::Closed;
+                if !self.write_shutdown_complete && self.write_buf.is_empty() {
+                    self.write_shutdown_complete = matches!(
+                        compio_until(deadline, self.inner.shutdown()).await,
+                        Some(Ok(()))
+                    );
+                }
+                return Some(Err(Error::ConnectionClosed));
+            }
+
             let read_result = if let Some(deadline) = self.closing_deadline {
+                self.closing_read_attempted = true;
                 match compio_until(deadline, read_more(&mut self.inner, &mut self.read_buf)).await {
                     Some(result) => Some(result),
                     None => {
@@ -1785,7 +1795,13 @@ where
             Message::Ping(data) => {
                 // END_STREAM forbids a Pong, but the read half must continue
                 // through a crossing Ping to the peer's Close.
-                if !self.write_shutdown_complete {
+                // Once Close is accepted, RFC 6455 §5.5.2 permits skipping Pong.
+                // Do not let that write hide the queued Close, or start a new
+                // control write after the closing budget has expired.
+                if !self.write_shutdown_complete
+                    && !self.pending_messages.iter().any(Message::is_close)
+                    && !self.closing_deadline.is_some_and(|at| Instant::now() >= at)
+                {
                     self.protocol.encode_pong(data, &mut self.write_buf);
                     if let Err(error) = self.flush().await {
                         self.heartbeat.stop();
@@ -2699,6 +2715,7 @@ pub struct CompioCompressedWebSocketStream<S> {
     write_buf: BytesMut,
     state: CompioStreamState,
     closing_deadline: Option<Instant>,
+    closing_read_attempted: bool,
     immediate_write_shutdown: bool,
     write_shutdown_complete: bool,
     config: Config,
@@ -2746,6 +2763,7 @@ where
             write_buf: BytesMut::with_capacity(config.write_buffer_size),
             state: CompioStreamState::Open,
             closing_deadline: None,
+            closing_read_attempted: false,
             immediate_write_shutdown: false,
             write_shutdown_complete: false,
             config,
@@ -2788,6 +2806,7 @@ where
             write_buf: BytesMut::with_capacity(config.write_buffer_size),
             state: CompioStreamState::Open,
             closing_deadline: None,
+            closing_read_attempted: false,
             immediate_write_shutdown: false,
             write_shutdown_complete: false,
             config,
@@ -2818,6 +2837,9 @@ where
 
     /// Receive the next WebSocket message.
     ///
+    /// This future is not cancellation-safe. Cancelling it during Close cleanup
+    /// can lose the accepted Close; drive it to completion for ordered delivery.
+    ///
     /// With automatic Ping enabled, custom `AsyncRead` implementations must
     /// cooperate with Compio's current `CancelToken` so a pending read can return
     /// its owned buffer before Ping is sent. The built-in transports do this.
@@ -2829,18 +2851,6 @@ where
         loop {
             if self.state == CompioStreamState::Closed {
                 return None;
-            }
-            if let Some(deadline) = self.closing_deadline
-                && Instant::now() >= deadline
-            {
-                self.state = CompioStreamState::Closed;
-                if !self.write_shutdown_complete && self.write_buf.is_empty() {
-                    self.write_shutdown_complete = matches!(
-                        compio_until(deadline, self.inner.shutdown()).await,
-                        Some(Ok(()))
-                    );
-                }
-                return Some(Err(Error::ConnectionClosed));
             }
 
             if let Some(msg) = self.next_pending_message() {
@@ -2883,7 +2893,24 @@ where
                 }
             }
 
+            // Accepted messages are drained before enforcing the new-I/O budget.
+            // A zero-budget close gets at most one read poll, not one per next().
+            if let Some(deadline) = self.closing_deadline
+                && Instant::now() >= deadline
+                && (self.config.close_timeout != 0 || self.closing_read_attempted)
+            {
+                self.state = CompioStreamState::Closed;
+                if !self.write_shutdown_complete && self.write_buf.is_empty() {
+                    self.write_shutdown_complete = matches!(
+                        compio_until(deadline, self.inner.shutdown()).await,
+                        Some(Ok(()))
+                    );
+                }
+                return Some(Err(Error::ConnectionClosed));
+            }
+
             let read_result = if let Some(deadline) = self.closing_deadline {
+                self.closing_read_attempted = true;
                 match compio_until(deadline, read_more(&mut self.inner, &mut self.read_buf)).await {
                     Some(result) => Some(result),
                     None => {
@@ -3130,7 +3157,13 @@ where
             Message::Ping(data) => {
                 // END_STREAM forbids a Pong, but the read half must continue
                 // through a crossing Ping to the peer's Close.
-                if !self.write_shutdown_complete {
+                // Once Close is accepted, RFC 6455 §5.5.2 permits skipping Pong.
+                // Do not let that write hide the queued Close, or start a new
+                // control write after the closing budget has expired.
+                if !self.write_shutdown_complete
+                    && !self.pending_messages.iter().any(Message::is_close)
+                    && !self.closing_deadline.is_some_and(|at| Instant::now() >= at)
+                {
                     self.protocol.encode_pong(data, &mut self.write_buf);
                     if let Err(error) = self.flush().await {
                         self.heartbeat.stop();

@@ -86,6 +86,87 @@ macro_rules! close_cases {
             use super::*;
 
             #[compio::test]
+            async fn zero_budget_tcp_close_does_not_wait_for_driver_completion() {
+                let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let client = compio::net::TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (_peer, _) = listener.accept().await.unwrap();
+                let mut ws = ($make)(client, config(0));
+                let driver = compio::runtime::Runtime::with_current(|rt| rt.driver_type());
+                let result = futures_util::poll!(std::pin::pin!(ws.close(1000, "")));
+                eprintln!("zero-budget TCP close: driver={driver:?}, result={result:?}");
+                // Submission is not completion on every driver. Either outcome
+                // is valid, but zero budget must not wait for the driver's turn.
+                assert!(matches!(
+                    result,
+                    std::task::Poll::Ready(Ok(()) | Err(Error::ConnectionClosed))
+                ));
+                assert!(matches!(
+                    futures_util::poll!(std::pin::pin!(ws.next())),
+                    std::task::Poll::Ready(None | Some(Err(Error::ConnectionClosed)))
+                ));
+                assert!(ws.next().await.is_none());
+            }
+
+            #[compio::test]
+            async fn accepted_batch_survives_close_deadline() {
+                let mut ws = ($make)(
+                    TestIo::new(Some(b"\x89\x01p\x82\x01d\x88\x02\x03\xe8"), true),
+                    config(1),
+                );
+                ws.close(1000, "").await.unwrap();
+                assert!(ws.next().await.unwrap().unwrap().is_ping());
+                compio::time::sleep(Duration::from_millis(1100)).await;
+                assert!(matches!(ws.next().await, Some(Ok(Message::Binary(_)))));
+                assert!(ws.next().await.unwrap().unwrap().is_close());
+                assert!(ws.next().await.is_none());
+            }
+
+            #[compio::test]
+            async fn zero_budget_local_close_reads_one_ready_batch() {
+                let mut ws = ($make)(
+                    TestIo::new(Some(b"\x89\x01p\x88\x02\x03\xe8"), true),
+                    config(0),
+                );
+                ws.close(1000, "").await.unwrap();
+                assert!(ws.next().await.unwrap().unwrap().is_ping());
+                assert!(ws.next().await.unwrap().unwrap().is_close());
+                assert!(ws.next().await.is_none());
+            }
+
+            #[compio::test]
+            async fn zero_budget_read_attempt_is_not_renewed() {
+                let mut io = TestIo::new(None, false);
+                io.repeat_ping = true;
+                let mut ws = ($make)(io, config(0));
+                ws.close(1000, "").await.unwrap();
+                assert!(ws.next().await.unwrap().unwrap().is_ping());
+                assert!(matches!(
+                    ws.next().await,
+                    Some(Err(Error::ConnectionClosed))
+                ));
+                assert!(ws.next().await.is_none());
+            }
+
+            #[compio::test]
+            async fn accepted_close_does_not_wait_for_preceding_pong() {
+                let mut io = TestIo::new(Some(b"\x89\x01p\x88\x02\x03\xe8"), true);
+                io.block_write = true;
+                let mut ws = ($make)(io, config(1));
+                assert!(
+                    compio::time::timeout(Duration::from_secs(2), ws.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap()
+                        .is_ping()
+                );
+                assert!(ws.next().await.unwrap().unwrap().is_close());
+                assert!(ws.next().await.is_none());
+            }
+
+            #[compio::test]
             async fn shutdown_failure_preserves_peer_close_once() {
                 let mut ws = ($make)(TestIo::new(Some(b"\x88\x02\x03\xe8"), false), config(1));
                 assert!(ws.next().await.unwrap().unwrap().is_close());
