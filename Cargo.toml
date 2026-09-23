@@ -299,6 +299,11 @@ name = "comparison_bench"
 harness = false
 required-features = ["tokio-runtime"]
 
+[[bench]]
+name = "sink_backpressure"
+harness = false
+required-features = ["tokio-runtime", "permessage-deflate"]
+
 [profile.release]
 opt-level = 3
 lto = "fat"

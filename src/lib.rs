@@ -484,8 +484,17 @@ pub struct Config {
     /// Every valid inbound frame resets this independent deadline. When it
     /// ties a Pong deadline, the more specific Pong timeout wins.
     pub idle_timeout: u32,
-    /// Maximum backpressure in bytes before dropping connection (default: 1MB)
-    /// If write buffer exceeds this, connection is closed
+    /// Queued-write backpressure threshold in bytes (default: 1 MiB).
+    /// The Tokio Sink drains pending encoded bytes before accepting another
+    /// message when this threshold is reached. One message may exceed it;
+    /// this is not an outbound message size limit or a peak memory bound.
+    /// Zero drains any pending output before accepting another message.
+    /// Split and Compio sends already drain each message before returning.
+    ///
+    /// Tokio `feed`, `send_all`, and `forward` may wait here. A blocked unified
+    /// write does not drive reads or inbound deadlines; applications must choose
+    /// their slow-consumer policy. This threshold is separate from the high-water
+    /// mark reported by `WebSocketStream::is_backpressured`.
     pub max_backpressure: usize,
     /// Send native Pings after inbound inactivity (default: true).
     ///
