@@ -284,12 +284,9 @@ All of section 4 except the runtime is now done, in the working tree after v2.1.
 
 ### 6.1 Batch-scoped write coalescing (`Config::write_coalescing`, default on)
 
-`Sink::poll_flush` returns `Ready` without writing while inbound messages that were already
-parsed are still queued for the application and the write buffer is under the high-water mark.
-`poll_next` writes everything in one vectored write before it next waits on the transport, so a
-reply is never delayed past the end of the read batch it belongs to. This is the uWebSockets
-cork, scoped to a read batch instead of an event-loop callback. Sequential request/response
-traffic (nothing queued) is unaffected; bursts are where it pays.
+Tokio `SinkExt::feed()` buffers frames; readiness drains at the smaller of the high-water mark and `max_backpressure` before accepting another frame. With `write_coalescing=false`, readiness drains any pending output. Standard `send()` and `flush()` always flush the transport. Flush after each batch before waiting for replies or pausing reads; `poll_next` also flushes before waiting for transport input.
+
+The measurements below used the earlier implicit coalescing API and have not been rerun for this contract change. They are historical evidence, not performance claims for the current feed/flush API.
 
 Same neutral client as section 2.2, `depth` messages in flight per connection:
 

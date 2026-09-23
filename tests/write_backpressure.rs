@@ -109,6 +109,94 @@ partial_drain_case!(
     }
 );
 
+macro_rules! batching_drain_case {
+    ($name:ident, $make:expr, $coalesce:expr, $payload_len:expr) => {
+        #[tokio::test]
+        async fn $name() {
+            let state = std::rc::Rc::new(std::cell::RefCell::new(WriteState::default()));
+            let mut ws = ($make)(
+                ControlledIo(state.clone()),
+                Config::builder()
+                    .max_backpressure(usize::MAX)
+                    .write_coalescing($coalesce)
+                    .build(),
+            );
+            let payload = vec![7; $payload_len];
+            let mut expected = bytes::BytesMut::new();
+            sockudo_ws::frame::encode_frame(
+                &mut expected,
+                sockudo_ws::frame::OpCode::Binary,
+                &payload,
+                true,
+                None,
+            );
+            ws.feed(Message::binary(payload)).await.unwrap();
+            state.borrow_mut().allowance = 1;
+            {
+                let next = ws.feed(Message::text("not accepted"));
+                let mut next = std::pin::pin!(next);
+                assert!(futures_util::poll!(next.as_mut()).is_pending());
+            }
+            // Cancelling feed preserves the active drain even below high-water.
+            let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+            assert!(std::pin::Pin::new(&mut ws).poll_ready(&mut cx).is_pending());
+            state.borrow_mut().allowance = expected.len() - 1;
+            assert!(std::pin::Pin::new(&mut ws).poll_ready(&mut cx).is_pending());
+            assert_eq!(ws.write_buffer_len(), 0);
+            assert_eq!(state.borrow().written.as_slice(), expected.as_ref());
+            state.borrow_mut().flush_ready = true;
+            assert!(matches!(
+                std::pin::Pin::new(&mut ws).poll_ready(&mut cx),
+                std::task::Poll::Ready(Ok(()))
+            ));
+        }
+    };
+}
+batching_drain_case!(
+    high_water_drain_survives_cancel,
+    WebSocketStream::server,
+    true,
+    65532
+);
+batching_drain_case!(
+    disabled_batching_waits_for_flush,
+    WebSocketStream::server,
+    false,
+    8
+);
+#[cfg(feature = "permessage-deflate")]
+batching_drain_case!(
+    compressed_high_water_drain_survives_cancel,
+    |io, config| {
+        sockudo_ws::CompressedWebSocketStream::server(
+            io,
+            config,
+            sockudo_ws::DeflateConfig {
+                compression_threshold: usize::MAX,
+                ..Default::default()
+            },
+        )
+    },
+    true,
+    65532
+);
+#[cfg(feature = "permessage-deflate")]
+batching_drain_case!(
+    compressed_disabled_batching_waits_for_flush,
+    |io, config| {
+        sockudo_ws::CompressedWebSocketStream::server(
+            io,
+            config,
+            sockudo_ws::DeflateConfig {
+                compression_threshold: usize::MAX,
+                ..Default::default()
+            },
+        )
+    },
+    false,
+    8
+);
+
 macro_rules! completed_drain_case {
     ($name:ident, $make:expr) => {
         #[tokio::test]
@@ -226,7 +314,7 @@ macro_rules! coalesced_readiness_case {
             let mut ws = ($make)(io, Config::builder().max_backpressure(8).build());
             peer.write_all(&[0x82, 1, 1, 0x82, 1, 2]).await.unwrap();
             assert_eq!(ws.next().await.unwrap().unwrap().as_bytes(), &[1]);
-            ws.send(Message::Ping(bytes::Bytes::from_static(&[3; 2])))
+            ws.feed(Message::Ping(bytes::Bytes::from_static(&[3; 2])))
                 .await
                 .unwrap();
             assert_eq!(ws.write_buffer_len(), 8);

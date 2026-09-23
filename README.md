@@ -787,7 +787,9 @@ let config = Config::builder()
 
 On a unified stream, waiting for writable capacity does not poll the read side, so automatic Pong and inbound heartbeat/idle processing do not advance during that wait. An open connection has no write deadline from `close_timeout`. A peer that never reads can therefore stall a sequential fan-out loop. Monitor `write_buffer_len()` / `is_backpressured()` to choose an application-level slow-consumer policy; these observations do not guarantee that a later send cannot wait. Native `split()` lets reading/control processing progress independently, but sequentially awaiting each split writer still permits head-of-line blocking.
 
-`is_backpressured()` reports the separate high-water mark (64 KiB by default), which also controls read-batch coalescing. It is not the Sink readiness threshold: it can be true while `poll_ready` succeeds. `max_backpressure` defaults to 1 MiB and controls readiness draining independently.
+With `write_coalescing=true` (the default), Tokio Sink readiness drains at the smaller of the high-water mark (default 64 KiB) and `max_backpressure` (default 1 MiB). `is_backpressured()` reports whether queued bytes exceed the high-water mark; readiness starts draining when a threshold is reached. With `write_coalescing=false`, readiness drains any pending output before accepting another frame. Zero thresholds never flush an empty buffer merely to become ready.
+
+`SinkExt::send()` and `SinkExt::flush()` always complete the transport flush, even while parsed inbound messages remain unread. Applications previously relying on implicit batching across `send()` calls should use `feed()` and then `flush()` at each batch boundary. Flush before waiting for a reply or pausing reads; the read path also drains output before waiting for more input. A successful flush does not mean the peer has received or processed the message.
 
 ### Native keepalive semantics
 
