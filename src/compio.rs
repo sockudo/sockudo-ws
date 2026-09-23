@@ -1851,6 +1851,9 @@ where
     S::WriteHalf: AsyncWrite + 'static,
 {
     /// Split the WebSocket stream into independent Compio read and write halves.
+    ///
+    /// Buffered output is not transferred. Finish pending writes before splitting;
+    /// this operation does not make cancelled owned I/O safe to resume.
     pub fn split(
         self,
     ) -> (
@@ -1872,15 +1875,14 @@ where
             shared.begin_closing();
         }
 
-        let reader_protocol = Protocol::new(
-            self.protocol.role,
-            self.config.max_frame_size,
-            self.config.max_message_size,
-        );
+        // Receive progress, including partial UTF-8 validation, belongs to the reader.
+        let (reader_protocol, writer_protocol) = self
+            .protocol
+            .split(self.config.max_frame_size, self.config.max_message_size);
 
         ::compio::runtime::spawn(compio_split_writer_driver(
             writer,
-            self.protocol,
+            writer_protocol,
             self.config,
             CompioDriverChannels {
                 control_rx,
@@ -3222,6 +3224,9 @@ where
     S::WriteHalf: AsyncWrite + 'static,
 {
     /// Split the compressed WebSocket stream into Compio read and write halves.
+    ///
+    /// Buffered output is not transferred. Finish pending writes before splitting;
+    /// this operation does not make cancelled owned I/O safe to resume.
     pub fn split(
         self,
     ) -> (

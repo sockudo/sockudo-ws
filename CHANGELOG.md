@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Splitting a Tokio or Compio stream now preserves partially parsed frames and receive-side fragment/UTF-8 state. Compressed protocol splitting retains parser progress while applying the supplied frame and message limits, including a lowered frame limit for an already accepted header.
 - Frame size limits now apply equally to complete and partially received short frames. Single-frame text and binary messages honor the message size limit in typed, raw, and compression-capable protocols, including uncompressed input to compressed readers. Exact-limit payloads remain accepted.
 - Resuming typed protocol processing during a fragmented text message now validates bytes accumulated by raw calls without losing split UTF-8 code points. Messages completed through the raw API remain unvalidated.
 - Tokio Sink readiness now drains queued encoded output at `max_backpressure`, continuing partial drains before accepting another message. This is a soft queue threshold, not a message size limit: individual messages may exceed it, and zero drains any pending output. `feed`, `send_all`, and `forward` may now wait for a slow reader; blocked unified writes do not drive inbound heartbeat/idle processing. The high-water mark can trigger readiness draining earlier when batching is enabled. A completed transport flush also clears a cancelled readiness drain.

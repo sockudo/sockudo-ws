@@ -1440,6 +1440,10 @@ where
     ///
     /// This starts one connection-scoped Tokio task that exclusively owns the
     /// transport writer. Dropping either returned half cancels that task.
+    ///
+    /// Queued output is not transferred: finish flushing any fed messages before
+    /// splitting. A control message retained by a cancelled read is not transferred
+    /// either; flushing output alone does not recover that pending delivery.
     pub fn split(self) -> (SplitReader<S>, SplitWriter<S>) {
         let (reader, writer) = SplitTransport::pair(self.inner);
         let transport = reader.clone();
@@ -1454,13 +1458,12 @@ where
             shared.begin_read_error();
         }
         let terminal_rx = shared.terminal_tx.subscribe();
-        let reader_protocol = Protocol::new(
-            self.protocol.role,
-            self.config.max_frame_size,
-            self.config.max_message_size,
-        );
+        // Receive progress, including partial UTF-8 validation, belongs to the reader.
+        let (reader_protocol, writer_protocol) = self
+            .protocol
+            .split(self.config.max_frame_size, self.config.max_message_size);
         let sink: SharedSink<SplitTransport<S>, Protocol> = Arc::new(tokio::sync::Mutex::new(
-            SplitSink::new(writer, self.protocol, self.config.write_buffer_size),
+            SplitSink::new(writer, writer_protocol, self.config.write_buffer_size),
         ));
         let close_timeout = Duration::from_secs(self.config.close_timeout.into());
 
@@ -2922,6 +2925,10 @@ where
     /// Both halves maintain compression/decompression state independently:
     /// - Reader has the decoder for decompressing incoming messages
     /// - Writer has the encoder for compressing outgoing messages
+    ///
+    /// Queued output is not transferred: finish flushing any fed messages before
+    /// splitting. A control message retained by a cancelled read is not transferred
+    /// either; flushing output alone does not recover that pending delivery.
     ///
     /// # Example
     ///
