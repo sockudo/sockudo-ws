@@ -537,23 +537,16 @@ fn build_request_inner(
     buf.freeze()
 }
 
-/// Generate a random WebSocket key (client-side)
+/// Generate a random WebSocket key (client-side).
+///
+/// Uses the selected RNG backend, in priority order: `getrandom`, `rand_rng`,
+/// then `fastrand`. The default `fastrand` backend and the no-feature fallback
+/// are non-cryptographic; native fastrand seeds from a clock and thread ID.
+/// Use `getrandom` or `rand_rng` for cryptographically secure output.
+/// With `getrandom`, an entropy-source failure panics,
+/// matching frame-mask generation.
 pub fn generate_key() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let mut seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-
-    let mut bytes = [0u8; 16];
-    for byte in &mut bytes {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        *byte = seed as u8;
-    }
-
+    let bytes = crate::mask::generate_key_bytes();
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
@@ -860,6 +853,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_key_decodes_to_sixteen_bytes() {
+        use base64::Engine;
+        let key = super::generate_key();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(key)
+                .unwrap()
+                .len(),
+            16
+        );
+    }
 
     #[test]
     fn test_generate_accept_key() {

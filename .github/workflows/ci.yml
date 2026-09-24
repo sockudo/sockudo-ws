@@ -23,6 +23,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - name: default
+            args: ""
           - name: all-features
             args: --all-features
           - name: tokio
@@ -51,8 +53,8 @@ jobs:
         run: cargo test --locked --doc --all-features
 
       - name: Clippy
-        if: matrix.name == 'all-features'
-        run: cargo clippy --locked --all-features --all-targets -- -D warnings
+        if: matrix.name == 'all-features' || matrix.name == 'default'
+        run: cargo clippy --locked ${{ matrix.args }} --all-targets -- -D warnings
 
   fmt:
     name: Format
