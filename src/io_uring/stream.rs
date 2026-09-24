@@ -1,12 +1,13 @@
 //! io_uring-backed async stream
 //!
-//! This module provides `UringStream`, a wrapper around tokio-uring's TcpStream
-//! that implements tokio's `AsyncRead` and `AsyncWrite` traits.
+//! This module provides `UringStream`, a buffered compatibility wrapper around
+//! tokio-uring's `TcpStream` that implements Tokio's `AsyncRead` and
+//! `AsyncWrite` traits.
 //!
-//! # Combining with HTTP/2 and HTTP/3
+//! # Using io_uring as a TCP transport
 //!
 //! `UringStream` is a **transport layer** - it can be used as the underlying
-//! TCP connection for any protocol:
+//! TCP connection for TCP-based protocols:
 //!
 //! ```ignore
 //! // io_uring + HTTP/1.1 WebSocket
@@ -17,55 +18,80 @@
 //! let uring_stream = UringStream::new(tcp_stream);
 //! let tls_stream = tls_accept(uring_stream).await?;  // TLS over io_uring
 //! server.serve(tls_stream, handler).await?;          // H2 over TLS over io_uring
-//!
-//! // io_uring + HTTP/3 WebSocket
-//! // quinn already uses io_uring internally when available
 //! ```
 
+use std::future::Future;
 use std::io;
+use std::net::Shutdown;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll, ready};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_uring::net::TcpStream as UringTcpStream;
 
-/// Wrapper that implements tokio's AsyncRead/AsyncWrite over tokio-uring TcpStream
+const IO_BUFFER_SIZE: usize = 64 * 1024;
+
+type ReadOperation = Pin<Box<dyn Future<Output = (io::Result<usize>, Vec<u8>)> + 'static>>;
+type WriteOperation = Pin<Box<dyn Future<Output = (io::Result<()>, Vec<u8>)> + 'static>>;
+
+/// Buffered Tokio `AsyncRead`/`AsyncWrite` bridge for tokio-uring TCP streams
 ///
-/// This allows io_uring streams to be used with any protocol that expects
-/// standard async I/O traits, including:
+/// The bridge copies between borrowed poll-based buffers and owned buffers used
+/// by tokio-uring completion operations. This allows io_uring streams to be
+/// used with protocols that expect standard async I/O traits, including:
 /// - Direct WebSocket (HTTP/1.1)
 /// - HTTP/2 (via h2 crate)
 /// - TLS (via tokio-rustls with io_uring support)
 ///
+/// # Buffering and concurrency
+///
+/// Poll-based writes accept bytes into a buffer. Flush before waiting for a
+/// response or dropping the stream; dropping does not flush and can lose unsent
+/// bytes. Shutdown flushes before closing the write half. A failed flush returns
+/// the write error and clears that batch; it does not retain bytes for retry,
+/// and a prefix may already have reached the peer.
+///
+/// The native methods require mutable access to preserve ordering with the
+/// bridge, so they cannot be used for concurrent reads and writes through a
+/// shared `UringStream`. Read and write bridge state remain independent.
+/// For exclusively direct native I/O, see [`Self::get_ref`].
+///
 /// # Example: io_uring + HTTP/2 WebSocket
 ///
-/// ```ignore
+/// ```no_run
+/// # #[cfg(all(feature = "http2", any(feature = "rustls-webpki-roots", feature = "rustls-native-roots", feature = "rustls-platform-verifier")))]
+/// # {
+/// use futures_util::{SinkExt, StreamExt};
 /// use sockudo_ws::io_uring::UringStream;
-/// use sockudo_ws::http2::H2WebSocketServer;
+/// use sockudo_ws::{Config, Http2, WebSocketServer};
 ///
-/// #[tokio_uring::main]
-/// async fn main() {
-///     let listener = tokio_uring::net::TcpListener::bind(addr)?;
-///     let server = H2WebSocketServer::new(Config::default());
-///
-///     loop {
-///         let (tcp_stream, _) = listener.accept().await?;
-///
-///         // Wrap TCP in UringStream for io_uring I/O
-///         let uring_stream = UringStream::new(tcp_stream);
-///
-///         // Add TLS (required for HTTP/2)
-///         let tls_stream = tls_acceptor.accept(uring_stream).await?;
-///
-///         // HTTP/2 WebSocket server uses io_uring transport!
-///         tokio_uring::spawn(async move {
-///             server.serve(tls_stream, |ws, req| async move {
-///                 // Handle WebSocket over HTTP/2 over TLS over io_uring
-///             }).await.ok();
-///         });
-///     }
+/// // Configure the TLS acceptor with a certificate and ALPN protocol h2.
+/// fn serve(tls_acceptor: tokio_rustls::TlsAcceptor) -> Result<(), Box<dyn std::error::Error>> {
+///     tokio_uring::start(async move {
+///         let listener = tokio_uring::net::TcpListener::bind("127.0.0.1:8443".parse()?)?;
+///         let server = WebSocketServer::<Http2>::new(Config::default());
+///         loop {
+///             let (tcp, _) = listener.accept().await?;
+///             // Wrap TCP in UringStream for io_uring I/O.
+///             let uring = UringStream::new(tcp);
+///             // Add TLS for this HTTP/2 endpoint: TCP -> TLS -> HTTP/2 -> WebSocket.
+///             let tls = tls_acceptor.accept(uring).await?;
+///             let server = server.clone();
+///             tokio_uring::spawn(async move {
+///                 server.serve(tls, |mut ws, _req| async move {
+///                     // Handle WebSocket over HTTP/2 over TLS over io_uring.
+///                     while let Some(Ok(message)) = ws.next().await {
+///                         if ws.send(message).await.is_err() {
+///                             break;
+///                         }
+///                     }
+///                 }).await
+///             });
+///         }
+///     })
 /// }
+/// # }
 /// ```
 pub struct UringStream {
     /// The underlying tokio-uring TCP stream
@@ -84,21 +110,18 @@ struct ReadState {
     data_len: usize,
     /// Current read position
     read_pos: usize,
+    /// EOF is permanent for the socket; do not resubmit completed reads.
+    eof: bool,
     /// Pending read operation
-    pending_read: Option<PendingOp>,
+    pending_read: Option<ReadOperation>,
 }
 
 /// State for pending write operations
 struct WriteState {
-    /// Pending write operation
-    pending_write: Option<PendingOp>,
-    /// Bytes written in current operation
-    bytes_written: usize,
-}
-
-/// A pending io_uring operation
-struct PendingOp {
-    waker: Option<Waker>,
+    /// Data accepted by `poll_write` and waiting to be flushed
+    buffer: Option<Vec<u8>>,
+    /// Pending flush operation
+    pending_write: Option<WriteOperation>,
 }
 
 impl UringStream {
@@ -110,14 +133,15 @@ impl UringStream {
         Self {
             inner: Rc::new(stream),
             read_state: ReadState {
-                buffer: Some(vec![0u8; 64 * 1024]),
+                buffer: Some(vec![0u8; IO_BUFFER_SIZE]),
                 data_len: 0,
                 read_pos: 0,
                 pending_read: None,
+                eof: false,
             },
             write_state: WriteState {
+                buffer: Some(Vec::with_capacity(IO_BUFFER_SIZE)),
                 pending_write: None,
-                bytes_written: 0,
             },
         }
     }
@@ -131,7 +155,16 @@ impl UringStream {
         Ok(Self::new(uring_stream))
     }
 
-    /// Get a reference to the underlying tokio-uring stream
+    /// Get a reference to the underlying tokio-uring stream.
+    ///
+    /// Use this for socket inspection and configuration. Direct I/O is also
+    /// supported when all I/O uses this reference from construction onward:
+    /// the bridge then has no buffered or pending operations. In that mode,
+    /// a shared `Rc<UringStream>` can perform a read and a write concurrently
+    /// through the underlying stream's shared-reference methods.
+    ///
+    /// Do not mix direct I/O with the bridge or its native methods: direct I/O
+    /// bypasses bridge state and can reorder bytes or skip buffered input.
     pub fn get_ref(&self) -> &UringTcpStream {
         &self.inner
     }
@@ -139,6 +172,43 @@ impl UringStream {
     /// Check if there's buffered data available for reading
     pub fn has_buffered_data(&self) -> bool {
         self.read_state.read_pos < self.read_state.data_len
+    }
+
+    fn poll_flush_buffer(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.write_state.pending_write.is_none() {
+            let buffer = self
+                .write_state
+                .buffer
+                .as_ref()
+                .expect("write buffer must be available without a pending operation");
+            if buffer.is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+
+            let buffer = self
+                .write_state
+                .buffer
+                .take()
+                .expect("write buffer must be available without a pending operation");
+            let stream = Rc::clone(&self.inner);
+            self.write_state.pending_write =
+                Some(Box::pin(async move { stream.write_all(buffer).await }));
+        }
+
+        let operation = self
+            .write_state
+            .pending_write
+            .as_mut()
+            .expect("flush must have a pending operation");
+        match operation.as_mut().poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready((result, mut buffer)) => {
+                self.write_state.pending_write = None;
+                buffer.clear();
+                self.write_state.buffer = Some(buffer);
+                Poll::Ready(result)
+            }
+        }
     }
 }
 
@@ -150,51 +220,62 @@ impl AsyncRead for UringStream {
     ) -> Poll<io::Result<()>> {
         let this = &mut *self;
 
-        // First, try to satisfy from the internal buffer
-        if this.read_state.read_pos < this.read_state.data_len
-            && let Some(ref read_buf) = this.read_state.buffer
-        {
-            let available = this.read_state.data_len - this.read_state.read_pos;
-            let to_copy = std::cmp::min(available, buf.remaining());
-
-            buf.put_slice(&read_buf[this.read_state.read_pos..this.read_state.read_pos + to_copy]);
-            this.read_state.read_pos += to_copy;
-
+        if buf.remaining() == 0 || this.read_state.eof {
             return Poll::Ready(Ok(()));
         }
 
-        // Buffer exhausted, need to read more from io_uring
-        // Reset buffer state
-        this.read_state.read_pos = 0;
-        this.read_state.data_len = 0;
+        loop {
+            // First, try to satisfy from the internal buffer
+            if this.read_state.read_pos < this.read_state.data_len {
+                let read_buf = this
+                    .read_state
+                    .buffer
+                    .as_ref()
+                    .expect("read buffer must be available after completion");
+                let available = this.read_state.data_len - this.read_state.read_pos;
+                let to_copy = std::cmp::min(available, buf.remaining());
 
-        // Take the buffer for the read operation
-        let read_buf = this
-            .read_state
-            .buffer
-            .take()
-            .unwrap_or_else(|| vec![0u8; 64 * 1024]);
+                buf.put_slice(
+                    &read_buf[this.read_state.read_pos..this.read_state.read_pos + to_copy],
+                );
+                this.read_state.read_pos += to_copy;
+                return Poll::Ready(Ok(()));
+            }
 
-        // Store waker for when operation completes
-        this.read_state.pending_read = Some(PendingOp {
-            waker: Some(cx.waker().clone()),
-        });
+            if this.read_state.pending_read.is_none() {
+                this.read_state.read_pos = 0;
+                this.read_state.data_len = 0;
+                let read_buf = this
+                    .read_state
+                    .buffer
+                    .take()
+                    .expect("read buffer must be available without a pending operation");
+                let stream = Rc::clone(&this.inner);
+                this.read_state.pending_read =
+                    Some(Box::pin(async move { stream.read(read_buf).await }));
+            }
 
-        let _stream = Rc::clone(&this.inner);
-
-        // Note: In a real implementation, we'd use tokio-uring's spawn mechanism
-        // to handle the completion. This is a simplified version.
-        // tokio-uring requires using its own runtime and spawn functions.
-
-        // For now, we indicate that the caller should use tokio-uring's
-        // native async methods directly for best performance.
-
-        // Return the buffer
-        this.read_state.buffer = Some(read_buf);
-
-        // In practice, tokio-uring streams should be used with their native
-        // async methods. This trait impl is for compatibility layers.
-        Poll::Pending
+            let operation = this
+                .read_state
+                .pending_read
+                .as_mut()
+                .expect("read must have a pending operation");
+            match operation.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready((result, read_buf)) => {
+                    this.read_state.pending_read = None;
+                    this.read_state.buffer = Some(read_buf);
+                    match result {
+                        Ok(0) => {
+                            this.read_state.eof = true;
+                            return Poll::Ready(Ok(()));
+                        }
+                        Ok(read) => this.read_state.data_len = read,
+                        Err(error) => return Poll::Ready(Err(error)),
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -210,23 +291,36 @@ impl AsyncWrite for UringStream {
             return Poll::Ready(Ok(0));
         }
 
-        // Store waker
-        this.write_state.pending_write = Some(PendingOp {
-            waker: Some(cx.waker().clone()),
-        });
+        if this.write_state.pending_write.is_some() {
+            ready!(this.poll_flush_buffer(cx))?;
+        }
 
-        // Similar to read - in practice, use tokio-uring's native methods
-        Poll::Pending
+        let write_buf = this
+            .write_state
+            .buffer
+            .as_mut()
+            .expect("write buffer must be available without a pending operation");
+        if write_buf.len() == write_buf.capacity() {
+            ready!(this.poll_flush_buffer(cx))?;
+        }
+
+        let write_buf = this
+            .write_state
+            .buffer
+            .as_mut()
+            .expect("write buffer must be available without a pending operation");
+        let written = std::cmp::min(buf.len(), write_buf.capacity() - write_buf.len());
+        write_buf.extend_from_slice(&buf[..written]);
+        Poll::Ready(Ok(written))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // io_uring handles flushing at the kernel level
-        Poll::Ready(Ok(()))
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_flush_buffer(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Shutdown is handled by dropping the stream
-        Poll::Ready(Ok(()))
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        ready!(self.poll_flush_buffer(cx))?;
+        Poll::Ready(self.inner.shutdown(Shutdown::Write))
     }
 }
 
@@ -245,8 +339,8 @@ impl std::fmt::Debug for UringStream {
 impl UringStream {
     /// Read data using io_uring (native async, preferred method)
     ///
-    /// This is more efficient than using the AsyncRead trait because it
-    /// uses io_uring's native completion-based I/O directly.
+    /// This avoids the bridge's copy when no earlier poll-based read is pending
+    /// or buffered. Any bytes already read by the bridge are returned first.
     ///
     /// # Example
     ///
@@ -256,19 +350,41 @@ impl UringStream {
     /// let n = result?;
     /// // buf[..n] contains the data
     /// ```
-    pub async fn read_native(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    pub async fn read_native(&mut self, mut buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        if self.has_buffered_data() || self.read_state.pending_read.is_some() || self.read_state.eof
+        {
+            let initialized = buf.len();
+            buf.clear();
+            let mut read_buf = ReadBuf::uninit(buf.spare_capacity_mut());
+            let result =
+                std::future::poll_fn(|cx| Pin::new(&mut *self).poll_read(cx, &mut read_buf)).await;
+            let filled = read_buf.filled().len();
+            // SAFETY: the old prefix was initialized before clear, and ReadBuf
+            // guarantees initialization of its filled prefix.
+            unsafe {
+                buf.set_len(initialized.max(filled));
+            }
+            return (result.map(|()| filled), buf);
+        }
         self.inner.read(buf).await
     }
 
     /// Write data using io_uring (native async, preferred method)
     ///
-    /// This is more efficient than using the AsyncWrite trait.
-    pub async fn write_native(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+    /// This avoids the buffering and copy required by the poll-based
+    /// compatibility bridge after flushing any earlier poll-based writes.
+    pub async fn write_native(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        if let Err(error) = std::future::poll_fn(|cx| self.poll_flush_buffer(cx)).await {
+            return (Err(error), buf);
+        }
         self.inner.write(buf).submit().await
     }
 
-    /// Write all data using io_uring
-    pub async fn write_all_native(&self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
+    /// Write all data using io_uring, after flushing earlier poll-based writes.
+    pub async fn write_all_native(&mut self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
+        if let Err(error) = std::future::poll_fn(|cx| self.poll_flush_buffer(cx)).await {
+            return (Err(error), buf);
+        }
         self.inner.write_all(buf).await
     }
 }
@@ -285,30 +401,55 @@ impl UringStream {
 /// For best performance, use the native async methods when possible.
 pub struct UringStreamAdapter {
     stream: UringStream,
-    /// Buffered data from completed reads
-    read_buffer: Vec<u8>,
-    read_pos: usize,
-    read_len: usize,
 }
 
 impl UringStreamAdapter {
     /// Create a new adapter
     pub fn new(stream: UringStream) -> Self {
-        Self {
-            stream,
-            read_buffer: vec![0u8; 64 * 1024],
-            read_pos: 0,
-            read_len: 0,
-        }
+        Self { stream }
     }
 
     /// Get buffered data if available
     pub fn buffered_data(&self) -> &[u8] {
-        &self.read_buffer[self.read_pos..self.read_len]
+        let state = &self.stream.read_state;
+        state
+            .buffer
+            .as_ref()
+            .map(|buffer| &buffer[state.read_pos..state.data_len])
+            .unwrap_or_default()
     }
 
     /// Consume buffered data
     pub fn consume(&mut self, amt: usize) {
-        self.read_pos = std::cmp::min(self.read_pos + amt, self.read_len);
+        let state = &mut self.stream.read_state;
+        state.read_pos += amt.min(state.data_len - state.read_pos);
+    }
+}
+
+impl AsyncRead for UringStreamAdapter {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for UringStreamAdapter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
