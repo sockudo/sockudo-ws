@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Compressed Tokio streams now accept post-handshake frame bytes through `client_with_leftover` and `server_with_leftover`, including when split before the first read; existing constructors continue to start with an empty receive buffer.
 - `WebSocketServer<Http1>::protocols` configures HTTP/1 subprotocol selection in server preference order while preserving the existing first-offered default when no list is configured.
 
 ### Changed
