@@ -157,6 +157,13 @@ pub(crate) fn quic_transport_config(
 ) -> crate::Result<std::sync::Arc<quinn::TransportConfig>> {
     validate_config(config)?;
 
+    // The same window covers HTTP/3 control streams as well as request streams.
+    if config.initial_stream_window_size == 0 {
+        return Err(crate::Error::Http3(
+            "HTTP/3 stream window must be nonzero".to_string(),
+        ));
+    }
+
     let idle_timeout = quinn::VarInt::from_u64(config.max_idle_timeout_ms)
         .map_err(|_| crate::Error::Http3("HTTP/3 idle timeout exceeds QUIC limits".to_string()))?;
     let stream_window = quinn::VarInt::from_u64(config.initial_stream_window_size)

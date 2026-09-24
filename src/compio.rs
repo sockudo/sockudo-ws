@@ -1184,10 +1184,6 @@ impl CompioHttp3Connection {
         path: &str,
         protocol: Option<&str>,
     ) -> Result<CompioWebSocketStream<CompioHttp3ClientStream>> {
-        if !self.config.http3.enable_connect_protocol {
-            return Err(Error::ExtendedConnectNotSupported);
-        }
-
         let uri = format!("https://{}:{}{}", self.server_name, self.server_port, path);
 
         let mut req = http::Request::builder()
@@ -1291,7 +1287,7 @@ pub async fn connect_http3_multiplexed(
         .map_err(|e| Error::Http3(e.to_string()))?;
 
     let mut builder = ::compio::quic::h3::client::builder();
-    builder.enable_extended_connect(config.http3.enable_connect_protocol);
+    builder.enable_extended_connect(true);
     let (mut driver, send_request) = builder
         .build::<_, ::compio::quic::h3::OpenStreams, Bytes>(conn)
         .await

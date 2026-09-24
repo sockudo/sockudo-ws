@@ -1,5 +1,4 @@
 #![cfg(feature = "http3")]
-#[cfg(feature = "http3")]
 mod h3_support {
     use std::sync::Once;
 
@@ -66,14 +65,17 @@ async fn compio_server_rejects_unrepresentable_idle_timeout() {
 }
 
 #[cfg(feature = "tokio-runtime")]
+#[rstest::rstest]
+#[case::zero(0)]
+#[case::overflow(u64::MAX)]
 #[tokio::test]
-async fn tokio_server_rejects_unrepresentable_stream_window() {
+async fn tokio_server_rejects_invalid_stream_window(#[case] window: u64) {
     let (server_tls, _) = h3_support::tls_configs();
     let result = sockudo_ws::WebSocketServer::<sockudo_ws::Http3>::bind(
         "127.0.0.1:0".parse().unwrap(),
         server_tls,
         sockudo_ws::Config::builder()
-            .http3_stream_window_size(u64::MAX)
+            .http3_stream_window_size(window)
             .build(),
     )
     .await;
@@ -201,11 +203,11 @@ async fn compio_multiplexed_client_rejects_disabled_connect_before_connecting() 
     ));
 }
 
+#[cfg(feature = "tokio-runtime")]
 #[rstest::rstest]
 #[case::server(true, false)]
 #[case::client(false, false)]
 #[case::multiplexed_client(false, true)]
-#[cfg(feature = "tokio-runtime")]
 #[tokio::test]
 async fn tokio_configured_idle_timeout_closes_an_established_connection(
     #[case] configure_server: bool,
@@ -334,6 +336,220 @@ async fn compio_configured_idle_timeout_closes_an_established_connection(
             matches!(result, Ok(None) | Ok(Some(Err(_)))),
             "configured QUIC idle timeout did not close the stream: {result:?}"
         );
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(feature = "tokio-runtime")]
+#[tokio::test]
+async fn tokio_server_rejects_unsupported_early_data() {
+    let (server_tls, _) = h3_support::tls_configs();
+    let result = sockudo_ws::WebSocketServer::<sockudo_ws::Http3>::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        server_tls,
+        sockudo_ws::Config::builder()
+            .http3_enable_0rtt(true)
+            .build(),
+    )
+    .await;
+    assert!(matches!(result, Err(sockudo_ws::Error::Http3(message)) if message.contains("0-RTT")));
+}
+
+#[cfg(feature = "tokio-runtime")]
+#[rstest::rstest]
+#[case::single(false)]
+#[case::multiplexed(true)]
+#[tokio::test]
+async fn tokio_client_rejects_early_data_before_connecting(#[case] multiplexed: bool) {
+    let (_, client_tls) = h3_support::tls_configs();
+    let client = sockudo_ws::WebSocketClient::<sockudo_ws::Http3>::new(
+        sockudo_ws::Config::builder()
+            .http3_enable_0rtt(true)
+            .build(),
+    );
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let addr = "127.0.0.1:9".parse().unwrap();
+        if multiplexed {
+            client
+                .connect_multiplexed(addr, "localhost", client_tls)
+                .await
+                .map(|_| ())
+        } else {
+            client
+                .connect(addr, "localhost", "/", client_tls)
+                .await
+                .map(|_| ())
+        }
+    })
+    .await
+    .expect("configuration must be rejected before network I/O");
+    assert!(matches!(result, Err(sockudo_ws::Error::Http3(message)) if message.contains("0-RTT")));
+}
+
+#[cfg(feature = "tokio-runtime")]
+#[tokio::test]
+async fn tokio_caller_endpoint_rejects_early_data_when_serving() {
+    let (server_tls, _) = h3_support::tls_configs();
+    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).unwrap();
+    let endpoint = quinn::Endpoint::server(
+        quinn::ServerConfig::with_crypto(std::sync::Arc::new(crypto)),
+        "127.0.0.1:0".parse().unwrap(),
+    )
+    .unwrap();
+    let server = sockudo_ws::WebSocketServer::<sockudo_ws::Http3>::from_endpoint(
+        endpoint,
+        sockudo_ws::Config::builder()
+            .http3_enable_0rtt(true)
+            .build(),
+    );
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        server.serve(|_, _| async { panic!("invalid configuration reached handler") }),
+    )
+    .await
+    .expect("configuration must be rejected before accepting connections");
+    assert!(matches!(result, Err(sockudo_ws::Error::Http3(message)) if message.contains("0-RTT")));
+}
+
+#[cfg(feature = "compio-runtime")]
+#[compio::test]
+async fn compio_server_rejects_zero_stream_window() {
+    let (server_tls, _) = h3_support::tls_configs();
+    let result = sockudo_ws::compio::CompioHttp3Server::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        server_tls,
+        sockudo_ws::Config::builder()
+            .http3_stream_window_size(0)
+            .build(),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(sockudo_ws::Error::Http3(message)) if message.contains("stream window"))
+    );
+}
+
+#[cfg(feature = "compio-runtime")]
+#[compio::test]
+async fn compio_disabled_extended_connect_rejects_a_real_request() {
+    use sockudo_ws::Config;
+    use sockudo_ws::compio::CompioHttp3Server;
+    compio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (server_tls, client_tls) = h3_support::tls_configs();
+        let server = CompioHttp3Server::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            server_tls,
+            Config::builder()
+                .http3_enable_connect_protocol(false)
+                .build(),
+        )
+        .await
+        .unwrap();
+        let addr = server.local_addr().unwrap();
+        let serving = compio::runtime::spawn(async move {
+            server
+                .serve(|_, _| async { panic!("disabled CONNECT reached handler") })
+                .await
+                .unwrap()
+        });
+        let crypto = compio::quic::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap();
+        let socket = compio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = compio::quic::Endpoint::new(
+            socket,
+            Default::default(),
+            None,
+            Some(compio::quic::ClientConfig::new(std::sync::Arc::new(crypto))),
+        )
+        .unwrap();
+        let connection = endpoint
+            .connect(addr, "localhost", None)
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut driver, mut requests) = compio::quic::h3::client::builder()
+            .build::<_, compio::quic::h3::OpenStreams, bytes::Bytes>(connection)
+            .await
+            .unwrap();
+        let driving = compio::runtime::spawn(async move { driver.wait_idle().await });
+        let request = http::Request::builder()
+            .method(http::Method::CONNECT)
+            .uri(format!("https://localhost:{}/", addr.port()))
+            .extension(h3::ext::Protocol::WEB_TRANSPORT)
+            .body(())
+            .unwrap();
+        let mut stream = requests.send_request(request).await.unwrap();
+        let response = stream.recv_response().await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::NOT_IMPLEMENTED);
+        driving.cancel().await;
+        serving.cancel().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(feature = "tokio-runtime")]
+#[rstest::rstest]
+#[case::enabled(true)]
+#[case::disabled(false)]
+#[tokio::test]
+async fn tokio_server_advertises_extended_connect_setting(#[case] enabled: bool) {
+    // Inspect the wire value: an echo with our client does not check peer SETTINGS.
+    async fn read_varint(stream: &mut quinn::RecvStream) -> (u64, usize) {
+        let mut first = [0];
+        stream.read_exact(&mut first).await.unwrap();
+        let width = 1 << (first[0] >> 6);
+        let mut value = u64::from(first[0] & 0x3f);
+        for _ in 1..width {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).await.unwrap();
+            value = (value << 8) | u64::from(byte[0]);
+        }
+        (value, width)
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (server_tls, client_tls) = h3_support::tls_configs();
+        let server = sockudo_ws::WebSocketServer::<sockudo_ws::Http3>::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            server_tls,
+            sockudo_ws::Config::builder()
+                .http3_enable_connect_protocol(enabled)
+                .build(),
+        )
+        .await
+        .unwrap();
+        let addr = server.local_addr().unwrap();
+        let serving = tokio::spawn(server.serve(|_, _| async { panic!("no request sent") }));
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(quinn::ClientConfig::new(std::sync::Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap(),
+        )));
+        let connection = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+        let mut control = loop {
+            let mut stream = connection.accept_uni().await.unwrap();
+            if read_varint(&mut stream).await.0 == 0 {
+                break stream;
+            }
+        };
+        assert_eq!(
+            read_varint(&mut control).await.0,
+            4,
+            "first control frame must be SETTINGS"
+        );
+        let length = read_varint(&mut control).await.0 as usize;
+        let mut consumed = 0;
+        let mut advertised = None;
+        while consumed < length {
+            let (id, id_len) = read_varint(&mut control).await;
+            let (value, value_len) = read_varint(&mut control).await;
+            consumed += id_len + value_len;
+            if id == sockudo_ws::http3::SETTINGS_ENABLE_CONNECT_PROTOCOL {
+                assert!(advertised.replace(value).is_none(), "duplicate setting");
+            }
+        }
+        assert_eq!(consumed, length);
+        assert_eq!(advertised, Some(u64::from(enabled)));
+        connection.close(0u32.into(), b"done");
+        serving.abort();
     })
     .await
     .unwrap();

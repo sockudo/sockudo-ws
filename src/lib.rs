@@ -213,7 +213,7 @@ pub struct Http3Config {
     /// Zero disables the local timeout; the peer can still impose its own limit.
     pub max_idle_timeout_ms: u64,
     /// Initial per-stream receive window size (default: 1,250,000 bytes, as in Quinn).
-    /// Zero prevents stream data from arriving.
+    /// Must be nonzero: zero also blocks HTTP/3 control streams and request headers.
     pub initial_stream_window_size: u64,
     /// Request 0-RTT support (default: false)
     ///
@@ -224,6 +224,9 @@ pub struct Http3Config {
     pub enable_connect_protocol: bool,
     /// Maximum accepted UDP payload size (1200–65527 bytes; default: 1472, as in Quinn).
     /// This advertised receive limit is not a fixed outgoing packet size.
+    /// Increasing it linearly increases endpoint datagram receive-buffer memory;
+    /// the multiplier depends on the runtime and platform. Each built-in Tokio
+    /// client connection creates its own endpoint.
     pub max_udp_payload_size: u16,
 }
 
@@ -781,21 +784,27 @@ impl ConfigBuilder {
     // HTTP/3 Configuration Methods
     // ========================================================================
 
-    /// Set HTTP/3 maximum idle timeout in milliseconds
+    /// Set HTTP/3 maximum idle timeout in milliseconds.
+    /// Values exceeding the QUIC variable-integer range are rejected when
+    /// creating a built-in endpoint; zero disables the local timeout.
     #[cfg(feature = "http3")]
     pub fn http3_idle_timeout(mut self, ms: u64) -> Self {
         self.config.http3.max_idle_timeout_ms = ms;
         self
     }
 
-    /// Set HTTP/3 initial stream window size
+    /// Set HTTP/3 initial stream window size.
+    /// Zero and values exceeding the QUIC variable-integer range are rejected
+    /// when creating a built-in endpoint.
     #[cfg(feature = "http3")]
     pub fn http3_stream_window_size(mut self, size: u64) -> Self {
         self.config.http3.initial_stream_window_size = size;
         self
     }
 
-    /// Enable or disable HTTP/3 0-RTT
+    /// Request HTTP/3 0-RTT support.
+    /// The built-in client and server reject `true`; their H3 layer cannot
+    /// safely restore peer settings after resumption.
     #[cfg(feature = "http3")]
     pub fn http3_enable_0rtt(mut self, enabled: bool) -> Self {
         self.config.http3.enable_0rtt = enabled;
@@ -809,7 +818,9 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set HTTP/3 maximum UDP payload size
+    /// Set HTTP/3 maximum accepted UDP payload size (1200–65527 bytes).
+    /// Values outside this range are rejected when creating a built-in endpoint.
+    /// Larger values linearly increase endpoint receive-buffer memory.
     #[cfg(feature = "http3")]
     pub fn http3_max_udp_payload_size(mut self, size: u16) -> Self {
         self.config.http3.max_udp_payload_size = size;
