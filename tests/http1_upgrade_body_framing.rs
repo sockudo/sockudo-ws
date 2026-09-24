@@ -33,7 +33,10 @@ fn request_accepts_zero_content_length_values(#[case] header: &str) {
 #[case::nonzero("Content-Length: 1\r\n")]
 #[case::combined_conflict("Content-Length: 0, 1\r\n")]
 #[case::repeated_conflict("Content-Length: 0\r\nContent-Length: 1\r\n")]
-fn request_rejects_nonzero_or_conflicting_content_length(#[case] header: &str) {
+#[case::empty("Content-Length:\r\n")]
+#[case::trailing_comma("Content-Length: 0,\r\n")]
+#[case::sign("Content-Length: +0\r\n")]
+fn request_rejects_nonzero_or_invalid_content_length(#[case] header: &str) {
     let error = parse_request(&request_with(header)).unwrap_err();
 
     assert!(matches!(

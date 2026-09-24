@@ -170,10 +170,7 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>
 }
 
 fn is_zero_content_length(value: &str) -> bool {
-    value.split(',').all(|length| {
-        let length = length.trim_matches([' ', '\t']);
-        !length.is_empty() && length.bytes().all(|byte| byte == b'0')
-    })
+    list_elements(value).all(|length| !length.is_empty() && length.bytes().all(|byte| byte == b'0'))
 }
 
 /// Returns true if the comma-separated header `value` contains `token`
