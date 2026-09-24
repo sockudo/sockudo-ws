@@ -91,6 +91,29 @@ async fn split_reader_completes_a_partial_handshake_leftover_frame() {
 }
 
 #[tokio::test]
+async fn unified_reader_delivers_valid_leftover_before_parse_error() {
+    let mut wire = BytesMut::new();
+    encode_frame_with_rsv(&mut wire, OpCode::Binary, b"accepted", true, None, false);
+    encode_frame_with_rsv(&mut wire, OpCode::Ping, b"bad", true, None, true);
+    let (io, _peer) = tokio::io::duplex(128);
+    let mut ws = CompressedWebSocketStream::client_with_leftover(
+        io,
+        Config::default(),
+        DeflateConfig::default(),
+        Some(wire.freeze()),
+    );
+
+    let message = ws.next().await.unwrap().unwrap();
+    assert_eq!(message.as_bytes(), b"accepted");
+    assert!(matches!(
+        ws.next().await,
+        Some(Err(Error::Protocol(
+            "RSV1 on control or continuation frame"
+        )))
+    ));
+}
+
+#[tokio::test]
 async fn split_reader_delivers_valid_leftover_before_parse_error() {
     let mut wire = BytesMut::new();
     encode_frame_with_rsv(&mut wire, OpCode::Binary, b"accepted", true, None, false);
