@@ -74,3 +74,105 @@ fn request_rejects_unsupported_or_malformed_targets() {
         );
     }
 }
+
+#[test]
+fn query_only_absolute_target_rejects_fragment() {
+    assert!(
+        parse_request(&request_with(
+            "http://example.com?room=one#fragment",
+            "example.com"
+        ))
+        .is_err()
+    );
+}
+
+#[rstest::rstest]
+#[case("/chat?room=one", "/chat?room=one", false)]
+#[case("http://example.com/chat?room=one", "/chat?room=one", false)]
+#[case("http://example.com", "/", false)]
+#[case("http://example.com?room=one", "/?room=one", true)]
+fn normalized_path_only_owns_synthesized_query(
+    #[case] target: &str,
+    #[case] expected: &str,
+    #[case] owned: bool,
+) {
+    let input = request_with(target, "example.com");
+    let (request, _) = parse_request(&input).unwrap().unwrap();
+    assert_eq!(request.path, expected);
+    assert_eq!(matches!(request.path, std::borrow::Cow::Owned(_)), owned);
+}
+
+#[test]
+fn absolute_target_still_requires_host_header() {
+    let input = String::from_utf8(request_with("http://example.com/chat", "proxy.example.com"))
+        .unwrap()
+        .replace("Host: proxy.example.com\r\n", "");
+    assert!(parse_request(input.as_bytes()).is_err());
+}
+
+#[cfg(feature = "tokio-runtime")]
+#[tokio::test]
+async fn server_normalizes_absolute_target_and_preserves_first_frame() {
+    use futures_util::StreamExt;
+    use sockudo_ws::{Config, Http1, server::WebSocketServer};
+    use tokio::io::AsyncWriteExt;
+    let (mut client, server) = tokio::io::duplex(4096);
+    let mut input = request_with("http://example.com?room=one", "proxy.example.com");
+    input.extend_from_slice(b"\x81\x82\x00\x00\x00\x00ok");
+    client.write_all(&input).await.unwrap();
+    let (mut ws, handshake) = WebSocketServer::<Http1>::new(Config::default())
+        .accept(server)
+        .await
+        .unwrap();
+    assert_eq!(handshake.path, "/?room=one");
+    assert_eq!(ws.next().await.unwrap().unwrap().as_bytes(), b"ok");
+}
+
+#[cfg(feature = "tokio-runtime")]
+#[tokio::test]
+async fn server_rejects_invalid_target_before_upgrade() {
+    use sockudo_ws::{Config, Http1, server::WebSocketServer};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut client, server) = tokio::io::duplex(4096);
+    client
+        .write_all(&request_with("*", "example.com"))
+        .await
+        .unwrap();
+    assert!(
+        WebSocketServer::<Http1>::new(Config::default())
+            .accept(server)
+            .await
+            .is_err()
+    );
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).await.unwrap();
+    assert!(response.is_empty());
+}
+
+#[cfg(feature = "compio-runtime")]
+#[compio::test]
+async fn compio_server_normalizes_absolute_target_and_preserves_first_frame() {
+    use compio::{
+        io::AsyncWriteExt,
+        net::{TcpListener, TcpStream},
+    };
+    use sockudo_ws::{CompioWebSocketStream, Config, compio::server_handshake};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (mut server, _) = listener.accept().await.unwrap();
+    let mut input = request_with("http://example.com?room=one", "proxy.example.com");
+    input.extend_from_slice(b"\x81\x82\x00\x00\x00\x00ok");
+    client.write_all(input).await.0.unwrap();
+    let handshake = server_handshake(&mut server).await.unwrap();
+    assert_eq!(handshake.path, "/?room=one");
+    let mut ws =
+        CompioWebSocketStream::server_with_leftover(server, Config::default(), handshake.leftover);
+    let message = compio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.as_bytes(), b"ok");
+}
