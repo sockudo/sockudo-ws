@@ -56,6 +56,17 @@ pub struct HandshakeRequest<'a> {
 /// Parse a WebSocket upgrade request
 ///
 /// Returns the parsed request and the number of bytes consumed.
+///
+/// Used by the built-in Tokio and Compio HTTP/1 server handshakes; Axum's
+/// upgrade extractor uses Hyper's URI parsing instead.
+///
+/// Accepts origin-form and absolute HTTP/HTTPS targets. Path and query characters
+/// follow `http::Uri`'s compatibility rules (including raw UTF-8 and JSON path
+/// characters), with an additional requirement that percent escapes contain two
+/// hexadecimal digits. This is not strict RFC 3986 character validation.
+/// Fragments, unsupported target forms or schemes, userinfo, empty absolute hosts
+/// and nonnumeric ports are rejected. A Host header remains required even when
+/// the absolute target supplies the effective authority.
 pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut headers);
@@ -219,7 +230,7 @@ fn parse_server_request_target<'a>(
     }
 
     let parsed_authority = uri.authority()?;
-    if parsed_authority.as_str().contains('@') {
+    if parsed_authority.host().is_empty() || parsed_authority.as_str().contains('@') {
         return None;
     }
     let port_suffix = parsed_authority

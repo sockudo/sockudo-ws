@@ -146,7 +146,7 @@ async fn server_rejects_invalid_target_before_upgrade() {
     );
     let mut response = Vec::new();
     client.read_to_end(&mut response).await.unwrap();
-    assert!(response.is_empty());
+    assert!(!response.starts_with(b"HTTP/1.1 101"));
 }
 
 #[cfg(feature = "compio-runtime")]
@@ -175,4 +175,25 @@ async fn compio_server_normalizes_absolute_target_and_preserves_first_frame() {
         .unwrap()
         .unwrap();
     assert_eq!(message.as_bytes(), b"ok");
+}
+
+#[rstest::rstest]
+#[case("http://:80/chat")]
+#[case("https://:443/chat")]
+fn absolute_target_rejects_empty_host(#[case] target: &str) {
+    assert!(parse_request(&request_with(target, "example.com")).is_err());
+}
+
+#[rstest::rstest]
+#[case(r#"/chat/{"a":1}"#)]
+#[case("/行情?市场=现货")]
+fn request_preserves_compatible_path_characters(#[case] target: &str) {
+    let input = request_with(target, "example.com");
+    let (request, _) = parse_request(&input).unwrap().unwrap();
+    assert_eq!(request.path, target);
+}
+
+#[test]
+fn request_rejects_bare_percent_in_query() {
+    assert!(parse_request(&request_with("/chat?discount=10%", "example.com")).is_err());
 }
