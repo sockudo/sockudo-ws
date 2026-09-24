@@ -88,8 +88,14 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>
 
                 // Case-insensitive comparisons without allocating per header.
                 if name.eq_ignore_ascii_case("sec-websocket-key") {
+                    if key.is_some() {
+                        return Err(Error::HandshakeFailed("duplicate Sec-WebSocket-Key"));
+                    }
                     key = Some(value);
                 } else if name.eq_ignore_ascii_case("sec-websocket-version") {
+                    if version.is_some() {
+                        return Err(Error::HandshakeFailed("duplicate Sec-WebSocket-Version"));
+                    }
                     version = Some(value);
                 } else if name.eq_ignore_ascii_case("sec-websocket-protocol") {
                     if !is_valid_protocol_list(value) {
@@ -598,6 +604,9 @@ pub fn parse_response(buf: &[u8]) -> Result<Option<(HandshakeResponse<'_>, usize
                     .map_err(|_| Error::InvalidHttp("invalid header value"))?;
 
                 if name.eq_ignore_ascii_case("sec-websocket-accept") {
+                    if accept.is_some() {
+                        return Err(Error::HandshakeFailed("duplicate Sec-WebSocket-Accept"));
+                    }
                     accept = Some(value);
                 } else if name.eq_ignore_ascii_case("sec-websocket-protocol") {
                     if protocol.is_some() {
@@ -608,6 +617,9 @@ pub fn parse_response(buf: &[u8]) -> Result<Option<(HandshakeResponse<'_>, usize
                     }
                     protocol = Some(value);
                 } else if name.eq_ignore_ascii_case("sec-websocket-extensions") {
+                    if extensions.is_some() {
+                        return Err(Error::HandshakeFailed("duplicate Sec-WebSocket-Extensions"));
+                    }
                     if !is_valid_extension_list(value) {
                         return Err(Error::HandshakeFailed("invalid Sec-WebSocket-Extensions"));
                     }
