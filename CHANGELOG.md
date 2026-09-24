@@ -43,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- HTTP/1 handshake nonces now use the selected RNG backend (`getrandom`, then `rand_rng`, then `fastrand`) instead of a timestamp-seeded byte loop. The default fastrand nonce generator forks the thread RNG once, then keeps separate state from frame masking; no-RNG builds also keep separate fallback states. These non-cryptographic backends do not provide a cryptographic isolation guarantee.
+- HTTP/1 handshake nonces now use the selected RNG backend (`getrandom`, then `rand_rng`, then `fastrand`) instead of a timestamp-seeded byte loop. The default fastrand nonce generator forks the thread RNG once, then keeps separate state from frame masking; no-RNG builds also keep separate fallback states. Native fastrand seeds from a clock and thread ID, not OS entropy. These non-cryptographic backends do not provide a cryptographic isolation guarantee; use `getrandom` or `rand_rng` when cryptographically secure output is required.
 - Tokio HTTP/3 servers now advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1` when Extended CONNECT is enabled, including with the default configuration.
 - Drive io_uring completion operations across poll calls, flush buffered writes before shutdown, and enable the required Tokio integration for the `io-uring` feature.
 - PubSub subscriber, socket-ID, and topic indexes now update atomically, preventing duplicate socket IDs and stale membership under concurrent changes. Publication and removal release the membership lock before waking channel receivers so their wakers can reenter membership operations.

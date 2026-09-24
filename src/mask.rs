@@ -4,7 +4,12 @@
 //! Supports multiple RNG backends via feature flags:
 //! - `fastrand`: fast PRNG (default, same as tokio-websockets)
 //! - `getrandom`: cryptographically secure RNG
-//! - `rand_rng`: alternative PRNG (prefer if `rand` is already in dependency tree)
+//! - `rand_rng`: rand's thread-local CSPRNG, seeded and periodically reseeded from the OS
+//!
+//! Native fastrand seeds from a clock and thread ID, not OS entropy. Use
+//! `getrandom` or `rand_rng` when unpredictable output is required. Rand's
+//! thread RNG is not automatically reseeded after a process fork; callers
+//! using fork must follow rand's reseeding requirements.
 //!
 //! Builds without an RNG feature use a small standard-library fallback so
 //! server-only `default-features = false` builds still compile.
@@ -24,7 +29,7 @@ static NONCE_FALLBACK_STATE: AtomicU64 = AtomicU64::new(0);
 /// The RNG implementation is selected via feature flags:
 /// - `fastrand` (default): fast, non-cryptographic PRNG
 /// - `getrandom`: cryptographically secure RNG
-/// - `rand_rng`: uses the `rand` crate
+/// - `rand_rng`: uses rand's OS-seeded thread-local CSPRNG
 ///
 /// If multiple features are enabled, priority is: getrandom > rand_rng > fastrand.
 /// If no RNG feature is enabled, a lightweight fallback is used. Enable
@@ -52,8 +57,9 @@ pub(crate) fn generate_key_bytes() -> [u8; 16] {
 #[inline]
 fn generate_key_bytes_inner() -> [u8; 16] {
     thread_local! {
-        // Fork the thread RNG once at initialization; subsequent nonces do not
-        // consume the frame-mask stream. This is not cryptographic isolation.
+        // Keep public nonce bytes from directly exposing consecutive outputs
+        // of the frame-mask RNG. Fork the thread RNG once at initialization;
+        // subsequent nonces do not consume it. This is not cryptographic isolation.
         static NONCE_RNG: std::cell::RefCell<fastrand::Rng> =
             std::cell::RefCell::new(fastrand::Rng::new());
     }
@@ -66,7 +72,9 @@ fn generate_key_bytes_inner() -> [u8; 16] {
 #[inline]
 fn generate_key_bytes_inner() -> [u8; 16] {
     use rand::Rng;
-    rand::rng().random()
+    let mut bytes = [0; 16];
+    rand::rng().fill(&mut bytes[..]);
+    bytes
 }
 
 #[cfg(feature = "getrandom")]
@@ -152,6 +160,23 @@ mod tests {
 
     #[test]
     fn handshake_nonce_does_not_advance_the_fallback_mask_stream() {
+        // Other library tests generate masks concurrently under cargo test.
+        // Re-run only this test in a child process before resetting global state.
+        const CHILD: &str = "SOCKUDO_FALLBACK_RNG_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let name = concat!(
+                module_path!(),
+                "::handshake_nonce_does_not_advance_the_fallback_mask_stream"
+            );
+            let name = name.split_once("::").unwrap().1;
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--test-threads=1", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "isolated test failed: {output:?}");
+            return;
+        }
         MASK_FALLBACK_STATE.store(42, Ordering::Relaxed);
         let expected = generate_mask();
 

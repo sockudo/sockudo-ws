@@ -541,7 +541,9 @@ fn build_request_inner(
 ///
 /// Uses the selected RNG backend, in priority order: `getrandom`, `rand_rng`,
 /// then `fastrand`. The default `fastrand` backend and the no-feature fallback
-/// are non-cryptographic. With `getrandom`, an entropy-source failure panics,
+/// are non-cryptographic; native fastrand seeds from a clock and thread ID.
+/// Use `getrandom` or `rand_rng` for cryptographically secure output.
+/// With `getrandom`, an entropy-source failure panics,
 /// matching frame-mask generation.
 pub fn generate_key() -> String {
     let bytes = crate::mask::generate_key_bytes();
@@ -850,6 +852,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn generated_key_decodes_to_sixteen_bytes() {
         use base64::Engine;
@@ -862,8 +866,6 @@ mod tests {
             16
         );
     }
-
-    use super::*;
 
     #[test]
     fn test_generate_accept_key() {
