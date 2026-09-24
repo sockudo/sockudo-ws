@@ -209,15 +209,21 @@ impl Default for Http2Config {
 #[cfg(feature = "http3")]
 #[derive(Debug, Clone)]
 pub struct Http3Config {
-    /// Maximum idle timeout for QUIC connection in milliseconds (default: 30000)
+    /// Maximum idle timeout for QUIC connection in milliseconds (default: 30000).
+    /// Zero disables the local timeout; the peer can still impose its own limit.
     pub max_idle_timeout_ms: u64,
-    /// Initial stream-level flow control window size (default: 1MB)
+    /// Initial per-stream receive window size (default: 1,250,000 bytes, as in Quinn).
+    /// Zero prevents stream data from arriving.
     pub initial_stream_window_size: u64,
-    /// Enable 0-RTT for faster reconnection (default: false)
+    /// Request 0-RTT support (default: false)
+    ///
+    /// The built-in HTTP/3 client and server reject `true` because their H3 layer
+    /// cannot safely restore peer settings after resumption.
     pub enable_0rtt: bool,
     /// Enable Extended CONNECT protocol for WebSocket (default: true)
     pub enable_connect_protocol: bool,
-    /// Maximum UDP payload size (default: 1350)
+    /// Maximum accepted UDP payload size (1200–65527 bytes; default: 1472, as in Quinn).
+    /// This advertised receive limit is not a fixed outgoing packet size.
     pub max_udp_payload_size: u16,
 }
 
@@ -226,10 +232,10 @@ impl Default for Http3Config {
     fn default() -> Self {
         Self {
             max_idle_timeout_ms: 30_000,
-            initial_stream_window_size: 1024 * 1024, // 1MB
+            initial_stream_window_size: 1_250_000, // Quinn's default stream receive window
             enable_0rtt: false,
             enable_connect_protocol: true,
-            max_udp_payload_size: 1350,
+            max_udp_payload_size: 1472,
         }
     }
 }

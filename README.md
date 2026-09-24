@@ -561,7 +561,7 @@ let mut ws2 = conn.open_websocket("wss://example.com/notifications", None).await
 
 ## HTTP/3 WebSocket (RFC 9220)
 
-HTTP/3 WebSocket runs over QUIC, providing benefits like 0-RTT, no head-of-line blocking, and better mobile performance.
+HTTP/3 WebSocket runs over QUIC, with independent streams and connection migration. Built-in endpoints apply the configured QUIC transport settings and reject `enable_0rtt = true`; TLS resumption does not enable early data.
 
 ```rust
 use sockudo_ws::{WebSocketServer, Http3, Config, Message};
@@ -604,7 +604,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | Feature | Benefit |
 |---------|---------|
 | No head-of-line blocking | One slow stream doesn't block others |
-| 0-RTT connection resumption | Faster reconnections |
+| TLS connection resumption | Reuse session state without 0-RTT early data |
 | Better mobile performance | Handles network changes gracefully |
 | Multiple streams per connection | Efficient multiplexing |
 

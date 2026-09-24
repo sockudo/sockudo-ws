@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Built-in Tokio and Compio HTTP/3 endpoints now apply configured QUIC idle timeout, stream receive window and maximum accepted UDP payload size. Default window (1,250,000 bytes) and payload limit (1472 bytes) preserve Quinn's previously implicit defaults. Extended CONNECT can be disabled; unsupported 0-RTT requests are rejected and early data is disabled on endpoints created by the library. Caller-provided endpoints retain their transport and TLS settings.
+
 - **Breaking:** native io_uring read/write methods now require mutable access to preserve ordering with poll I/O, so these methods no longer support concurrent reads and writes through a shared stream. Exclusively direct I/O through `get_ref` still supports concurrent reads and writes, provided it is never mixed with bridge I/O or the wrapper's native methods.
 - `io_uring::has_recommended_kernel()` now checks Linux 5.10 or later, matching tokio-uring 0.5's minimum requirement; Linux 5.6–5.9 now returns `false`.
 - PubSub selects publication recipients atomically with membership changes and enqueues messages after releasing the membership lock. Removal after selection does not cancel that publication's already selected deliveries; socket-ID exclusion uses the same snapshot.
