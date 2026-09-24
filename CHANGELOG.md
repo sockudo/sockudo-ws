@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** native io_uring read/write methods now require mutable access to preserve ordering with poll I/O. Direct I/O through `get_ref` bypasses the bridge and is outside this ordering contract.
+
 - PubSub selects publication recipients atomically with membership changes and enqueues messages after releasing the membership lock. Removal after selection does not cancel that publication's already selected deliveries; socket-ID exclusion uses the same snapshot.
 - **Breaking:** Compio 0.19 HTTP/2 entry points require Splittable; wrap other transports with compio::io::util::Split::new. Automatic Ping requires pending custom reads to cooperate with cancellation; an existing idle/Pong deadline remains terminal. With idle timeout disabled, nonzero pong_timeout also bounds read-buffer recovery from Ping's due time; expiry reports HeartbeatTimeout even if Ping has not been sent. Setting both timeouts to zero leaves recovery unbounded.
 - **Breaking:** DEFLATE encoder windows use `DeflateWindowBits` (9–15), including the public window constants and codec configuration fields. An unsupported 8-bit encoder limit is rejected instead of panicking or widening it; server negotiation can still receive an 8-bit client stream with a larger decoder window. A server policy below 15 client window bits declines a `permessage-deflate` offer that omits `client_max_window_bits` rather than exceeding the configured policy. Public offer parsing now rejects duplicate or empty parameters, malformed quoted values, leading zeroes, and non-ASCII optional whitespace.
@@ -38,6 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared cell instead of a channel message per data frame.
 
 ### Fixed
+
+- Drive io_uring completion operations across poll calls, flush buffered writes before shutdown, and enable the required Tokio integration for the `io-uring` feature.
 
 - PubSub subscriber, socket-ID, and topic indexes now update atomically, preventing duplicate socket IDs and stale membership under concurrent changes. Publication and removal release the membership lock before waking channel receivers so their wakers can reenter membership operations.
 - Cancelled native Compio HTTP/3 DATA writes now abort both directions of the affected WebSocket stream with `H3_REQUEST_CANCELLED`; subsequent operations on that stream fail with `ConnectionAborted`, while the multiplexed connection can open new streams.
