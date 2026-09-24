@@ -65,6 +65,9 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>
             if req.method != Some("GET") {
                 return Err(Error::InvalidHttp("method must be GET"));
             }
+            if req.version != Some(1) {
+                return Err(Error::InvalidHttp("HTTP version must be 1.1"));
+            }
 
             // Extract required headers
             let mut key = None;
@@ -120,9 +123,15 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>
             }
             let key = key.ok_or(Error::HandshakeFailed("missing Sec-WebSocket-Key"))?;
             let version = version.ok_or(Error::HandshakeFailed("missing Sec-WebSocket-Version"))?;
+            let host = host
+                .filter(|value| !value.is_empty())
+                .ok_or(Error::HandshakeFailed("missing Host"))?;
 
             if version != "13" {
                 return Err(Error::HandshakeFailed("unsupported WebSocket version"));
+            }
+            if !is_valid_websocket_key(key) {
+                return Err(Error::HandshakeFailed("invalid Sec-WebSocket-Key"));
             }
 
             let path = req.path.unwrap_or("/");
@@ -130,7 +139,7 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>
             Ok(Some((
                 HandshakeRequest {
                     path,
-                    host,
+                    host: Some(host),
                     key,
                     version,
                     protocol,
@@ -149,12 +158,19 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>
 }
 
 /// Returns true if the comma-separated header `value` contains `token`
-/// (ASCII case-insensitive, surrounding whitespace ignored).
+/// (ASCII case-insensitive, surrounding HTTP optional whitespace ignored).
 #[inline]
 fn has_token_ignore_case(value: &str, token: &str) -> bool {
     value
         .split(',')
-        .any(|part| part.trim().eq_ignore_ascii_case(token))
+        .any(|part| trim_optional_whitespace(part).eq_ignore_ascii_case(token))
+}
+
+fn is_valid_websocket_key(value: &str) -> bool {
+    let mut decoded = [0; 24];
+    base64::engine::general_purpose::STANDARD
+        .decode_slice(value, &mut decoded)
+        .is_ok_and(|len| len == 16)
 }
 
 /// Generate the Sec-WebSocket-Accept key
@@ -217,8 +233,9 @@ pub fn build_request(
 ///
 /// Custom headers are emitted in the supplied order. Header names must use the
 /// HTTP token syntax, values must not contain disallowed control bytes, and
-/// WebSocket protocol and extension values must follow their handshake field
-/// grammar. Headers managed by the WebSocket handshake cannot be overridden.
+/// Host must be nonempty, the key must encode 16 bytes, and WebSocket protocol
+/// and extension values must follow their handshake field grammar. Headers
+/// managed by the WebSocket handshake cannot be overridden.
 ///
 /// # Errors
 ///
@@ -256,10 +273,15 @@ fn validate_request_fields(
     extensions: Option<&str>,
 ) -> Result<()> {
     validate_header_value(host, "invalid Host")?;
+    if host.is_empty() {
+        return Err(Error::InvalidHttp("invalid Host"));
+    }
     if !path.bytes().all(is_request_target_byte) {
         return Err(Error::InvalidHttp("invalid request target"));
     }
-    validate_header_value(key, "invalid Sec-WebSocket-Key")?;
+    if !is_valid_websocket_key(key) {
+        return Err(Error::InvalidHttp("invalid Sec-WebSocket-Key"));
+    }
     if let Some(protocol) = protocol
         && (!is_valid_protocol_list(protocol) || list_elements(protocol).any(str::is_empty))
     {
@@ -544,10 +566,15 @@ pub fn parse_response(buf: &[u8]) -> Result<Option<(HandshakeResponse<'_>, usize
             if status != 101 {
                 return Err(Error::HandshakeFailed("expected 101 Switching Protocols"));
             }
+            if res.version != Some(1) {
+                return Err(Error::InvalidHttp("HTTP version must be 1.1"));
+            }
 
             let mut accept = None;
             let mut protocol = None;
             let mut extensions = None;
+            let mut upgrade = false;
+            let mut connection_upgrade = false;
 
             for header in res.headers.iter() {
                 let name = header.name;
@@ -569,7 +596,22 @@ pub fn parse_response(buf: &[u8]) -> Result<Option<(HandshakeResponse<'_>, usize
                         return Err(Error::HandshakeFailed("invalid Sec-WebSocket-Extensions"));
                     }
                     extensions = Some(value);
+                } else if name.eq_ignore_ascii_case("upgrade") {
+                    // RFC 6455 requires an exact response value, unlike the request-side list.
+                    if !value.eq_ignore_ascii_case("websocket") {
+                        return Err(Error::HandshakeFailed("missing Upgrade: websocket"));
+                    }
+                    upgrade = true;
+                } else if name.eq_ignore_ascii_case("connection") {
+                    connection_upgrade |= has_token_ignore_case(value, "upgrade");
                 }
+            }
+
+            if !upgrade {
+                return Err(Error::HandshakeFailed("missing Upgrade: websocket"));
+            }
+            if !connection_upgrade {
+                return Err(Error::HandshakeFailed("missing Connection: Upgrade"));
             }
 
             Ok(Some((
