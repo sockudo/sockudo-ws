@@ -218,7 +218,7 @@ Compressed (RSV1) frames are skipped, since their bytes are validated after infl
 * Text messages are returned as `Bytes` views into the read buffer, no copy on receive.
 * `encode_frame` writes header and payload in one reserved region; masked client encode fuses the
   copy and the XOR.
-* `pubsub` uses `DashMap` and clones `Bytes` (refcount) per subscriber, not the payload.
+* `pubsub` snapshots recipient senders under one membership `RwLock`, sends after unlocking, and clones `Bytes` (refcount) per subscriber, not the payload.
 * Memory: `Config::default()` reserves 64 KiB read + 16 KiB cork per connection. RSS per idle
   connection is much lower because untouched pages are not resident, which matches the 35 KiB
   the competitor measured.
