@@ -15,7 +15,7 @@ use sockudo_ws::handshake::{build_response, generate_accept_key, parse_request};
 use sockudo_ws::protocol::{Message, Protocol, Role};
 
 #[cfg(feature = "permessage-deflate")]
-use sockudo_ws::deflate::{DeflateConfig, parse_deflate_offer};
+use sockudo_ws::deflate::{DeflateConfig, negotiate_server_deflate};
 #[cfg(feature = "permessage-deflate")]
 use sockudo_ws::protocol::CompressedProtocol;
 
@@ -92,29 +92,11 @@ async fn handle_connection(mut stream: TcpStream) -> Result<()> {
                 if DEBUG {
                     println!("Client requested extensions: {}", ext);
                 }
-                // Parse each extension offer
-                let mut found = false;
-                for offer in ext.split(',') {
-                    if DEBUG {
-                        println!("Parsing offer: {}", offer.trim());
-                    }
-                    if let Some(params) = parse_deflate_offer(offer.trim()) {
-                        if DEBUG {
-                            println!("Found deflate offer with {} params", params.len());
-                        }
-                        // Accept the deflate offer with our preferred config
-                        if let Ok(config) = DeflateConfig::from_params(&params) {
-                            if DEBUG {
-                                println!("Accepting compression with config: {:?}", config);
-                            }
-                            deflate_config = Some(config);
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-                if found {
-                    let resp = deflate_config.as_ref().map(|c| c.to_response_header());
+                // Parse the offers and accept the first one compatible with our policy.
+                if let Some(negotiation) = negotiate_server_deflate(ext, &DeflateConfig::default())
+                {
+                    let resp = Some(negotiation.to_response_header());
+                    deflate_config = Some(negotiation.config);
                     if DEBUG {
                         println!("Sending extension response: {:?}", resp);
                     }

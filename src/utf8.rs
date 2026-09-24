@@ -1,21 +1,8 @@
 //! SIMD-accelerated UTF-8 validation
 //!
-//! This module provides high-performance UTF-8 validation using:
-//! - `simdutf8` crate for x86_64 (SSE4.2, AVX2, AVX-512), aarch64 (NEON), arm (NEON), wasm32
-//! - Custom SIMD implementations for architectures/instructions not supported by simdutf8:
-//!   - x86_64 SSE2 - for older CPUs without SSE4.2 (stable Rust)
-//!   - LoongArch64 (LSX/LASX) - requires nightly + `nightly` feature
-//!   - PowerPC/PowerPC64 (AltiVec) - requires nightly + `nightly` feature
-//!   - s390x (z13 vectors) - requires `nightly` feature
-//!
-//! The custom implementations use ASCII fast-path detection with scalar validation fallback.
-//!
-//! # Performance
-//!
-//! - x86-64 (SSE4.2+): Up to 23x faster than std on valid non-ASCII (via simdutf8)
-//! - x86-64 (SSE2 only): Significantly faster than std on ASCII-heavy input (custom SIMD)
-//! - aarch64: Up to 11x faster than std on valid non-ASCII (via simdutf8)
-//! - LoongArch64/PowerPC/s390x: Significantly faster than std (custom SIMD)
+//! Uses `simdutf8` on its supported targets, including x86 and aarch64,
+//! and its portable fallback elsewhere. Streaming validation retains an
+//! incomplete code point between chunks instead of validating vectors alone.
 //!
 //! # References
 //!
@@ -23,457 +10,13 @@
 //! - [Validating UTF-8 In Less Than One Instruction Per Byte](https://arxiv.org/abs/2010.03090)
 //! - [simdutf8](https://github.com/rusticstuff/simdutf8)
 
-// ============================================================================
-// Main validation function - dispatches to best available implementation
-// ============================================================================
-
-/// Validate that the input is valid UTF-8
+/// Validate that the input is valid UTF-8.
 ///
-/// Returns true if the input is valid UTF-8, false otherwise.
-/// Automatically selects the fastest available implementation for the platform.
+/// The dependency dispatches to its supported SIMD implementations and uses
+/// the standard validator on other targets. Validation spans vector boundaries.
 #[inline]
 pub fn validate_utf8(data: &[u8]) -> bool {
-    // For x86_64/x86, try simdutf8 first (handles SSE4.2+, AVX2, AVX-512)
-    // If not available, fall back to custom SSE2 implementation
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    {
-        validate_utf8_x86(data)
-    }
-
-    // For aarch64, arm (NEON), and wasm32, use simdutf8
-    #[cfg(any(
-        target_arch = "aarch64",
-        all(target_arch = "arm", target_feature = "neon"),
-        target_arch = "wasm32",
-    ))]
-    {
-        simdutf8::basic::from_utf8(data).is_ok()
-    }
-
-    // For LoongArch64 with nightly, use custom SIMD implementation
-    #[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
-    {
-        validate_utf8_loongarch(data)
-    }
-
-    // For PowerPC with nightly, use custom SIMD implementation
-    #[cfg(all(
-        any(target_arch = "powerpc", target_arch = "powerpc64"),
-        feature = "nightly"
-    ))]
-    {
-        validate_utf8_powerpc(data)
-    }
-
-    // For s390x with nightly, use custom SIMD implementation
-    #[cfg(all(target_arch = "s390x", feature = "nightly"))]
-    {
-        validate_utf8_s390x(data)
-    }
-
-    // Fallback to simdutf8 (which falls back to std on unsupported platforms)
-    #[cfg(not(any(
-        target_arch = "x86_64",
-        target_arch = "x86",
-        target_arch = "aarch64",
-        all(target_arch = "arm", target_feature = "neon"),
-        target_arch = "wasm32",
-        all(target_arch = "loongarch64", feature = "nightly"),
-        all(
-            any(target_arch = "powerpc", target_arch = "powerpc64"),
-            feature = "nightly"
-        ),
-        all(target_arch = "s390x", feature = "nightly"),
-    )))]
-    {
-        simdutf8::basic::from_utf8(data).is_ok()
-    }
-}
-
-// ============================================================================
-// x86/x86_64 Implementation - SSE2/SSE4.2/AVX2/AVX-512 dispatch
-// ============================================================================
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-fn validate_utf8_x86(data: &[u8]) -> bool {
-    // Try simdutf8 first - it will use the best available instruction set
-    // (AVX-512, AVX2, or SSE4.2) if supported
-    // Note: simdutf8 does NOT support SSE2, only SSE4.2+
-
-    // Check if we have SSE4.2 or better (which simdutf8 supports)
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::is_x86_feature_detected!("sse4.2") {
-            // simdutf8 will handle SSE4.2, AVX2, or AVX-512 automatically
-            return simdutf8::basic::from_utf8(data).is_ok();
-        }
-    }
-
-    #[cfg(target_arch = "x86")]
-    {
-        if std::arch::is_x86_feature_detected!("sse4.2") {
-            return simdutf8::basic::from_utf8(data).is_ok();
-        }
-    }
-
-    // SSE4.2 not available, fall back to custom SSE2 implementation
-    // SSE2 is guaranteed on all x86_64 CPUs, and very common on x86
-    #[cfg(target_arch = "x86_64")]
-    {
-        // SSE2 is guaranteed on x86_64
-        unsafe { validate_utf8_sse2(data) }
-    }
-
-    #[cfg(target_arch = "x86")]
-    {
-        if std::arch::is_x86_feature_detected!("sse2") {
-            unsafe { validate_utf8_sse2(data) }
-        } else {
-            // No SIMD available, use scalar fallback
-            validate_utf8_scalar(data)
-        }
-    }
-}
-
-// ============================================================================
-// x86/x86_64 SSE2 Implementation (Custom)
-// ============================================================================
-
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "sse2")]
-unsafe fn validate_utf8_sse2(data: &[u8]) -> bool {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-
-    let mut i = 0;
-    let len = data.len();
-
-    // For short inputs, use scalar validation
-    if len < 16 {
-        return validate_utf8_scalar(data);
-    }
-
-    // Process 16 bytes at a time with SSE2
-    while i + 16 <= len {
-        // SAFETY: We checked that i + 16 <= len, so this is in bounds
-        unsafe {
-            // Load 16 bytes
-            let chunk_ptr = data.as_ptr().add(i) as *const __m128i;
-            let chunk = _mm_loadu_si128(chunk_ptr);
-
-            // Check for ASCII fast path (all bytes < 0x80)
-            // Create a mask of 0x80 for each byte
-            let high_bit_mask = _mm_set1_epi8(0x80u8 as i8);
-
-            // Test if any byte has the high bit set
-            // _mm_movemask_epi8 creates a 16-bit mask from the high bit of each byte
-            let test = _mm_and_si128(chunk, high_bit_mask);
-            let mask = _mm_movemask_epi8(test);
-
-            if mask == 0 {
-                // Pure ASCII chunk - all bytes are valid UTF-8
-                i += 16;
-                continue;
-            }
-        }
-
-        // Non-ASCII detected - need full validation for this chunk
-        // Fall back to scalar validation for this chunk
-        let chunk_slice = &data[i..i + 16];
-        if !validate_utf8_scalar(chunk_slice) {
-            return false;
-        }
-
-        i += 16;
-    }
-
-    // Handle remaining bytes with scalar validation
-    if i < len {
-        return validate_utf8_scalar(&data[i..]);
-    }
-
-    true
-}
-
-// ============================================================================
-// Lemire UTF-8 Validation Algorithm - Lookup Tables
-// ============================================================================
-//
-// The algorithm uses three 16-element lookup tables that encode error conditions
-// as bit flags. The tables are indexed by nibbles (4-bit values) of the input bytes.
-//
-// Error flags:
-// - TOO_SHORT (0x01): Lead byte followed by another lead byte or ASCII
-// - TOO_LONG (0x02): ASCII/continuation followed by continuation
-// - OVERLONG_3 (0x04): 3-byte overlong encoding
-// - SURROGATE (0x10): UTF-16 surrogate (U+D800-U+DFFF)
-// - OVERLONG_2 (0x20): 2-byte overlong encoding
-// - OVERLONG_4 (0x40): 4-byte overlong encoding
-// - TOO_LARGE (0x08): Code point > U+10FFFF
-// - TOO_LARGE_1000 (0x80): Code point >= U+10000 in wrong context
-
-// Note: The SIMD implementations below use an ASCII fast-path strategy:
-// 1. Check if all bytes in a 16/32-byte chunk have high bit unset (< 0x80)
-// 2. If pure ASCII, skip validation for that chunk
-// 3. If non-ASCII, fall back to scalar validation
-//
-// This provides significant speedup for ASCII-heavy content while maintaining
-// correctness for all UTF-8 input. A full Lemire lookup-table algorithm
-// (as used by simdutf8/simdjson) would be faster for non-ASCII content but
-// requires more complex SIMD shuffle operations.
-
-// ============================================================================
-// LoongArch64 LSX/LASX Implementation
-// ============================================================================
-
-#[cfg(all(target_arch = "loongarch64", feature = "nightly"))]
-fn validate_utf8_loongarch(data: &[u8]) -> bool {
-    // For short inputs, use scalar validation
-    if data.len() < 16 {
-        return validate_utf8_scalar(data);
-    }
-
-    // Try LASX (256-bit) first, then LSX (128-bit)
-    #[cfg(target_feature = "lasx")]
-    {
-        if std::arch::is_loongarch_feature_detected!("lasx") {
-            return unsafe { validate_utf8_lasx(data) };
-        }
-    }
-
-    #[cfg(target_feature = "lsx")]
-    {
-        if std::arch::is_loongarch_feature_detected!("lsx") {
-            return unsafe { validate_utf8_lsx(data) };
-        }
-    }
-
-    // Fallback to scalar
-    validate_utf8_scalar(data)
-}
-
-#[cfg(all(
-    target_arch = "loongarch64",
-    feature = "nightly",
-    target_feature = "lsx"
-))]
-#[target_feature(enable = "lsx")]
-unsafe fn validate_utf8_lsx(data: &[u8]) -> bool {
-    use std::arch::loongarch64::*;
-
-    let mut i = 0;
-    let len = data.len();
-    let mut prev_incomplete: v16i8 = unsafe { std::mem::zeroed() };
-    let mut errors: v16i8 = unsafe { std::mem::zeroed() };
-
-    // Process 16 bytes at a time
-    while i + 16 <= len {
-        let chunk = lsx_vld(data.as_ptr().add(i) as *const i8, 0);
-
-        // Check for ASCII fast path (all bytes < 0x80)
-        let high_bits = lsx_vmskltz_b(chunk);
-        if high_bits == 0 {
-            // Pure ASCII chunk
-            prev_incomplete = unsafe { std::mem::zeroed() };
-            i += 16;
-            continue;
-        }
-
-        // Non-ASCII: need full validation
-        // This is a simplified check - for production, implement full Lemire algorithm
-        let chunk_slice = &data[i..i + 16];
-        if !validate_utf8_scalar(chunk_slice) {
-            return false;
-        }
-
-        i += 16;
-    }
-
-    // Handle remaining bytes
-    if i < len {
-        return validate_utf8_scalar(&data[i..]);
-    }
-
-    true
-}
-
-#[cfg(all(
-    target_arch = "loongarch64",
-    feature = "nightly",
-    target_feature = "lasx"
-))]
-#[target_feature(enable = "lasx")]
-unsafe fn validate_utf8_lasx(data: &[u8]) -> bool {
-    // LASX processes 32 bytes at a time
-    let mut i = 0;
-    let len = data.len();
-
-    // Process 32 bytes at a time
-    while i + 32 <= len {
-        // For LASX, similar logic but with 256-bit vectors
-        // Check ASCII fast path
-        let chunk = &data[i..i + 32];
-        let all_ascii = chunk.iter().all(|&b| b < 0x80);
-
-        if all_ascii {
-            i += 32;
-            continue;
-        }
-
-        // Non-ASCII: validate
-        if !validate_utf8_scalar(chunk) {
-            return false;
-        }
-
-        i += 32;
-    }
-
-    // Handle remaining bytes
-    if i < len {
-        return validate_utf8_scalar(&data[i..]);
-    }
-
-    true
-}
-
-// ============================================================================
-// PowerPC AltiVec Implementation
-// ============================================================================
-
-#[cfg(all(
-    any(target_arch = "powerpc", target_arch = "powerpc64"),
-    feature = "nightly"
-))]
-fn validate_utf8_powerpc(data: &[u8]) -> bool {
-    // For short inputs, use scalar validation
-    if data.len() < 16 {
-        return validate_utf8_scalar(data);
-    }
-
-    unsafe { validate_utf8_altivec(data) }
-}
-
-#[cfg(all(
-    any(target_arch = "powerpc", target_arch = "powerpc64"),
-    feature = "nightly"
-))]
-#[target_feature(enable = "altivec")]
-unsafe fn validate_utf8_altivec(data: &[u8]) -> bool {
-    #[cfg(target_arch = "powerpc")]
-    use std::arch::powerpc::*;
-    #[cfg(target_arch = "powerpc64")]
-    use std::arch::powerpc64::*;
-
-    let mut i = 0;
-    let len = data.len();
-
-    // Process 16 bytes at a time
-    while i + 16 <= len {
-        let ptr = data.as_ptr().add(i) as *const vector_unsigned_char;
-        let chunk: vector_unsigned_char = vec_ld(0, ptr);
-
-        // Check for ASCII fast path using vec_any_ge (any byte >= 0x80)
-        let high_bit_mask: vector_unsigned_char = vec_splats(0x80u8);
-        let has_high_bits = vec_any_ge(chunk, high_bit_mask);
-
-        if !has_high_bits {
-            // Pure ASCII chunk
-            i += 16;
-            continue;
-        }
-
-        // Non-ASCII: need full validation
-        let chunk_slice = &data[i..i + 16];
-        if !validate_utf8_scalar(chunk_slice) {
-            return false;
-        }
-
-        i += 16;
-    }
-
-    // Handle remaining bytes
-    if i < len {
-        return validate_utf8_scalar(&data[i..]);
-    }
-
-    true
-}
-
-// ============================================================================
-// s390x z13 Vector Implementation
-// ============================================================================
-
-#[cfg(all(target_arch = "s390x", feature = "nightly"))]
-fn validate_utf8_s390x(data: &[u8]) -> bool {
-    // For short inputs, use scalar validation
-    if data.len() < 16 {
-        return validate_utf8_scalar(data);
-    }
-
-    // Check for vector facility
-    if std::arch::is_s390x_feature_detected!("vector") {
-        return unsafe { validate_utf8_s390x_vector(data) };
-    }
-
-    validate_utf8_scalar(data)
-}
-
-#[cfg(all(target_arch = "s390x", feature = "nightly"))]
-#[target_feature(enable = "vector")]
-unsafe fn validate_utf8_s390x_vector(data: &[u8]) -> bool {
-    use std::arch::s390x::*;
-
-    let mut i = 0;
-    let len = data.len();
-
-    // Create mask for high bit check
-    let high_bit_mask: vector_unsigned_char = vec_splats(0x80u8);
-
-    // Process 16 bytes at a time
-    while i + 16 <= len {
-        // Load 16 bytes
-        let chunk_ptr = data.as_ptr().add(i) as *const vector_unsigned_char;
-        let chunk: vector_unsigned_char = *chunk_ptr;
-
-        // Check for ASCII fast path
-        // If AND with 0x80 mask is all zeros, it's ASCII
-        let masked = vec_and(chunk, high_bit_mask);
-        let zero: vector_unsigned_char = vec_splats(0u8);
-        let is_ascii = vec_all_eq(masked, zero);
-
-        if is_ascii != 0 {
-            // Pure ASCII chunk
-            i += 16;
-            continue;
-        }
-
-        // Non-ASCII: need full validation
-        let chunk_slice = &data[i..i + 16];
-        if !validate_utf8_scalar(chunk_slice) {
-            return false;
-        }
-
-        i += 16;
-    }
-
-    // Handle remaining bytes
-    if i < len {
-        return validate_utf8_scalar(&data[i..]);
-    }
-
-    true
-}
-
-// ============================================================================
-// Scalar Fallback Implementation
-// ============================================================================
-
-/// Scalar UTF-8 validation (used as fallback and for short inputs)
-#[inline]
-fn validate_utf8_scalar(data: &[u8]) -> bool {
-    std::str::from_utf8(data).is_ok()
+    simdutf8::basic::from_utf8(data).is_ok()
 }
 
 // ============================================================================
@@ -507,6 +50,21 @@ impl Utf8Stream {
     #[inline]
     pub fn reset(&mut self) {
         self.carry_len = 0;
+    }
+
+    /// Resume from a message's unvalidated suffix before any validation error.
+    ///
+    /// After successful validation the carry is the entire pending state, so
+    /// matching bytes already represent the result of resetting and re-pushing
+    /// the suffix. Compare contents, not just length: raw processing may have
+    /// started another message while leaving this validator unchanged.
+    #[inline]
+    pub(crate) fn resume(&mut self, suffix: &[u8]) -> bool {
+        if suffix == &self.carry[..self.carry_len as usize] {
+            return true;
+        }
+        self.reset();
+        self.push(suffix)
     }
 
     /// Validate the next chunk of the message.
@@ -931,30 +489,37 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    fn test_sse2_validation() {
-        // Test that exercises the SSE2 code path specifically
-        // This test directly calls the SSE2 implementation
-        unsafe {
-            // Test ASCII fast path (16 bytes)
-            let ascii_16 = b"Hello, World!!!!";
-            assert!(validate_utf8_sse2(ascii_16));
+    fn short_utf8_matches_std_at_every_byte_position() {
+        for len in [1, 7, 8, 15, 16, 31, 32, 34, 63, 64, 65] {
+            for sequence in [
+                &[0x80][..],
+                &[0xFF],
+                "é".as_bytes(),
+                "世".as_bytes(),
+                "🎉".as_bytes(),
+            ] {
+                for start in 0..len {
+                    let mut data = vec![b'a'; len];
+                    let copied = sequence.len().min(len - start);
+                    data[start..start + copied].copy_from_slice(&sequence[..copied]);
+                    assert_eq!(validate_utf8(&data), std::str::from_utf8(&data).is_ok());
+                }
+            }
+        }
+    }
 
-            // Test longer ASCII to exercise SIMD loop
-            let long_ascii = "a".repeat(128);
-            assert!(validate_utf8_sse2(long_ascii.as_bytes()));
+    #[test]
+    fn valid_utf8_crossing_simd_boundaries_is_accepted() {
+        for boundary in [16, 32, 64] {
+            for sequence in ["é".as_bytes(), "世".as_bytes(), "🎉".as_bytes()] {
+                for bytes_before_boundary in 1..sequence.len() {
+                    let start = boundary - bytes_before_boundary;
+                    let mut data = vec![b'a'; 128];
+                    data[start..start + sequence.len()].copy_from_slice(sequence);
 
-            // Test mixed ASCII and UTF-8
-            let mixed = format!("{}日本語{}", "a".repeat(64), "b".repeat(64));
-            assert!(validate_utf8_sse2(mixed.as_bytes()));
-
-            // Test invalid UTF-8
-            assert!(!validate_utf8_sse2(&[0xFF, 0xFF]));
-            assert!(!validate_utf8_sse2(&[0xED, 0xA0, 0x80])); // Surrogate
-
-            // Test edge cases
-            assert!(validate_utf8_sse2(b"")); // Empty (< 16 bytes)
-            assert!(validate_utf8_sse2(b"short")); // < 16 bytes
+                    assert!(validate_utf8(&data));
+                }
+            }
         }
     }
 }
