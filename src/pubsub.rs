@@ -639,17 +639,23 @@ impl PubSub {
         exclude: Option<SubscriberId>,
     ) -> Option<Vec<UnboundedSender<Message>>> {
         let topic_subscribers = data.topics.get(topic)?;
-        let recipients = topic_subscribers
-            .iter()
-            .filter(|id| Some(**id) != exclude)
-            .map(|id| {
-                data.subscribers
-                    .get(id)
-                    .expect("topic index must reference an active subscriber")
-                    .sender
-                    .clone()
-            })
-            .collect();
+        let recipient_count = topic_subscribers.len()
+            - usize::from(exclude.is_some_and(|id| topic_subscribers.contains(&id)));
+        // Avoid growing the snapshot under the lock, including allocating for an
+        // empty snapshot when the only subscriber is excluded.
+        let mut recipients = Vec::with_capacity(recipient_count);
+        recipients.extend(
+            topic_subscribers
+                .iter()
+                .filter(|id| Some(**id) != exclude)
+                .map(|id| {
+                    data.subscribers
+                        .get(id)
+                        .expect("topic index must reference an active subscriber")
+                        .sender
+                        .clone()
+                }),
+        );
 
         Some(recipients)
     }
