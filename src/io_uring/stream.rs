@@ -44,34 +44,54 @@ type WriteOperation = Pin<Box<dyn Future<Output = (io::Result<()>, Vec<u8>)> + '
 /// - HTTP/2 (via h2 crate)
 /// - TLS (via tokio-rustls with io_uring support)
 ///
+/// # Buffering and concurrency
+///
+/// Poll-based writes accept bytes into a buffer. Flush before waiting for a
+/// response or dropping the stream; dropping does not flush and can lose unsent
+/// bytes. Shutdown flushes before closing the write half. A failed flush returns
+/// the write error and clears that batch; it does not retain bytes for retry,
+/// and a prefix may already have reached the peer.
+///
+/// The native methods require mutable access to preserve ordering with the
+/// bridge, so they cannot be used for concurrent reads and writes through a
+/// shared `UringStream`. Read and write bridge state remain independent.
+/// For exclusively direct native I/O, see [`Self::get_ref`].
+///
 /// # Example: io_uring + HTTP/2 WebSocket
 ///
-/// ```ignore
+/// ```no_run
+/// # #[cfg(all(feature = "http2", any(feature = "rustls-webpki-roots", feature = "rustls-native-roots", feature = "rustls-platform-verifier")))]
+/// # {
+/// use futures_util::{SinkExt, StreamExt};
 /// use sockudo_ws::io_uring::UringStream;
-/// use sockudo_ws::http2::H2WebSocketServer;
+/// use sockudo_ws::{Config, Http2, WebSocketServer};
 ///
-/// #[tokio_uring::main]
-/// async fn main() {
-///     let listener = tokio_uring::net::TcpListener::bind(addr)?;
-///     let server = H2WebSocketServer::new(Config::default());
-///
-///     loop {
-///         let (tcp_stream, _) = listener.accept().await?;
-///
-///         // Wrap TCP in UringStream for io_uring I/O
-///         let uring_stream = UringStream::new(tcp_stream);
-///
-///         // Add TLS (required for HTTP/2)
-///         let tls_stream = tls_acceptor.accept(uring_stream).await?;
-///
-///         // HTTP/2 WebSocket server uses io_uring transport!
-///         tokio_uring::spawn(async move {
-///             server.serve(tls_stream, |ws, req| async move {
-///                 // Handle WebSocket over HTTP/2 over TLS over io_uring
-///             }).await.ok();
-///         });
-///     }
+/// // Configure the TLS acceptor with a certificate and ALPN protocol h2.
+/// fn serve(tls_acceptor: tokio_rustls::TlsAcceptor) -> Result<(), Box<dyn std::error::Error>> {
+///     tokio_uring::start(async move {
+///         let listener = tokio_uring::net::TcpListener::bind("127.0.0.1:8443".parse()?)?;
+///         let server = WebSocketServer::<Http2>::new(Config::default());
+///         loop {
+///             let (tcp, _) = listener.accept().await?;
+///             // Wrap TCP in UringStream for io_uring I/O.
+///             let uring = UringStream::new(tcp);
+///             // Add TLS for this HTTP/2 endpoint: TCP -> TLS -> HTTP/2 -> WebSocket.
+///             let tls = tls_acceptor.accept(uring).await?;
+///             let server = server.clone();
+///             tokio_uring::spawn(async move {
+///                 server.serve(tls, |mut ws, _req| async move {
+///                     // Handle WebSocket over HTTP/2 over TLS over io_uring.
+///                     while let Some(Ok(message)) = ws.next().await {
+///                         if ws.send(message).await.is_err() {
+///                             break;
+///                         }
+///                     }
+///                 }).await
+///             });
+///         }
+///     })
 /// }
+/// # }
 /// ```
 pub struct UringStream {
     /// The underlying tokio-uring TCP stream
@@ -137,9 +157,14 @@ impl UringStream {
 
     /// Get a reference to the underlying tokio-uring stream.
     ///
-    /// Use this for socket inspection and configuration. Performing I/O on
-    /// this reference bypasses pending and buffered operations in the bridge
-    /// and can reorder bytes. Use the bridge or its native methods for I/O.
+    /// Use this for socket inspection and configuration. Direct I/O is also
+    /// supported when all I/O uses this reference from construction onward:
+    /// the bridge then has no buffered or pending operations. In that mode,
+    /// a shared `Rc<UringStream>` can perform a read and a write concurrently
+    /// through the underlying stream's shared-reference methods.
+    ///
+    /// Do not mix direct I/O with the bridge or its native methods: direct I/O
+    /// bypasses bridge state and can reorder bytes or skip buffered input.
     pub fn get_ref(&self) -> &UringTcpStream {
         &self.inner
     }

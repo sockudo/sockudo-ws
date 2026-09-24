@@ -610,72 +610,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## io_uring Support (Linux)
 
-io_uring provides kernel-level async I/O with zero-copy operations. It's a **transport layer** that can be combined with any protocol.
+io_uring provides completion-based kernel I/O. `UringStream` is a buffered TCP transport bridge: its poll-based API copies between borrowed buffers and owned completion buffers. HTTP/3 uses a separate UDP transport. Run inside `tokio_uring::start` on Linux 5.10 or later.
 
 ### io_uring with HTTP/1.1
 
 ```rust
+use futures_util::{SinkExt, StreamExt};
 use sockudo_ws::io_uring::UringStream;
 use sockudo_ws::{Config, WebSocketStream};
 
-#[tokio_uring::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let listener = tokio_uring::net::TcpListener::bind("127.0.0.1:8080".parse()?)?;
-
-    loop {
-        let (tcp_stream, _) = listener.accept().await?;
-        
-        // Wrap in UringStream for io_uring I/O
-        let uring_stream = UringStream::new(tcp_stream);
-        
-        tokio_uring::spawn(async move {
-            let mut ws = WebSocketStream::server(uring_stream, Config::default());
-            
-            while let Some(msg) = ws.next().await {
-                if let Ok(msg) = msg {
-                    ws.send(msg).await.ok();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tokio_uring::start(async {
+        let listener = tokio_uring::net::TcpListener::bind("127.0.0.1:8080".parse()?)?;
+        loop {
+            let (tcp, _) = listener.accept().await?;
+            // Wrap TCP in UringStream for io_uring I/O.
+            let uring = UringStream::new(tcp);
+            tokio_uring::spawn(async move {
+                // Direct WebSocket framing; an HTTP upgrade must be handled separately.
+                let mut ws = WebSocketStream::server(uring, Config::default());
+                while let Some(Ok(message)) = ws.next().await {
+                    if ws.send(message).await.is_err() {
+                        break;
+                    }
                 }
-            }
-        });
-    }
+            });
+        }
+    })
 }
 ```
 
 ### io_uring with HTTP/2
 
-Combine io_uring transport with HTTP/2 protocol for maximum performance:
+Enable `io-uring`, `http2`, and a `rustls-*` feature for this TLS example. Supply a TLS acceptor configured with a certificate and ALPN `h2`:
 
 ```rust
+use futures_util::{SinkExt, StreamExt};
 use sockudo_ws::io_uring::UringStream;
-use sockudo_ws::{WebSocketServer, Http2, Config};
+use sockudo_ws::{Config, Http2, WebSocketServer};
 
-#[tokio_uring::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let listener = tokio_uring::net::TcpListener::bind("127.0.0.1:8080".parse()?)?;
-    let server = WebSocketServer::<Http2>::new(Config::default());
-
-    loop {
-        let (tcp_stream, _) = listener.accept().await?;
-        
-        // 1. Wrap TCP in UringStream for io_uring I/O
-        let uring_stream = UringStream::new(tcp_stream);
-        
-        // 2. Add TLS (required for HTTP/2)
-        // let tls_stream = tls_acceptor.accept(uring_stream).await?;
-        
-        // 3. Run HTTP/2 WebSocket over io_uring transport
-        let server = server.clone();
-        tokio_uring::spawn(async move {
-            server.serve(uring_stream, |mut ws, req| async move {
-                // WebSocket over HTTP/2 over io_uring!
-                while let Some(msg) = ws.next().await {
-                    if let Ok(msg) = msg {
-                        ws.send(msg).await.ok();
+// Configure the TLS acceptor with a certificate and ALPN protocol h2.
+fn serve(tls_acceptor: tokio_rustls::TlsAcceptor) -> Result<(), Box<dyn std::error::Error>> {
+    tokio_uring::start(async move {
+        let listener = tokio_uring::net::TcpListener::bind("127.0.0.1:8443".parse()?)?;
+        let server = WebSocketServer::<Http2>::new(Config::default());
+        loop {
+            let (tcp, _) = listener.accept().await?;
+            // Wrap TCP in UringStream for io_uring I/O.
+            let uring = UringStream::new(tcp);
+            // Add TLS for this HTTP/2 endpoint: TCP -> TLS -> HTTP/2 -> WebSocket.
+            let tls = tls_acceptor.accept(uring).await?;
+            let server = server.clone();
+            tokio_uring::spawn(async move {
+                server.serve(tls, |mut ws, _req| async move {
+                    // Handle WebSocket over HTTP/2 over TLS over io_uring.
+                    while let Some(Ok(message)) = ws.next().await {
+                        if ws.send(message).await.is_err() {
+                            break;
+                        }
                     }
-                }
-            }).await.ok();
-        });
-    }
+                }).await
+            });
+        }
+    })
 }
 ```
 
@@ -689,7 +686,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ├─────────────────────────────┤
 │      HTTP/2 (h2 crate)      │  ← Extended CONNECT framing
 ├─────────────────────────────┤
-│     TLS (rustls/openssl)    │  ← Required for HTTP/2
+│     TLS (rustls/openssl)    │  ← TLS for this endpoint
 ├─────────────────────────────┤
 │        UringStream          │  ← io_uring async I/O
 ├─────────────────────────────┤
@@ -1173,7 +1170,7 @@ sockudo-ws/
 │   └── io_uring/         # Linux io_uring transport
 │       ├── mod.rs
 │       ├── stream.rs     # UringStream wrapper
-│       └── buffer.rs     # Registered buffer pool
+│       └── buffer.rs     # Owned buffer pool (not kernel-registered)
 ├── fuzz/                 # Fuzzing targets
 │   └── fuzz_targets/
 │       ├── parse_frame.rs

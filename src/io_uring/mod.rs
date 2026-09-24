@@ -26,27 +26,39 @@
 //!
 //! # Combining io_uring with HTTP/2
 //!
-//! ```ignore
+//! ```no_run
+//! # #[cfg(all(feature = "http2", any(feature = "rustls-webpki-roots", feature = "rustls-native-roots", feature = "rustls-platform-verifier")))]
+//! # {
+//! use futures_util::{SinkExt, StreamExt};
 //! use sockudo_ws::io_uring::UringStream;
-//! use sockudo_ws::http2::H2WebSocketServer;
+//! use sockudo_ws::{Config, Http2, WebSocketServer};
 //!
-//! #[tokio_uring::main]
-//! async fn main() {
-//!     let listener = tokio_uring::net::TcpListener::bind(addr)?;
-//!     let server = H2WebSocketServer::new(Config::default());
-//!
-//!     loop {
-//!         let (tcp, _) = listener.accept().await?;
-//!
-//!         // io_uring TCP -> TLS -> HTTP/2 -> WebSocket
-//!         let uring = UringStream::new(tcp);
-//!         let tls = tls_acceptor.accept(uring).await?;
-//!
-//!         server.serve(tls, |ws, req| async {
-//!             // Full stack: WebSocket/HTTP2/TLS/io_uring!
-//!         }).await.ok();
-//!     }
+//! // Configure the TLS acceptor with a certificate and ALPN protocol h2.
+//! fn serve(tls_acceptor: tokio_rustls::TlsAcceptor) -> Result<(), Box<dyn std::error::Error>> {
+//!     tokio_uring::start(async move {
+//!         let listener = tokio_uring::net::TcpListener::bind("127.0.0.1:8443".parse()?)?;
+//!         let server = WebSocketServer::<Http2>::new(Config::default());
+//!         loop {
+//!             let (tcp, _) = listener.accept().await?;
+//!             // Wrap TCP in UringStream for io_uring I/O.
+//!             let uring = UringStream::new(tcp);
+//!             // Add TLS for this HTTP/2 endpoint: TCP -> TLS -> HTTP/2 -> WebSocket.
+//!             let tls = tls_acceptor.accept(uring).await?;
+//!             let server = server.clone();
+//!             tokio_uring::spawn(async move {
+//!                 server.serve(tls, |mut ws, _req| async move {
+//!                     // Handle WebSocket over HTTP/2 over TLS over io_uring.
+//!                     while let Some(Ok(message)) = ws.next().await {
+//!                         if ws.send(message).await.is_err() {
+//!                             break;
+//!                         }
+//!                     }
+//!                 }).await
+//!             });
+//!         }
+//!     })
 //! }
+//! # }
 //! ```
 //!
 //! # Combining io_uring with HTTP/3
@@ -56,25 +68,29 @@
 //!
 //! # Direct io_uring + HTTP/1.1 WebSocket
 //!
-//! ```ignore
-//! use sockudo_ws::{Config, WebSocketStream};
+//! ```no_run
+//! use futures_util::{SinkExt, StreamExt};
 //! use sockudo_ws::io_uring::UringStream;
+//! use sockudo_ws::{Config, WebSocketStream};
 //!
-//! #[tokio_uring::main]
-//! async fn main() {
-//!     let listener = tokio_uring::net::TcpListener::bind(addr)?;
-//!
-//!     loop {
-//!         let (stream, _) = listener.accept().await?;
-//!         let uring_stream = UringStream::new(stream);
-//!
-//!         // Direct: WebSocket over io_uring TCP
-//!         let mut ws = WebSocketStream::server(uring_stream, Config::default());
-//!
-//!         while let Some(msg) = ws.next().await {
-//!             ws.send(msg?).await.ok();
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     tokio_uring::start(async {
+//!         let listener = tokio_uring::net::TcpListener::bind("127.0.0.1:8080".parse()?)?;
+//!         loop {
+//!             let (tcp, _) = listener.accept().await?;
+//!             // Wrap TCP in UringStream for io_uring I/O.
+//!             let uring = UringStream::new(tcp);
+//!             tokio_uring::spawn(async move {
+//!                 // Direct WebSocket framing; an HTTP upgrade must be handled separately.
+//!                 let mut ws = WebSocketStream::server(uring, Config::default());
+//!                 while let Some(Ok(message)) = ws.next().await {
+//!                     if ws.send(message).await.is_err() {
+//!                         break;
+//!                     }
+//!                 }
+//!             });
 //!         }
-//!     }
+//!     })
 //! }
 //! ```
 //!
@@ -182,7 +198,7 @@ pub fn kernel_version() -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
-/// Check if the kernel version supports io_uring with recommended features
+/// Check if the kernel version meets tokio-uring 0.5's minimum requirement
 ///
 /// Returns true if the kernel is 5.10 or higher.
 #[cfg(target_os = "linux")]

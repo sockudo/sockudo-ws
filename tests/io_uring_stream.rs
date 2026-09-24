@@ -226,3 +226,41 @@ fn empty_poll_read_does_not_turn_an_open_stream_into_eof() {
         .unwrap();
     });
 }
+
+#[test]
+fn native_partial_write_preserves_preceding_poll_write() {
+    tokio_uring::start(async {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let (mut stream, mut peer) = connected_streams().await;
+            stream.write_all(b"A").await.unwrap();
+
+            let (result, _) = stream.write_native(b"B".to_vec()).await;
+
+            assert_eq!(result.unwrap(), 1);
+            stream.flush().await.unwrap();
+            let mut bytes = [0; 2];
+            peer.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, b"AB");
+        })
+        .await
+        .unwrap();
+    });
+}
+
+#[test]
+fn native_read_returns_eof_after_poll_read_eof() {
+    tokio_uring::start(async {
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let (mut stream, mut peer) = connected_streams().await;
+            peer.shutdown().await.unwrap();
+            assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
+
+            let (result, buffer) = stream.read_native(vec![0; 1]).await;
+
+            assert_eq!(result.unwrap(), 0);
+            assert_eq!(buffer, [0]);
+        })
+        .await
+        .unwrap();
+    });
+}
