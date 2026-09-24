@@ -29,12 +29,10 @@
 
 use std::future::Future;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 #[cfg(feature = "http3")]
 use std::net::SocketAddr;
-
-#[cfg(feature = "http3")]
-use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::protocol::Role;
@@ -100,7 +98,7 @@ pub struct WebSocketServer<T: Transport> {
 
 // Server inner state - different for each transport
 enum ServerInner<T: Transport> {
-    Http1(PhantomData<T>),
+    Http1(Option<Arc<[String]>>),
     #[cfg(feature = "http2")]
     Http2(PhantomData<T>),
     #[cfg(feature = "http3")]
@@ -120,8 +118,42 @@ impl WebSocketServer<Http1> {
     pub fn new(config: Config) -> Self {
         Self {
             config,
-            inner: ServerInner::Http1(PhantomData),
+            inner: ServerInner::Http1(None),
         }
+    }
+
+    /// Set supported WebSocket subprotocols in server preference order.
+    ///
+    /// The server selects the first exact match from this list. If no protocol
+    /// matches, the handshake succeeds without a selected protocol and
+    /// [`HandshakeResult::protocol`] is `None`. Browser clients that offered
+    /// protocols reject a response without a selection.
+    ///
+    /// Passing an empty iterator disables the default selection of the
+    /// client's first offer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any configured subprotocol is not a valid token.
+    pub fn protocols<I, P>(mut self, protocols: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<str>,
+    {
+        let protocols = protocols
+            .into_iter()
+            .map(|protocol| protocol.as_ref().to_owned())
+            .collect::<Vec<_>>();
+        handshake::validate_supported_protocols(&protocols)?;
+        self.inner = ServerInner::Http1(Some(protocols.into()));
+        Ok(self)
+    }
+
+    fn supported_protocols(&self) -> Option<&[String]> {
+        let ServerInner::Http1(protocols) = &self.inner else {
+            unreachable!("HTTP/1 server has a non-HTTP/1 inner state");
+        };
+        protocols.as_deref()
     }
 
     /// Create a new HTTP/1.1 WebSocket server with default configuration
@@ -170,7 +202,11 @@ impl WebSocketServer<Http1> {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         // Perform the HTTP/1.1 WebSocket handshake
-        let handshake_result = handshake::server_handshake(&mut stream).await?;
+        let handshake_result = handshake::server_handshake_with_supported_protocols(
+            &mut stream,
+            self.supported_protocols(),
+        )
+        .await?;
 
         // Wrap in Stream<Http1>
         let stream = Stream::<Http1>::new(stream);
@@ -223,7 +259,11 @@ impl WebSocketServer<Http1> {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         // Perform the HTTP/1.1 WebSocket handshake
-        let handshake_result = handshake::server_handshake(&mut stream).await?;
+        let handshake_result = handshake::server_handshake_with_supported_protocols(
+            &mut stream,
+            self.supported_protocols(),
+        )
+        .await?;
 
         // Preserve frame bytes read together with the HTTP upgrade request.
         let ws = WebSocketStream::from_raw_with_leftover(
@@ -240,6 +280,7 @@ impl WebSocketServer<Http1> {
     ///
     /// This is a convenience method that accepts connections from a listener
     /// and calls the handler for each successful WebSocket upgrade.
+    /// Accepted TCP sockets have `TCP_NODELAY` enabled when supported.
     ///
     /// # Example
     ///
@@ -264,12 +305,15 @@ impl WebSocketServer<Http1> {
     {
         loop {
             let (stream, _addr) = listener.accept().await.map_err(Error::Io)?;
-
             let handler = handler.clone();
-            let config = self.config.clone();
+            let server = self.clone();
 
             tokio::spawn(async move {
-                let server = WebSocketServer::<Http1>::new(config);
+                // A socket-option failure need not prevent a valid handshake.
+                // Report it locally and keep serving this connection.
+                if let Err(error) = stream.set_nodelay(true) {
+                    eprintln!("WebSocket socket setup error: {error}");
+                }
                 match server.accept(stream).await {
                     Ok((ws, handshake)) => {
                         handler(ws, handshake).await;
@@ -291,9 +335,12 @@ impl Default for WebSocketServer<Http1> {
 
 impl Clone for WebSocketServer<Http1> {
     fn clone(&self) -> Self {
+        let ServerInner::Http1(protocols) = &self.inner else {
+            unreachable!("HTTP/1 server has a non-HTTP/1 inner state");
+        };
         Self {
             config: self.config.clone(),
-            inner: ServerInner::Http1(PhantomData),
+            inner: ServerInner::Http1(protocols.clone()),
         }
     }
 }
@@ -481,7 +528,8 @@ where
         let h2_stream = Stream::<Http2>::from_h2(send_stream, recv_stream);
 
         // Create WebSocketStream over Stream<Http2>
-        let ws = WebSocketStream::from_raw(h2_stream, Role::Server, config);
+        let ws = WebSocketStream::from_raw(h2_stream, Role::Server, config)
+            .with_immediate_write_shutdown();
 
         // Call user handler
         handler(ws, ws_req).await;
@@ -534,7 +582,8 @@ where
 
         let recv_stream = request.into_body();
         let h2_stream = Stream::<Http2>::from_h2(send_stream, recv_stream);
-        let ws = WebSocketStream::from_raw(h2_stream, Role::Server, config);
+        let ws = WebSocketStream::from_raw(h2_stream, Role::Server, config)
+            .with_immediate_write_shutdown();
 
         handler(ws, ws_req).await;
 
@@ -564,17 +613,32 @@ impl WebSocketServer<Http3> {
     /// * `ws_config` - WebSocket configuration
     pub async fn bind(
         addr: SocketAddr,
-        tls_config: rustls::ServerConfig,
+        mut tls_config: rustls::ServerConfig,
         ws_config: Config,
     ) -> Result<Self> {
+        let transport_config = crate::http3::quic_transport_config(&ws_config.http3)?;
+        let endpoint_config = crate::http3::quic_endpoint_config(&ws_config.http3)?;
+
+        // HTTP/3 0-RTT is rejected by quic_transport_config. Keep caller-provided
+        // TLS settings from silently enabling early data through this API.
+        tls_config.max_early_data_size = 0;
+
         // Create QUIC server config from rustls config
         let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
             .map_err(|_| Error::HandshakeFailed("invalid TLS config"))?;
 
-        let server_config = ServerConfig::with_crypto(Arc::new(quic_config));
+        let mut server_config = ServerConfig::with_crypto(Arc::new(quic_config));
+        server_config.transport_config(transport_config);
 
         // Create QUIC endpoint
-        let endpoint = Endpoint::server(server_config, addr).map_err(Error::Io)?;
+        let socket = std::net::UdpSocket::bind(addr).map_err(Error::Io)?;
+        let endpoint = Endpoint::new(
+            endpoint_config,
+            Some(server_config),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(Error::Io)?;
 
         Ok(Self {
             config: ws_config,
@@ -587,6 +651,9 @@ impl WebSocketServer<Http3> {
     /// Use this when you need more control over the QUIC configuration,
     /// such as enabling BBR congestion control for better performance
     /// in lossy networks.
+    ///
+    /// Transport and TLS settings come from the supplied endpoint. HTTP/3
+    /// protocol settings still come from the WebSocket configuration.
     pub fn from_endpoint(endpoint: Endpoint, ws_config: Config) -> Self {
         Self {
             config: ws_config,
@@ -625,6 +692,7 @@ impl WebSocketServer<Http3> {
             + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
+        crate::http3::validate_config(&self.config.http3)?;
         let endpoint = match self.inner {
             ServerInner::Http3 { endpoint } => endpoint,
             _ => unreachable!(),
@@ -660,6 +728,7 @@ impl WebSocketServer<Http3> {
         Fut: Future<Output = ()> + Send + 'static,
         Filter: Fn(&ExtendedConnectRequest) -> bool + Clone + Send + Sync + 'static,
     {
+        crate::http3::validate_config(&self.config.http3)?;
         let endpoint = match self.inner {
             ServerInner::Http3 { endpoint } => endpoint,
             _ => unreachable!(),
@@ -707,10 +776,12 @@ where
 {
     let connection = incoming.await.map_err(Error::from)?;
 
-    let mut h3_conn: H3Connection<h3_quinn::Connection, Bytes> =
-        H3Connection::new(h3_quinn::Connection::new(connection))
-            .await
-            .map_err(Error::from)?;
+    let mut builder = h3::server::builder();
+    builder.enable_extended_connect(config.http3.enable_connect_protocol);
+    let mut h3_conn: H3Connection<h3_quinn::Connection, Bytes> = builder
+        .build(h3_quinn::Connection::new(connection))
+        .await
+        .map_err(Error::from)?;
 
     loop {
         match h3_conn.accept().await {
@@ -754,10 +825,12 @@ where
 {
     let connection = incoming.await.map_err(Error::from)?;
 
-    let mut h3_conn: H3Connection<h3_quinn::Connection, Bytes> =
-        H3Connection::new(h3_quinn::Connection::new(connection))
-            .await
-            .map_err(Error::from)?;
+    let mut builder = h3::server::builder();
+    builder.enable_extended_connect(config.http3.enable_connect_protocol);
+    let mut h3_conn: H3Connection<h3_quinn::Connection, Bytes> = builder
+        .build(h3_quinn::Connection::new(connection))
+        .await
+        .map_err(Error::from)?;
 
     loop {
         match h3_conn.accept().await {
@@ -804,6 +877,15 @@ where
 {
     use http::StatusCode;
 
+    if !config.http3.enable_connect_protocol {
+        let response = build_extended_connect_error(
+            StatusCode::NOT_IMPLEMENTED,
+            Some("Extended CONNECT is disabled"),
+        );
+        stream.send_response(response).await.ok();
+        return Ok(());
+    }
+
     if request.method() != Method::CONNECT {
         let response =
             build_extended_connect_error(StatusCode::METHOD_NOT_ALLOWED, Some("Expected CONNECT"));
@@ -842,7 +924,8 @@ where
     stream.send_response(response).await.map_err(Error::from)?;
 
     let h3_stream = Stream::<Http3>::from_h3_server(stream);
-    let ws = WebSocketStream::from_raw(h3_stream, Role::Server, config);
+    let ws =
+        WebSocketStream::from_raw(h3_stream, Role::Server, config).with_immediate_write_shutdown();
 
     handler(ws, ws_req).await;
 
@@ -863,6 +946,15 @@ where
     Filter: Fn(&ExtendedConnectRequest) -> bool + Send + 'static,
 {
     use http::StatusCode;
+
+    if !config.http3.enable_connect_protocol {
+        let response = build_extended_connect_error(
+            StatusCode::NOT_IMPLEMENTED,
+            Some("Extended CONNECT is disabled"),
+        );
+        stream.send_response(response).await.ok();
+        return Ok(());
+    }
 
     if request.method() != Method::CONNECT {
         let response =
@@ -904,7 +996,8 @@ where
     stream.send_response(response).await.ok();
 
     let h3_stream = Stream::<Http3>::from_h3_server(stream);
-    let ws = WebSocketStream::from_raw(h3_stream, Role::Server, config);
+    let ws =
+        WebSocketStream::from_raw(h3_stream, Role::Server, config).with_immediate_write_shutdown();
 
     handler(ws, ws_req).await;
 

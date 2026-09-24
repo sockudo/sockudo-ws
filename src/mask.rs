@@ -52,7 +52,8 @@ pub(crate) fn generate_key_bytes() -> [u8; 16] {
 #[inline]
 fn generate_key_bytes_inner() -> [u8; 16] {
     thread_local! {
-        // Public handshake nonces must not consume the frame-mask RNG stream.
+        // Fork the thread RNG once at initialization; subsequent nonces do not
+        // consume the frame-mask stream. This is not cryptographic isolation.
         static NONCE_RNG: std::cell::RefCell<fastrand::Rng> =
             std::cell::RefCell::new(fastrand::Rng::new());
     }
