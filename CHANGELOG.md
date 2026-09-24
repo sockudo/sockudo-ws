@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Built-in HTTP/1 WebSocket server handshakes now reject nonzero or invalid `Content-Length` values and any `Transfer-Encoding` request header; absent and zero-valued lengths remain accepted. Checked HTTP/1 client request construction now rejects custom `Content-Length` and `Transfer-Encoding` headers.
 - The built-in HTTP/1 handshake parsers and Tokio/Compio clients and servers now require HTTP/1.1, a nonempty request Host, a request key that decodes to 16 bytes, and an exact `Upgrade: websocket` response with a `Connection: Upgrade` token. Checked request construction, including client connect with an empty Host, now rejects invalid required fields before sending; token matching treats only SP/HTAB as optional whitespace. The separate Axum upgrade extractor is unchanged.
 - HTTP/1 upgrade handshakes enforce the 8 KiB limit on the request or response header itself, not on WebSocket frame bytes read with it; oversized incomplete headers remain rejected.
 - Frame parsers with compression enabled, including unified and split readers, now reject RSV1 on continuation and control frames as soon as the base header arrives, without waiting for the payload; RSV1 remains valid on the first text or binary frame of a compressed message.
