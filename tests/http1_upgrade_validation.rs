@@ -112,27 +112,62 @@ fn response_requires_http_11() {
     ));
 }
 
+#[test]
+fn response_reports_non_switching_status_before_http_version() {
+    let response = b"HTTP/1.0 404 Not Found\r\n\r\n";
+
+    assert!(matches!(
+        parse_response(response),
+        Err(Error::HandshakeFailed("expected 101 Switching Protocols"))
+    ));
+}
+
 #[rstest]
-#[case::missing_upgrade("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\r\n")]
-#[case::missing_connection("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n")]
+#[case::missing_upgrade(
+    "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\r\n",
+    "missing Upgrade: websocket"
+)]
+#[case::missing_connection(
+    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n",
+    "missing Connection: Upgrade"
+)]
 #[case::wrong_upgrade(
-    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: notwebsocket\r\nConnection: Upgrade\r\n\r\n"
+    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: notwebsocket\r\nConnection: Upgrade\r\n\r\n",
+    "missing Upgrade: websocket"
 )]
 #[case::wrong_connection(
-    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: keep-alive\r\n\r\n"
+    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: keep-alive\r\n\r\n",
+    "missing Connection: Upgrade"
 )]
-fn response_requires_upgrade_and_connection_tokens(#[case] response: &str) {
-    assert!(parse_response(response.as_bytes()).is_err());
+fn response_requires_upgrade_and_connection_tokens(#[case] response: &str, #[case] expected: &str) {
+    assert!(matches!(
+        parse_response(response.as_bytes()),
+        Err(Error::HandshakeFailed(reason)) if reason == expected
+    ));
 }
 
 #[test]
-fn response_accepts_case_insensitive_tokens_in_lists() {
+fn response_accepts_case_insensitive_upgrade_and_connection_token_list() {
     let response = b"HTTP/1.1 101 Switching Protocols\r\n\
-        Upgrade:\t h2c, WebSocket \t\r\n\
+        Upgrade:\t WebSocket \t\r\n\
         Connection: keep-alive, UpGrAdE\r\n\
         \r\n";
 
     assert!(parse_response(response).unwrap().is_some());
+}
+
+#[rstest]
+#[case::protocol_list(
+    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c, WebSocket\r\nConnection: Upgrade\r\n\r\n"
+)]
+#[case::mixed_fields(
+    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n"
+)]
+fn response_rejects_upgrade_protocol_list(#[case] response: &str) {
+    assert!(matches!(
+        parse_response(response.as_bytes()),
+        Err(Error::HandshakeFailed("missing Upgrade: websocket"))
+    ));
 }
 
 #[test]

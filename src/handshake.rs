@@ -279,7 +279,6 @@ fn validate_request_fields(
     if !path.bytes().all(is_request_target_byte) {
         return Err(Error::InvalidHttp("invalid request target"));
     }
-    validate_header_value(key, "invalid Sec-WebSocket-Key")?;
     if !is_valid_websocket_key(key) {
         return Err(Error::InvalidHttp("invalid Sec-WebSocket-Key"));
     }
@@ -564,11 +563,11 @@ pub fn parse_response(buf: &[u8]) -> Result<Option<(HandshakeResponse<'_>, usize
 
             let status = res.code.unwrap_or(0);
 
-            if res.version != Some(1) {
-                return Err(Error::InvalidHttp("HTTP version must be 1.1"));
-            }
             if status != 101 {
                 return Err(Error::HandshakeFailed("expected 101 Switching Protocols"));
+            }
+            if res.version != Some(1) {
+                return Err(Error::InvalidHttp("HTTP version must be 1.1"));
             }
 
             let mut accept = None;
@@ -598,7 +597,11 @@ pub fn parse_response(buf: &[u8]) -> Result<Option<(HandshakeResponse<'_>, usize
                     }
                     extensions = Some(value);
                 } else if name.eq_ignore_ascii_case("upgrade") {
-                    upgrade |= has_token_ignore_case(value, "websocket");
+                    // RFC 6455 requires an exact response value, unlike the request-side list.
+                    if !value.eq_ignore_ascii_case("websocket") {
+                        return Err(Error::HandshakeFailed("missing Upgrade: websocket"));
+                    }
+                    upgrade = true;
                 } else if name.eq_ignore_ascii_case("connection") {
                     connection_upgrade |= has_token_ignore_case(value, "upgrade");
                 }
