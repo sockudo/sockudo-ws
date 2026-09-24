@@ -584,6 +584,77 @@ type CompioH3ServerRequestStream = h3::server::RequestStream<CompioH3BidiStream,
 #[cfg(feature = "http3")]
 type CompioH3SendRequest = h3::client::SendRequest<::compio::quic::h3::OpenStreams, Bytes>;
 
+#[cfg(feature = "http3")]
+trait CompioH3CancelableSend {
+    async fn send_data(&mut self, data: Bytes) -> std::result::Result<(), h3::error::StreamError>;
+    fn cancel_write(&mut self);
+}
+
+#[cfg(feature = "http3")]
+impl CompioH3CancelableSend for CompioH3ClientRequestStream {
+    async fn send_data(&mut self, data: Bytes) -> std::result::Result<(), h3::error::StreamError> {
+        h3::client::RequestStream::send_data(self, data).await
+    }
+
+    fn cancel_write(&mut self) {
+        self.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+    }
+}
+
+#[cfg(feature = "http3")]
+impl CompioH3CancelableSend for CompioH3ServerRequestStream {
+    async fn send_data(&mut self, data: Bytes) -> std::result::Result<(), h3::error::StreamError> {
+        h3::server::RequestStream::send_data(self, data).await
+    }
+
+    fn cancel_write(&mut self) {
+        self.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+    }
+}
+
+/// Resets an HTTP/3 stream if an accepted DATA write future is cancelled.
+#[cfg(feature = "http3")]
+struct CompioH3WriteGuard<'a, S: CompioH3CancelableSend> {
+    stream: &'a mut S,
+    write_cancelled: &'a mut bool,
+    armed: bool,
+}
+
+#[cfg(feature = "http3")]
+impl<'a, S: CompioH3CancelableSend> CompioH3WriteGuard<'a, S> {
+    fn new(stream: &'a mut S, write_cancelled: &'a mut bool) -> Self {
+        Self {
+            stream,
+            write_cancelled,
+            armed: true,
+        }
+    }
+
+    async fn send_data(&mut self, data: Bytes) -> std::result::Result<(), h3::error::StreamError> {
+        let result = self.stream.send_data(data).await;
+        self.armed = false;
+        result
+    }
+}
+
+#[cfg(feature = "http3")]
+impl<S: CompioH3CancelableSend> Drop for CompioH3WriteGuard<'_, S> {
+    fn drop(&mut self) {
+        if self.armed {
+            *self.write_cancelled = true;
+            self.stream.cancel_write();
+        }
+    }
+}
+
+#[cfg(feature = "http3")]
+fn compio_h3_cancelled_write_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        "HTTP/3 DATA write was cancelled",
+    )
+}
+
 /// HTTP/2 stream exposed through native Compio I/O traits.
 #[cfg(feature = "http2")]
 pub struct CompioHttp2Stream {
@@ -910,6 +981,7 @@ where
 pub struct CompioHttp3ClientStream {
     stream: CompioH3ClientRequestStream,
     recv_buf: BytesMut,
+    write_cancelled: bool,
     _endpoint: Option<::compio::quic::Endpoint>,
     _send_request: Option<CompioH3SendRequest>,
 }
@@ -925,6 +997,7 @@ impl CompioHttp3ClientStream {
         Self {
             stream,
             recv_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
+            write_cancelled: false,
             _endpoint: endpoint,
             _send_request: send_request,
         }
@@ -934,6 +1007,9 @@ impl CompioHttp3ClientStream {
 #[cfg(feature = "http3")]
 impl AsyncRead for CompioHttp3ClientStream {
     async fn read<B: IoBufMut>(&mut self, mut buf: B) -> BufResult<usize, B> {
+        if self.write_cancelled {
+            return BufResult(Err(compio_h3_cancelled_write_error()), buf);
+        }
         if self.recv_buf.is_empty() {
             let Some(result) = poll_read_until_cancelled(self.stream.recv_data()).await else {
                 return BufResult(Err(poll_read_cancelled()), buf);
@@ -960,6 +1036,9 @@ impl AsyncRead for CompioHttp3ClientStream {
 #[cfg(feature = "http3")]
 impl AsyncWrite for CompioHttp3ClientStream {
     async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+        if self.write_cancelled {
+            return BufResult(Err(compio_h3_cancelled_write_error()), buf);
+        }
         let bytes = buf.as_init();
         if bytes.is_empty() {
             return BufResult(Ok(0), buf);
@@ -967,17 +1046,25 @@ impl AsyncWrite for CompioHttp3ClientStream {
 
         let len = bytes.len();
         let data = Bytes::copy_from_slice(bytes);
-        match self.stream.send_data(data).await {
+        let mut write = CompioH3WriteGuard::new(&mut self.stream, &mut self.write_cancelled);
+        match write.send_data(data).await {
             Ok(()) => BufResult(Ok(len), buf),
             Err(e) => BufResult(Err(io::Error::other(e)), buf),
         }
     }
 
     async fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        if self.write_cancelled {
+            Err(compio_h3_cancelled_write_error())
+        } else {
+            Ok(())
+        }
     }
 
     async fn shutdown(&mut self) -> io::Result<()> {
+        if self.write_cancelled {
+            return Err(compio_h3_cancelled_write_error());
+        }
         self.stream.finish().await.map_err(io::Error::other)
     }
 }
@@ -987,6 +1074,7 @@ impl AsyncWrite for CompioHttp3ClientStream {
 pub struct CompioHttp3ServerStream {
     stream: CompioH3ServerRequestStream,
     recv_buf: BytesMut,
+    write_cancelled: bool,
 }
 
 #[cfg(feature = "http3")]
@@ -996,6 +1084,7 @@ impl CompioHttp3ServerStream {
         Self {
             stream,
             recv_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
+            write_cancelled: false,
         }
     }
 }
@@ -1003,6 +1092,9 @@ impl CompioHttp3ServerStream {
 #[cfg(feature = "http3")]
 impl AsyncRead for CompioHttp3ServerStream {
     async fn read<B: IoBufMut>(&mut self, mut buf: B) -> BufResult<usize, B> {
+        if self.write_cancelled {
+            return BufResult(Err(compio_h3_cancelled_write_error()), buf);
+        }
         if self.recv_buf.is_empty() {
             let Some(result) = poll_read_until_cancelled(self.stream.recv_data()).await else {
                 return BufResult(Err(poll_read_cancelled()), buf);
@@ -1029,6 +1121,9 @@ impl AsyncRead for CompioHttp3ServerStream {
 #[cfg(feature = "http3")]
 impl AsyncWrite for CompioHttp3ServerStream {
     async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+        if self.write_cancelled {
+            return BufResult(Err(compio_h3_cancelled_write_error()), buf);
+        }
         let bytes = buf.as_init();
         if bytes.is_empty() {
             return BufResult(Ok(0), buf);
@@ -1036,17 +1131,25 @@ impl AsyncWrite for CompioHttp3ServerStream {
 
         let len = bytes.len();
         let data = Bytes::copy_from_slice(bytes);
-        match self.stream.send_data(data).await {
+        let mut write = CompioH3WriteGuard::new(&mut self.stream, &mut self.write_cancelled);
+        match write.send_data(data).await {
             Ok(()) => BufResult(Ok(len), buf),
             Err(e) => BufResult(Err(io::Error::other(e)), buf),
         }
     }
 
     async fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        if self.write_cancelled {
+            Err(compio_h3_cancelled_write_error())
+        } else {
+            Ok(())
+        }
     }
 
     async fn shutdown(&mut self) -> io::Result<()> {
+        if self.write_cancelled {
+            return Err(compio_h3_cancelled_write_error());
+        }
         self.stream.finish().await.map_err(io::Error::other)
     }
 }
