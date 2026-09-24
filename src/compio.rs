@@ -585,43 +585,47 @@ type CompioH3ServerRequestStream = h3::server::RequestStream<CompioH3BidiStream,
 type CompioH3SendRequest = h3::client::SendRequest<::compio::quic::h3::OpenStreams, Bytes>;
 
 #[cfg(feature = "http3")]
-trait CompioH3CancelableSend {
+trait CompioH3CancellableSend {
     async fn send_data(&mut self, data: Bytes) -> std::result::Result<(), h3::error::StreamError>;
     fn cancel_write(&mut self);
 }
 
 #[cfg(feature = "http3")]
-impl CompioH3CancelableSend for CompioH3ClientRequestStream {
+impl CompioH3CancellableSend for CompioH3ClientRequestStream {
     async fn send_data(&mut self, data: Bytes) -> std::result::Result<(), h3::error::StreamError> {
         h3::client::RequestStream::send_data(self, data).await
     }
 
     fn cancel_write(&mut self) {
-        self.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+        let code = h3::error::Code::H3_REQUEST_CANCELLED;
+        self.stop_stream(code);
+        self.stop_sending(code);
     }
 }
 
 #[cfg(feature = "http3")]
-impl CompioH3CancelableSend for CompioH3ServerRequestStream {
+impl CompioH3CancellableSend for CompioH3ServerRequestStream {
     async fn send_data(&mut self, data: Bytes) -> std::result::Result<(), h3::error::StreamError> {
         h3::server::RequestStream::send_data(self, data).await
     }
 
     fn cancel_write(&mut self) {
-        self.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+        let code = h3::error::Code::H3_REQUEST_CANCELLED;
+        self.stop_stream(code);
+        self.stop_sending(code);
     }
 }
 
-/// Resets an HTTP/3 stream if an accepted DATA write future is cancelled.
+/// Cancels both directions of an HTTP/3 stream if an accepted DATA write is cancelled.
 #[cfg(feature = "http3")]
-struct CompioH3WriteGuard<'a, S: CompioH3CancelableSend> {
+struct CompioH3WriteGuard<'a, S: CompioH3CancellableSend> {
     stream: &'a mut S,
     write_cancelled: &'a mut bool,
     armed: bool,
 }
 
 #[cfg(feature = "http3")]
-impl<'a, S: CompioH3CancelableSend> CompioH3WriteGuard<'a, S> {
+impl<'a, S: CompioH3CancellableSend> CompioH3WriteGuard<'a, S> {
     fn new(stream: &'a mut S, write_cancelled: &'a mut bool) -> Self {
         Self {
             stream,
@@ -638,7 +642,7 @@ impl<'a, S: CompioH3CancelableSend> CompioH3WriteGuard<'a, S> {
 }
 
 #[cfg(feature = "http3")]
-impl<S: CompioH3CancelableSend> Drop for CompioH3WriteGuard<'_, S> {
+impl<S: CompioH3CancellableSend> Drop for CompioH3WriteGuard<'_, S> {
     fn drop(&mut self) {
         if self.armed {
             *self.write_cancelled = true;
@@ -977,6 +981,9 @@ where
 }
 
 /// HTTP/3 client stream exposed through native Compio I/O traits.
+///
+/// Cancelling a pending DATA write terminates this stream. Subsequent reads,
+/// writes, flushes, and shutdowns return `ConnectionAborted`.
 #[cfg(feature = "http3")]
 pub struct CompioHttp3ClientStream {
     stream: CompioH3ClientRequestStream,
@@ -1070,6 +1077,9 @@ impl AsyncWrite for CompioHttp3ClientStream {
 }
 
 /// HTTP/3 server stream exposed through native Compio I/O traits.
+///
+/// Cancelling a pending DATA write terminates this stream. Subsequent reads,
+/// writes, flushes, and shutdowns return `ConnectionAborted`.
 #[cfg(feature = "http3")]
 pub struct CompioHttp3ServerStream {
     stream: CompioH3ServerRequestStream,

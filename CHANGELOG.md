@@ -38,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Cancelled native Compio HTTP/3 DATA writes now reset only the affected WebSocket stream; subsequent operations on that stream fail with `ConnectionAborted`, while the multiplexed connection can open new streams.
+- Cancelled native Compio HTTP/3 DATA writes now abort both directions of the affected WebSocket stream with `H3_REQUEST_CANCELLED`; subsequent operations on that stream fail with `ConnectionAborted`, while the multiplexed connection can open new streams.
 - Built-in HTTP/1 WebSocket handshakes now reject repeated request `Sec-WebSocket-Key` and `Sec-WebSocket-Version` fields and repeated response `Sec-WebSocket-Accept` and `Sec-WebSocket-Extensions` fields. Repeated response `Sec-WebSocket-Protocol` was already rejected; request protocol and extension field handling is unchanged.
 - Built-in HTTP/1 WebSocket server handshakes now reject nonzero or invalid `Content-Length` values and any `Transfer-Encoding` request header; absent and zero-valued lengths remain accepted. Checked HTTP/1 client request construction now rejects custom `Content-Length` and `Transfer-Encoding` headers.
 - The built-in HTTP/1 handshake parsers and Tokio/Compio clients and servers now require HTTP/1.1, a nonempty request Host, a request key that decodes to 16 bytes, and an exact `Upgrade: websocket` response with a `Connection: Upgrade` token. Checked request construction, including client connect with an empty Host, now rejects invalid required fields before sending; token matching treats only SP/HTAB as optional whitespace. The separate Axum upgrade extractor is unchanged.

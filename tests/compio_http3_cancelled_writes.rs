@@ -1,9 +1,11 @@
 #![cfg(all(feature = "compio-runtime", feature = "http3"))]
 
 use std::io;
-use std::sync::Once;
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
+use compio::io::AsyncWriteExt;
+use futures_channel::oneshot;
 use futures_util::{SinkExt, StreamExt};
 use sockudo_ws::compio::{CompioHttp3Server, connect_http3_multiplexed};
 use sockudo_ws::{Config, Error, Message};
@@ -38,6 +40,16 @@ fn is_cancelled_write(error: &Error) -> bool {
     matches!(error, Error::Io(error) if error.kind() == io::ErrorKind::ConnectionAborted)
 }
 
+fn is_request_cancelled_stop(error: &io::Error) -> bool {
+    matches!(
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<h3::error::StreamError>()),
+        Some(h3::error::StreamError::RemoteTerminate { code, .. })
+            if *code == h3::error::Code::H3_REQUEST_CANCELLED
+    )
+}
+
 #[compio::test]
 async fn cancelled_client_write_makes_the_http3_stream_terminal() {
     const PAYLOAD_SIZE: usize = 4 * 1024 * 1024;
@@ -61,8 +73,16 @@ async fn cancelled_client_write_makes_the_http3_stream_terminal() {
                         compio::time::sleep(Duration::from_millis(100)).await;
                         let observed =
                             compio::time::timeout(Duration::from_secs(5), ws.next()).await;
+                        let stopped = compio::time::timeout(
+                            Duration::from_secs(5),
+                            ws.get_mut().write_all(vec![0x33; PAYLOAD_SIZE]),
+                        )
+                        .await;
                         observed_tx
-                            .send(matches!(observed, Ok(Some(Err(_)))))
+                            .send((
+                                matches!(observed, Ok(Some(Err(_)))),
+                                matches!(stopped, Ok(compio::buf::BufResult(Err(error), _)) if is_request_cancelled_stop(&error)),
+                            ))
                             .await
                             .unwrap();
                     } else {
@@ -107,12 +127,12 @@ async fn cancelled_client_write_makes_the_http3_stream_terminal() {
         .expect_err("cancelled HTTP/3 stream accepted another write");
     assert!(is_cancelled_write(&error));
     assert!(client.is_closed());
-    assert!(
-        observed_rx
-            .next()
-            .await
-            .expect("server stopped before reporting the reset")
-    );
+    let (peer_saw_reset, peer_write_stopped) = observed_rx
+        .next()
+        .await
+        .expect("server stopped before reporting the reset");
+    assert!(peer_saw_reset);
+    assert!(peer_write_stopped, "peer kept sending after cancellation");
 
     let mut replacement = connection
         .open_websocket("/replacement", None)
@@ -145,11 +165,14 @@ async fn cancelled_server_write_makes_the_http3_stream_terminal() {
             .build(),
     );
     let (terminal_tx, mut terminal_rx) = futures_channel::mpsc::unbounded();
+    let (release_tx, release_rx) = oneshot::channel();
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
 
     let server_task = compio::runtime::spawn(async move {
         server
             .serve(move |mut ws, request| {
                 let mut terminal_tx = terminal_tx.clone();
+                let release_rx = Arc::clone(&release_rx);
                 async move {
                     if request.path == "/cancelled-server-write" {
                         let cancelled = compio::time::timeout(
@@ -166,6 +189,8 @@ async fn cancelled_server_write_makes_the_http3_stream_terminal() {
                             .await
                             .expect_err("cancelled HTTP/3 stream accepted another write");
                         terminal_tx.send(is_cancelled_write(&error)).await.unwrap();
+                        let release_rx = release_rx.lock().unwrap().take().unwrap();
+                        let _ = release_rx.await;
                     } else {
                         assert_eq!(request.path, "/replacement");
                         let message = ws.next().await.unwrap().unwrap();
@@ -197,6 +222,16 @@ async fn cancelled_server_write_makes_the_http3_stream_terminal() {
             .await
             .expect("server stopped before reporting terminal state")
     );
+    let peer_write_stopped = matches!(
+        compio::time::timeout(
+            Duration::from_secs(5),
+            client.get_mut().write_all(vec![0x33; PAYLOAD_SIZE]),
+        )
+        .await,
+        Ok(compio::buf::BufResult(Err(error), _)) if is_request_cancelled_stop(&error)
+    );
+    release_tx.send(()).unwrap();
+    assert!(peer_write_stopped, "peer kept sending after cancellation");
 
     let mut replacement = connection
         .open_websocket("/replacement", None)
