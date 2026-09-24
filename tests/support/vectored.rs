@@ -8,6 +8,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 pub struct WriteProbe {
     vectored: bool,
     pending: bool,
+    terminal: Option<io::Result<usize>>,
     output: Arc<Mutex<Vec<u8>>>,
 }
 
@@ -35,6 +36,9 @@ impl AsyncWrite for WriteProbe {
         cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
+        if let Some(result) = self.terminal.take() {
+            return Poll::Ready(result);
+        }
         if self.pending {
             self.pending = false;
             cx.waker().wake_by_ref();
@@ -71,6 +75,7 @@ pub fn check_vectored_forwarding<S: AsyncWrite + Unpin>(wrap: impl Fn(WriteProbe
         let mut stream = wrap(WriteProbe {
             vectored,
             pending: true,
+            terminal: None,
             output: output.clone(),
         });
         assert_eq!(stream.is_write_vectored(), vectored);
@@ -109,5 +114,29 @@ pub fn check_vectored_forwarding<S: AsyncWrite + Unpin>(wrap: impl Fn(WriteProbe
                 Poll::Ready(Ok(0))
             ));
         }
+    }
+}
+
+/// A wrapper must leave zero writes and transport errors for its caller to handle.
+pub fn check_terminal_write_results<S: AsyncWrite + Unpin>(wrap: impl Fn(WriteProbe) -> S) {
+    for result in [Ok(0), Err(io::Error::from_raw_os_error(32))] {
+        let expected_error = result.as_ref().err().and_then(io::Error::raw_os_error);
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut stream = wrap(WriteProbe {
+            vectored: true,
+            pending: false,
+            terminal: Some(result),
+            output: output.clone(),
+        });
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let bufs = [IoSlice::new(b"header"), IoSlice::new(b"payload")];
+        match Pin::new(&mut stream).poll_write_vectored(&mut cx, &bufs) {
+            Poll::Ready(Ok(0)) => assert_eq!(expected_error, None),
+            Poll::Ready(Err(error)) if expected_error.is_some() => {
+                assert_eq!(error.raw_os_error(), expected_error);
+            }
+            other => panic!("unexpected terminal write result: {other:?}"),
+        }
+        assert!(output.lock().unwrap().is_empty());
     }
 }

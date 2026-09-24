@@ -218,7 +218,7 @@ Compressed (RSV1) frames are skipped, since their bytes are validated after infl
 * Text messages are returned as `Bytes` views into the read buffer, no copy on receive.
 * `encode_frame` writes header and payload in one reserved region; masked client encode fuses the
   copy and the XOR.
-* `pubsub` uses `DashMap` and clones `Bytes` (refcount) per subscriber, not the payload.
+* `pubsub` snapshots recipient senders under one membership `RwLock`, sends after unlocking, and clones `Bytes` (refcount) per subscriber, not the payload.
 * Memory: `Config::default()` reserves 64 KiB read + 16 KiB cork per connection. RSS per idle
   connection is much lower because untouched pages are not resident, which matches the 35 KiB
   the competitor measured.
@@ -265,10 +265,10 @@ These are design-level and are listed so the next round has a target list.
 
 ```bash
 # primitives
-cargo bench --bench websocket_bench -- '^mask/|^utf8/'
+RUSTFLAGS="-C target-cpu=native" cargo bench --bench websocket_bench -- '^mask/|^utf8/'
 
 # Autobahn (Rust port of the suite)
-cargo build --release --bin autobahn-server && ./target/release/autobahn-server &
+RUSTFLAGS="-C target-cpu=native" cargo build --release --bin autobahn-server && ./target/release/autobahn-server &
 /path/to/autobahn-testsuite-rs/target/release/wstest -m fuzzingclient \
     -s autobahn/fuzzingclient.json --concurrency 8
 ```
@@ -282,14 +282,11 @@ repo; it is ~150 lines and is described in section 2.2 closely enough to recreat
 
 All of section 4 except the runtime is now done, in the working tree after v2.1.0.
 
-### 6.1 Batch-scoped write coalescing (`Config::write_coalescing`, default on)
+### 6.1 Explicit feed batching (`Config::write_coalescing`, default on)
 
-`Sink::poll_flush` returns `Ready` without writing while inbound messages that were already
-parsed are still queued for the application and the write buffer is under the high-water mark.
-`poll_next` writes everything in one vectored write before it next waits on the transport, so a
-reply is never delayed past the end of the read batch it belongs to. This is the uWebSockets
-cork, scoped to a read batch instead of an event-loop callback. Sequential request/response
-traffic (nothing queued) is unaffected; bursts are where it pays.
+Tokio `SinkExt::feed()` buffers frames; readiness drains at the smaller of the high-water mark and `max_backpressure` before accepting another frame. With `write_coalescing=false`, readiness drains any pending output. Standard `send()` and `flush()` always flush the transport. Flush after each batch before waiting for replies or pausing reads; `poll_next` also flushes before waiting for transport input.
+
+The measurements below used the earlier implicit coalescing API and have not been rerun for this contract change. They are historical evidence, not performance claims for the current feed/flush API.
 
 Same neutral client as section 2.2, `depth` messages in flight per connection:
 
@@ -307,9 +304,7 @@ The coalesced numbers are 2x at depth 8 on one connection and 15x at depth 32 on
 that is the syscall count going from one per message to one per batch. Sequential traffic is
 within noise of before.
 
-Regression tests: `read_batch_answered_with_sends_is_one_write_when_coalescing` counts the
-transport writes (1 vs 3), and `coalesced_frames_are_written_before_waiting_on_the_transport`
-proves the batch is flushed before the stream blocks on the next read.
+Regression tests: `read_batch_answered_with_feeds_is_one_write_when_coalescing` counts the transport writes (1 vs 3), and `coalesced_frames_are_written_before_waiting_on_the_transport` proves the batch is flushed before the stream blocks on the next read.
 
 ### 6.2 Zero-copy large sends
 
