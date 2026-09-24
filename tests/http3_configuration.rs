@@ -65,6 +65,7 @@ async fn compio_server_rejects_unrepresentable_idle_timeout() {
     );
 }
 
+#[cfg(feature = "tokio-runtime")]
 #[tokio::test]
 async fn tokio_server_rejects_unrepresentable_stream_window() {
     let (server_tls, _) = h3_support::tls_configs();
@@ -81,6 +82,7 @@ async fn tokio_server_rejects_unrepresentable_stream_window() {
     );
 }
 
+#[cfg(feature = "tokio-runtime")]
 #[tokio::test]
 async fn tokio_server_rejects_invalid_udp_payload_size() {
     let (server_tls, _) = h3_support::tls_configs();
@@ -97,6 +99,7 @@ async fn tokio_server_rejects_invalid_udp_payload_size() {
     );
 }
 
+#[cfg(feature = "tokio-runtime")]
 #[tokio::test]
 async fn tokio_client_rejects_disabled_extended_connect_before_connecting() {
     let (_, client_tls) = h3_support::tls_configs();
@@ -117,6 +120,7 @@ async fn tokio_client_rejects_disabled_extended_connect_before_connecting() {
     ));
 }
 
+#[cfg(feature = "tokio-runtime")]
 #[tokio::test]
 async fn disabled_server_extended_connect_rejects_a_real_request() {
     use sockudo_ws::{Config, Error, Http3, WebSocketClient, WebSocketServer};
@@ -201,6 +205,7 @@ async fn compio_multiplexed_client_rejects_disabled_connect_before_connecting() 
 #[case::server(true, false)]
 #[case::client(false, false)]
 #[case::multiplexed_client(false, true)]
+#[cfg(feature = "tokio-runtime")]
 #[tokio::test]
 async fn tokio_configured_idle_timeout_closes_an_established_connection(
     #[case] configure_server: bool,
