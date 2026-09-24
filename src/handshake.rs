@@ -6,10 +6,11 @@
 //! - Minimal allocations
 //! - Fast Base64/SHA-1 for accept key generation
 
-use std::collections::HashSet;
+use std::{borrow::Cow, collections::HashSet};
 
 use base64::Engine;
 use bytes::{BufMut, Bytes, BytesMut};
+use http::Uri;
 use sha1::{Digest, Sha1};
 
 use crate::WS_GUID;
@@ -32,9 +33,13 @@ const RESERVED_HANDSHAKE_HEADERS: &[&str] = &[
 /// WebSocket handshake request (server-side)
 #[derive(Debug)]
 pub struct HandshakeRequest<'a> {
-    /// The request path
-    pub path: &'a str,
-    /// The Host header
+    /// The resource name derived from the request target.
+    ///
+    /// Usually borrowed from the request; query-only absolute targets allocate
+    /// a leading `/`. Use `path.as_ref()` when a borrowed `&str` is required.
+    pub path: Cow<'a, str>,
+    /// The effective authority from an absolute target or the Host header.
+    /// A Host header is still required for absolute-form requests.
     pub host: Option<&'a str>,
     /// The Sec-WebSocket-Key header
     pub key: &'a str,
@@ -51,6 +56,17 @@ pub struct HandshakeRequest<'a> {
 /// Parse a WebSocket upgrade request
 ///
 /// Returns the parsed request and the number of bytes consumed.
+///
+/// Used by the built-in Tokio and Compio HTTP/1 server handshakes; Axum's
+/// upgrade extractor uses Hyper's URI parsing instead.
+///
+/// Accepts origin-form and absolute HTTP/HTTPS targets. Path and query characters
+/// follow `http::Uri`'s compatibility rules (including raw UTF-8 and JSON path
+/// characters), with an additional requirement that percent escapes contain two
+/// hexadecimal digits. This is not strict RFC 3986 character validation.
+/// Fragments, unsupported target forms or schemes, userinfo, empty absolute hosts
+/// and nonnumeric ports are rejected. A Host header remains required even when
+/// the absolute target supplies the effective authority.
 pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut headers);
@@ -152,7 +168,11 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>
                 return Err(Error::HandshakeFailed("invalid Sec-WebSocket-Key"));
             }
 
-            let path = req.path.unwrap_or("/");
+            let target = req
+                .path
+                .ok_or(Error::InvalidHttp("missing request target"))?;
+            let (path, host) = parse_server_request_target(target, host)
+                .ok_or(Error::InvalidHttp("invalid request target"))?;
 
             Ok(Some((
                 HandshakeRequest {
@@ -193,6 +213,95 @@ fn is_valid_websocket_key(value: &str) -> bool {
     base64::engine::general_purpose::STANDARD
         .decode_slice(value, &mut decoded)
         .is_ok_and(|len| len == 16)
+}
+
+fn parse_server_request_target<'a>(
+    target: &'a str,
+    header_host: &'a str,
+) -> Option<(Cow<'a, str>, &'a str)> {
+    if is_valid_origin_form(target) {
+        return Some((Cow::Borrowed(target), header_host));
+    }
+
+    let uri = target.parse::<Uri>().ok()?;
+    let scheme = uri.scheme_str()?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+
+    let parsed_authority = uri.authority()?;
+    if parsed_authority.host().is_empty() || parsed_authority.as_str().contains('@') {
+        return None;
+    }
+    let port_suffix = parsed_authority
+        .as_str()
+        .get(parsed_authority.host().len()..)?;
+    if !port_suffix.is_empty()
+        && !port_suffix
+            .strip_prefix(':')
+            .is_some_and(|port| port.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+
+    let scheme_end = target.find("://")?;
+    let authority_start = scheme_end + 3;
+    let authority_end = authority_start.checked_add(parsed_authority.as_str().len())?;
+    let authority = target.get(authority_start..authority_end)?;
+    if authority != parsed_authority.as_str() {
+        return None;
+    }
+
+    let resource = target.get(authority_end..)?;
+    // Uri may discard a fragment; a request target must never contain one,
+    // including in the query-only branch where we synthesize a leading slash.
+    if resource.contains('#') || !has_valid_percent_encoding(resource) {
+        return None;
+    }
+    let path = if resource.is_empty() {
+        Cow::Borrowed("/")
+    } else if resource.starts_with('?') {
+        Cow::Owned(format!("/{resource}"))
+    } else if uri
+        .path_and_query()
+        .is_some_and(|path_and_query| path_and_query.as_str() == resource)
+    {
+        Cow::Borrowed(resource)
+    } else {
+        return None;
+    };
+
+    Some((path, authority))
+}
+
+fn is_valid_origin_form(target: &str) -> bool {
+    target.starts_with('/')
+        && has_valid_percent_encoding(target)
+        && target.parse::<Uri>().is_ok_and(|uri| {
+            uri.scheme().is_none()
+                && uri.authority().is_none()
+                && uri
+                    .path_and_query()
+                    .is_some_and(|path_and_query| path_and_query.as_str() == target)
+        })
+}
+
+fn has_valid_percent_encoding(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+
+    while let Some(offset) = bytes[index..].iter().position(|byte| *byte == b'%') {
+        index += offset;
+        let Some(encoded) = bytes.get(index + 1..index + 3) else {
+            return false;
+        };
+        if !encoded.iter().all(u8::is_ascii_hexdigit) {
+            return false;
+        }
+        index += 3;
+    }
+
+    true
 }
 
 /// Generate the Sec-WebSocket-Accept key
