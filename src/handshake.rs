@@ -25,6 +25,8 @@ const RESERVED_HANDSHAKE_HEADERS: &[&str] = &[
     "sec-websocket-version",
     "sec-websocket-protocol",
     "sec-websocket-extensions",
+    "content-length",
+    "transfer-encoding",
 ];
 
 /// WebSocket handshake request (server-side)
@@ -111,6 +113,16 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>
                     && has_token_ignore_case(value, "upgrade")
                 {
                     connection_upgrade = true;
+                } else if name.eq_ignore_ascii_case("content-length") {
+                    if !is_zero_content_length(value) {
+                        return Err(Error::InvalidHttp(
+                            "WebSocket handshake must not contain a body",
+                        ));
+                    }
+                } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                    return Err(Error::InvalidHttp(
+                        "WebSocket handshake must not use Transfer-Encoding",
+                    ));
                 }
             }
 
@@ -155,6 +167,13 @@ pub fn parse_request(buf: &[u8]) -> Result<Option<(HandshakeRequest<'_>, usize)>
         Ok(httparse::Status::Partial) => Ok(None),
         Err(_) => Err(Error::InvalidHttp("failed to parse HTTP request")),
     }
+}
+
+fn is_zero_content_length(value: &str) -> bool {
+    value.split(',').all(|length| {
+        let length = length.trim_matches([' ', '\t']);
+        !length.is_empty() && length.bytes().all(|byte| byte == b'0')
+    })
 }
 
 /// Returns true if the comma-separated header `value` contains `token`
@@ -235,13 +254,13 @@ pub fn build_request(
 /// HTTP token syntax, values must not contain disallowed control bytes, and
 /// Host must be nonempty, the key must encode 16 bytes, and WebSocket protocol
 /// and extension values must follow their handshake field grammar. Headers
-/// managed by the WebSocket handshake cannot be overridden.
+/// managed by the WebSocket handshake and request body framing headers cannot
+/// be supplied.
 ///
 /// # Errors
 ///
 /// Returns [`Error::InvalidHttp`] if the request target or a header name or
-/// value is invalid, or if a custom header conflicts with a handshake-managed
-/// header.
+/// value is invalid, or if a custom header uses a reserved name.
 pub fn build_request_with_headers(
     host: &str,
     path: &str,
