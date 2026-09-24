@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- HTTP/1 WebSocket upgrades now require HTTP/1.1, a nonempty Host and a 16-byte decoded request key, and the response's Upgrade and Connection tokens. The checked request builder rejects an empty Host or invalid key; only SP/HTAB count as optional whitespace around handshake values.
 - HTTP/1 upgrade handshakes enforce the 8 KiB limit on the request or response header itself, not on WebSocket frame bytes read with it; oversized incomplete headers remain rejected.
 - Frame parsers with compression enabled, including unified and split readers, now reject RSV1 on continuation and control frames as soon as the base header arrives, without waiting for the payload; RSV1 remains valid on the first text or binary frame of a compressed message.
 - Splitting a Tokio or Compio stream now preserves partially parsed frames and receive-side fragment/UTF-8 state. Compressed protocol splitting retains parser progress while applying the supplied frame and message limits, including a lowered frame limit for an already accepted header.
