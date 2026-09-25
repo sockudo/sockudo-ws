@@ -18,18 +18,25 @@ jobs:
 
   test:
     name: Test (${{ matrix.name }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: default
+            runner: ubuntu-latest
+            args: ""
+          - name: arm64
+            runner: ubuntu-24.04-arm
             args: ""
           - name: all-features
+            runner: ubuntu-latest
             args: --all-features
           - name: tokio
+            runner: ubuntu-latest
             args: --no-default-features --features tokio-runtime,http2,http3
           - name: compio
+            runner: ubuntu-latest
             args: --no-default-features --features compio-runtime,http2,http3
     steps:
       - uses: actions/checkout@v4
@@ -53,7 +60,7 @@ jobs:
         run: cargo test --locked --doc --all-features
 
       - name: Clippy
-        if: matrix.name == 'all-features' || matrix.name == 'default'
+        if: matrix.name == 'all-features' || matrix.name == 'default' || matrix.name == 'arm64'
         run: cargo clippy --locked ${{ matrix.args }} --all-targets -- -D warnings
 
   fmt:
