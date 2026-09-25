@@ -327,3 +327,33 @@ strip = true
 opt-level = 3
 lto = "thin"
 debug = true
+
+[[bench]]
+name = "protocol_bench"
+harness = false
+required-features = ["tokio-runtime"]
+
+[[bench]]
+name = "masking_bench"
+harness = false
+required-features = ["tokio-runtime"]
+
+[[bench]]
+name = "client_mask_bench"
+harness = false
+required-features = ["tokio-runtime"]
+
+[[bench]]
+name = "deflate_input_bench"
+harness = false
+required-features = ["tokio-runtime", "permessage-deflate"]
+
+[[bench]]
+name = "deflate_capacity_bench"
+harness = false
+required-features = ["tokio-runtime", "permessage-deflate"]
+
+[[bench]]
+name = "services_bench"
+harness = false
+required-features = ["tokio-runtime", "permessage-deflate"]
