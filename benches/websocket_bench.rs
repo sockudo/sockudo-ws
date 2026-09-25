@@ -106,6 +106,12 @@ fn bench_parse(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("masked", size), &frame_data, |b, data| {
             let mut parser = FrameParser::new(1024 * 1024, true);
+            let mut check = BytesMut::from(data.as_ref());
+            assert_eq!(
+                parser.parse(&mut check).unwrap().unwrap().payload.as_ref(),
+                payload.as_slice()
+            );
+            assert!(check.is_empty());
 
             b.iter_batched(
                 || BytesMut::from(data.as_ref()),

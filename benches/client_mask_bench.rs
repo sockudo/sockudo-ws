@@ -10,7 +10,7 @@ use std::time::Instant;
 use bytes::BytesMut;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use futures_util::{SinkExt, StreamExt};
-use sockudo_ws::frame::{OpCode, encode_frame};
+use sockudo_ws::frame::{FrameParser, OpCode, encode_frame};
 use sockudo_ws::{Config, Message, WebSocketStream};
 
 fn bench_encoding(c: &mut Criterion) {
@@ -38,6 +38,22 @@ fn bench_encoding(c: &mut Criterion) {
                 (output.as_ptr() as usize + prefix_len + header_len) & 15,
                 destination_offset
             );
+            encode_frame(
+                &mut output,
+                OpCode::Binary,
+                payload,
+                true,
+                Some([0x37, 0xfa, 0x21, 0x3d]),
+            );
+            let mut encoded = BytesMut::from(&output[prefix_len..]);
+            let decoded = FrameParser::new(65536, true)
+                .parse(&mut encoded)
+                .unwrap()
+                .unwrap();
+            assert_eq!(decoded.payload.as_ref(), payload);
+            assert!(encoded.is_empty());
+            assert!(output[..prefix_len].iter().all(|&byte| byte == 0xa5));
+            drop(decoded);
             group.throughput(Throughput::Bytes(size as u64));
             group.bench_function(
                 BenchmarkId::new(

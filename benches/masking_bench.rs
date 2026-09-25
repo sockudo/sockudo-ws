@@ -26,6 +26,14 @@ fn bench_mask(c: &mut Criterion) {
             let start = storage.as_ptr().align_offset(16) + offset;
             let data = &mut storage[start..start + size];
             assert_eq!(data.as_ptr() as usize & 15, offset);
+            let mask = [0x37, 0xfa, 0x21, 0x3d];
+            let expected: Vec<_> = data
+                .iter()
+                .enumerate()
+                .map(|(i, byte)| byte ^ mask[i & 3])
+                .collect();
+            apply_mask(data, mask);
+            assert_eq!(data, expected);
             group.throughput(Throughput::Bytes(size as u64));
             group.bench_function(BenchmarkId::new(format!("offset_{offset}"), size), |b| {
                 b.iter(|| apply_mask(black_box(&mut *data), black_box([0x37, 0xfa, 0x21, 0x3d])));
@@ -54,8 +62,8 @@ fn bench_parse(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_function(BenchmarkId::from_parameter(size), |b| {
             b.iter(|| {
-                // Include input allocation/copy and frame destruction, matching
-                // the existing parsing benchmark rather than timing XOR alone.
+                // Include input allocation/copy and frame destruction. Unlike
+                // websocket_bench's batched parser case, this times input preparation.
                 let mut input = BytesMut::from(wire.as_ref());
                 black_box(parser.parse(black_box(&mut input)).unwrap().unwrap());
             });

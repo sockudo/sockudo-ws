@@ -89,6 +89,19 @@ fn bench_shared_compression(c: &mut Criterion) {
 
     for workers in [1, 4, 8, 16] {
         let pool = Arc::new(SharedCompressorPool::new(DeflateConfig::default()));
+        let compressed = pool
+            .compress(&payload)
+            .unwrap()
+            .expect("repeated payload must compress");
+        let mut decoder = DeflateDecoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, true);
+        assert_eq!(
+            decoder
+                .decompress(&compressed, payload.len())
+                .unwrap()
+                .as_ref(),
+            payload.as_slice()
+        );
+        drop(compressed);
         group.throughput(Throughput::Elements(workers as u64));
         group.bench_function(BenchmarkId::from_parameter(workers), |b| {
             b.iter_custom(|iterations| {
