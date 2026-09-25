@@ -258,6 +258,9 @@ enum ParseState {
     Mask,
     /// Waiting for payload
     Payload,
+    /// A limit change rejected an already accepted header.
+    #[cfg(feature = "permessage-deflate")]
+    FrameTooLarge,
 }
 
 /// High-performance frame parser
@@ -275,7 +278,7 @@ pub struct FrameParser {
     max_frame_size: usize,
     /// Whether to expect masked frames (server mode)
     expect_masked: bool,
-    /// Whether RSV1 is allowed (compression enabled)
+    /// Whether RSV1 is allowed on text and binary frames (compression enabled)
     allow_rsv1: bool,
     /// Number of payload bytes at the front of the caller's buffer that have
     /// already been unmasked while waiting for the rest of the frame.
@@ -317,7 +320,10 @@ impl FrameParser {
         }
     }
 
-    /// Create a new frame parser with compression support
+    /// Create a new frame parser with compression support.
+    ///
+    /// RSV1 is accepted only on text and binary frames; control and continuation
+    /// frames with RSV1 are rejected as soon as the base header is available.
     pub fn with_compression(max_frame_size: usize, expect_masked: bool) -> Self {
         Self {
             state: ParseState::Header,
@@ -351,7 +357,22 @@ impl FrameParser {
         })
     }
 
-    /// Enable or disable RSV1 (compression) support
+    /// Update the reader limit without losing a partially received frame.
+    #[cfg(feature = "permessage-deflate")]
+    pub(crate) fn set_max_frame_size(&mut self, max_frame_size: usize) {
+        self.max_frame_size = max_frame_size;
+        // Splitting a compressed protocol can lower the frame limit after a
+        // header was accepted. Check once here, not on every payload read.
+        if self
+            .header
+            .as_ref()
+            .is_some_and(|header| header.payload_len > max_frame_size as u64)
+        {
+            self.state = ParseState::FrameTooLarge;
+        }
+    }
+
+    /// Enable or disable RSV1 (compression) support on text and binary frames.
     pub fn set_compression(&mut self, enabled: bool) {
         self.allow_rsv1 = enabled;
     }
@@ -393,7 +414,10 @@ impl FrameParser {
                     let rsv3 = b0 & 0x10 != 0;
 
                     // Quick RSV validation
-                    if (rsv1 && !self.allow_rsv1) || rsv2 || rsv3 {
+                    if (rsv1 && (!self.allow_rsv1 || !matches!(b0 & 0x0F, 0x1 | 0x2)))
+                        || rsv2
+                        || rsv3
+                    {
                         return self.parse_slow(buf);
                     }
 
@@ -401,6 +425,10 @@ impl FrameParser {
                         // Control frame fragmentation check
                         if opcode.is_control() && !fin {
                             return Err(Error::Protocol("control frame must not be fragmented"));
+                        }
+
+                        if payload_len > self.max_frame_size {
+                            return Err(Error::FrameTooLarge);
                         }
 
                         // Extract payload
@@ -445,7 +473,10 @@ impl FrameParser {
                     let rsv3 = b0 & 0x10 != 0;
 
                     // Quick RSV validation
-                    if (rsv1 && !self.allow_rsv1) || rsv2 || rsv3 {
+                    if (rsv1 && (!self.allow_rsv1 || !matches!(b0 & 0x0F, 0x1 | 0x2)))
+                        || rsv2
+                        || rsv3
+                    {
                         return self.parse_slow(buf);
                     }
 
@@ -453,6 +484,10 @@ impl FrameParser {
                         // Control frame fragmentation check
                         if opcode.is_control() && !fin {
                             return Err(Error::Protocol("control frame must not be fragmented"));
+                        }
+
+                        if payload_len > self.max_frame_size {
+                            return Err(Error::FrameTooLarge);
                         }
 
                         // Extract mask
@@ -497,6 +532,8 @@ impl FrameParser {
                 );
             }
             match self.state {
+                #[cfg(feature = "permessage-deflate")]
+                ParseState::FrameTooLarge => return Err(Error::FrameTooLarge),
                 ParseState::Header => {
                     if buf.len() < 2 {
                         return Ok(None);
@@ -513,7 +550,7 @@ impl FrameParser {
                     let rsv3 = b0 & 0x10 != 0;
 
                     // Check RSV bits (must be 0 unless extension negotiated)
-                    // RSV1 is allowed when compression is enabled
+                    // RSV1 is allowed only on the first data frame when compression is enabled.
                     if rsv1 && !self.allow_rsv1 {
                         return Err(Error::Protocol(
                             "RSV1 must be 0 (compression not negotiated)",
@@ -525,6 +562,9 @@ impl FrameParser {
 
                     let opcode =
                         OpCode::from_u8(b0 & 0x0F).ok_or(Error::InvalidFrame("invalid opcode"))?;
+                    if rsv1 && !matches!(opcode, OpCode::Text | OpCode::Binary) {
+                        return Err(Error::Protocol("RSV1 on control or continuation frame"));
+                    }
 
                     // Control frames must not be fragmented
                     if opcode.is_control() && !fin {
