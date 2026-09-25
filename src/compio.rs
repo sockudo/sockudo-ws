@@ -136,20 +136,26 @@ struct CompioSplitShared {
     epoch: Instant,
     /// Milliseconds since `epoch` of the last inbound data frame (reader -> driver)
     last_inbound_ms: Cell<u64>,
+    /// Snapshot of the unified heartbeat's activity tracking state at split time.
+    tracks_inbound_activity: bool,
 }
 
 impl CompioSplitShared {
-    fn new(closed: bool) -> Rc<Self> {
+    fn new(closed: bool, tracks_inbound_activity: bool) -> Rc<Self> {
         Rc::new(Self {
             status: Cell::new(if closed { SPLIT_CLOSED } else { SPLIT_OPEN }),
             terminal: Cell::new(closed.then_some(CompioTerminalCause::ConnectionClosed)),
             epoch: Instant::now(),
             last_inbound_ms: Cell::new(0),
+            tracks_inbound_activity,
         })
     }
 
     #[inline]
     fn note_inbound(&self) {
+        if !self.tracks_inbound_activity {
+            return;
+        }
         let now_ms = self.epoch.elapsed().as_millis() as u64;
         self.last_inbound_ms
             .set(self.last_inbound_ms.get().max(now_ms));
@@ -1937,9 +1943,16 @@ where
         // Reuse the message Vec across reads; messages are popped from the
         // back, so keep them in reverse order.
         debug_assert!(self.pending_messages.is_empty());
-        let result = self
-            .protocol
-            .process_into(&mut self.read_buf, &mut self.pending_messages);
+        let mut accepted_fragment = false;
+        let result = self.protocol.process_into_with_activity(
+            &mut self.read_buf,
+            &mut self.pending_messages,
+            &mut accepted_fragment,
+        );
+        if accepted_fragment && self.heartbeat.tracks_inbound_activity() {
+            self.heartbeat
+                .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
+        }
         // Refresh even on error: the accepted prefix may already contain Close.
         self.batch_has_close = self.pending_messages.iter().any(Message::is_close);
         self.pending_messages.reverse();
@@ -2019,10 +2032,13 @@ where
         let (application_tx, application_rx) = mpsc::channel(SPLIT_APPLICATION_CAPACITY);
         let (cancel_tx, cancel_rx) = mpsc::unbounded();
         let (terminal_tx, terminal_rx) = mpsc::unbounded();
-        let shared = CompioSplitShared::new(!matches!(
-            self.state,
-            CompioStreamState::Open | CompioStreamState::ReadErrorPending
-        ));
+        let shared = CompioSplitShared::new(
+            !matches!(
+                self.state,
+                CompioStreamState::Open | CompioStreamState::ReadErrorPending
+            ),
+            self.heartbeat.tracks_inbound_activity(),
+        );
         // Splitting must not reopen application writes after a known parse error.
         // A preceding accepted Close still needs its automatic response.
         if self.pending_parse_error.is_some() {
@@ -2226,11 +2242,16 @@ where
 
             if !self.read_buf.is_empty() {
                 debug_assert!(self.pending_messages.is_empty());
-                match self
-                    .protocol
-                    .process_into(&mut self.read_buf, &mut self.pending_messages)
-                {
+                let mut accepted_fragment = false;
+                match self.protocol.process_into_with_activity(
+                    &mut self.read_buf,
+                    &mut self.pending_messages,
+                    &mut accepted_fragment,
+                ) {
                     Ok(()) => {
+                        if accepted_fragment {
+                            self.shared.note_inbound();
+                        }
                         self.pending_messages.reverse();
                         if !self.pending_messages.is_empty() {
                             continue;
@@ -3309,9 +3330,16 @@ where
         // Reuse the message Vec across reads; messages are popped from the
         // back, so keep them in reverse order.
         debug_assert!(self.pending_messages.is_empty());
-        let result = self
-            .protocol
-            .process_into(&mut self.read_buf, &mut self.pending_messages);
+        let mut accepted_fragment = false;
+        let result = self.protocol.process_into_with_activity(
+            &mut self.read_buf,
+            &mut self.pending_messages,
+            &mut accepted_fragment,
+        );
+        if accepted_fragment && self.heartbeat.tracks_inbound_activity() {
+            self.heartbeat
+                .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
+        }
         // Refresh even on error: the accepted prefix may already contain Close.
         self.batch_has_close = self.pending_messages.iter().any(Message::is_close);
         self.pending_messages.reverse();
@@ -3392,10 +3420,13 @@ where
         let (application_tx, application_rx) = mpsc::channel(SPLIT_APPLICATION_CAPACITY);
         let (cancel_tx, cancel_rx) = mpsc::unbounded();
         let (terminal_tx, terminal_rx) = mpsc::unbounded();
-        let shared = CompioSplitShared::new(!matches!(
-            self.state,
-            CompioStreamState::Open | CompioStreamState::ReadErrorPending
-        ));
+        let shared = CompioSplitShared::new(
+            !matches!(
+                self.state,
+                CompioStreamState::Open | CompioStreamState::ReadErrorPending
+            ),
+            self.heartbeat.tracks_inbound_activity(),
+        );
         // Splitting must not reopen application writes after a known parse error.
         // A preceding accepted Close still needs its automatic response.
         if self.pending_parse_error.is_some() {
@@ -3526,11 +3557,16 @@ where
 
             if !self.read_buf.is_empty() {
                 debug_assert!(self.pending_messages.is_empty());
-                match self
-                    .protocol
-                    .process_into(&mut self.read_buf, &mut self.pending_messages)
-                {
+                let mut accepted_fragment = false;
+                match self.protocol.process_into_with_activity(
+                    &mut self.read_buf,
+                    &mut self.pending_messages,
+                    &mut accepted_fragment,
+                ) {
                     Ok(()) => {
+                        if accepted_fragment {
+                            self.shared.note_inbound();
+                        }
                         self.pending_messages.reverse();
                         if !self.pending_messages.is_empty() {
                             continue;

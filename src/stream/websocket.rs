@@ -393,9 +393,16 @@ where
         // Reuse the message Vec across reads (no allocation per read). Messages
         // are popped from the back, so store them in reverse order.
         debug_assert!(self.pending_messages.is_empty());
-        let result = self
-            .protocol
-            .process_into(&mut self.read_buf, &mut self.pending_messages);
+        let mut accepted_fragment = false;
+        let result = self.protocol.process_into_with_activity(
+            &mut self.read_buf,
+            &mut self.pending_messages,
+            &mut accepted_fragment,
+        );
+        if accepted_fragment && self.heartbeat.tracks_inbound_activity() {
+            self.heartbeat
+                .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
+        }
         // process_into preserves accepted messages even when a later frame fails.
         self.batch_has_close = self.pending_messages.iter().any(Message::is_close);
         self.pending_messages.reverse();
@@ -1114,10 +1121,12 @@ struct SplitShared {
     epoch: tokio::time::Instant,
     /// Milliseconds since `epoch` of the last inbound data frame (reader -> driver)
     last_inbound_ms: AtomicU64,
+    /// Snapshot of the unified heartbeat's activity tracking state at split time.
+    tracks_inbound_activity: bool,
 }
 
 impl SplitShared {
-    fn new(closed: bool) -> Arc<Self> {
+    fn new(closed: bool, tracks_inbound_activity: bool) -> Arc<Self> {
         let (terminal_tx, _) = watch::channel(closed.then_some(TerminalCause::ConnectionClosed));
         Arc::new(Self {
             status: AtomicU8::new(if closed { SPLIT_CLOSED } else { SPLIT_OPEN }),
@@ -1125,11 +1134,15 @@ impl SplitShared {
             cancel: CancellationToken::new(),
             epoch: tokio::time::Instant::now(),
             last_inbound_ms: AtomicU64::new(0),
+            tracks_inbound_activity,
         })
     }
 
     #[inline]
     fn note_inbound(&self) {
+        if !self.tracks_inbound_activity {
+            return;
+        }
         let now_ms = self.epoch.elapsed().as_millis() as u64;
         self.last_inbound_ms.fetch_max(now_ms, Ordering::Relaxed);
     }
@@ -1448,10 +1461,13 @@ where
         let (reader, writer) = SplitTransport::pair(self.inner);
         let transport = reader.clone();
         let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
-        let shared = SplitShared::new(!matches!(
-            self.state,
-            StreamState::Open | StreamState::ReadErrorPending
-        ));
+        let shared = SplitShared::new(
+            !matches!(
+                self.state,
+                StreamState::Open | StreamState::ReadErrorPending
+            ),
+            self.heartbeat.tracks_inbound_activity(),
+        );
         // Splitting must not reopen application writes after a known parse error.
         // A preceding accepted Close still needs its automatic response.
         if self.pending_parse_error.is_some() {
@@ -1557,11 +1573,16 @@ where
             if self.has_unprocessed_read_data {
                 self.has_unprocessed_read_data = false;
                 debug_assert!(self.pending_messages.is_empty());
-                match self
-                    .protocol
-                    .process_into(&mut self.read_buf, &mut self.pending_messages)
-                {
+                let mut accepted_fragment = false;
+                match self.protocol.process_into_with_activity(
+                    &mut self.read_buf,
+                    &mut self.pending_messages,
+                    &mut accepted_fragment,
+                ) {
                     Ok(()) => {
+                        if accepted_fragment {
+                            self.shared.note_inbound();
+                        }
                         self.pending_messages.reverse();
                         if !self.pending_messages.is_empty() {
                             continue;
@@ -1580,6 +1601,7 @@ where
                 self.read_buf.reserve(crate::RECV_BUFFER_SIZE);
             }
 
+            let mut accepted_fragment = false;
             tokio::select! {
                 biased;
                 changed = self.terminal_rx.changed() => {
@@ -1595,9 +1617,14 @@ where
                         }
                         Ok(_) => match self
                             .protocol
-                            .process_into(&mut self.read_buf, &mut self.pending_messages)
+                            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages, &mut accepted_fragment)
                         {
-                            Ok(()) => self.pending_messages.reverse(),
+                            Ok(()) => {
+                                if accepted_fragment {
+                                    self.shared.note_inbound();
+                                }
+                                self.pending_messages.reverse();
+                            },
                             Err(error) => {
                                 self.pending_messages.reverse();
                                 self.pending_parse_error = Some(error);
@@ -2377,9 +2404,16 @@ where
         // Reuse the message Vec across reads (no allocation per read). Messages
         // are popped from the back, so store them in reverse order.
         debug_assert!(self.pending_messages.is_empty());
-        let result = self
-            .protocol
-            .process_into(&mut self.read_buf, &mut self.pending_messages);
+        let mut accepted_fragment = false;
+        let result = self.protocol.process_into_with_activity(
+            &mut self.read_buf,
+            &mut self.pending_messages,
+            &mut accepted_fragment,
+        );
+        if accepted_fragment && self.heartbeat.tracks_inbound_activity() {
+            self.heartbeat
+                .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
+        }
         // process_into preserves accepted messages even when a later frame fails.
         self.batch_has_close = self.pending_messages.iter().any(Message::is_close);
         self.pending_messages.reverse();
@@ -3003,10 +3037,13 @@ where
         let transport = reader.clone();
 
         let (control_tx, control_rx) = mpsc::channel(SPLIT_CONTROL_CAPACITY);
-        let shared = SplitShared::new(!matches!(
-            self.state,
-            StreamState::Open | StreamState::ReadErrorPending
-        ));
+        let shared = SplitShared::new(
+            !matches!(
+                self.state,
+                StreamState::Open | StreamState::ReadErrorPending
+            ),
+            self.heartbeat.tracks_inbound_activity(),
+        );
         // Splitting must not reopen application writes after a known parse error.
         // A preceding accepted Close still needs its automatic response.
         if self.pending_parse_error.is_some() {
@@ -3116,11 +3153,16 @@ where
             if self.has_unprocessed_read_data {
                 self.has_unprocessed_read_data = false;
                 debug_assert!(self.pending_messages.is_empty());
-                match self
-                    .protocol
-                    .process_into(&mut self.read_buf, &mut self.pending_messages)
-                {
+                let mut accepted_fragment = false;
+                match self.protocol.process_into_with_activity(
+                    &mut self.read_buf,
+                    &mut self.pending_messages,
+                    &mut accepted_fragment,
+                ) {
                     Ok(()) => {
+                        if accepted_fragment {
+                            self.shared.note_inbound();
+                        }
                         self.pending_messages.reverse();
                         if !self.pending_messages.is_empty() {
                             continue;
@@ -3139,6 +3181,7 @@ where
                 self.read_buf.reserve(crate::RECV_BUFFER_SIZE);
             }
 
+            let mut accepted_fragment = false;
             tokio::select! {
                 biased;
                 changed = self.terminal_rx.changed() => {
@@ -3154,9 +3197,14 @@ where
                         }
                         Ok(_) => match self
                             .protocol
-                            .process_into(&mut self.read_buf, &mut self.pending_messages)
+                            .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages, &mut accepted_fragment)
                         {
-                            Ok(()) => self.pending_messages.reverse(),
+                            Ok(()) => {
+                                if accepted_fragment {
+                                    self.shared.note_inbound();
+                                }
+                                self.pending_messages.reverse();
+                            },
                             Err(error) => {
                                 self.pending_messages.reverse();
                                 self.pending_parse_error = Some(error);
@@ -3556,7 +3604,7 @@ mod tests {
     #[tokio::test]
     async fn split_send_preserves_transport_error_after_termination() {
         let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let shared = SplitShared::new(false);
+        let shared = SplitShared::new(false, true);
         let (control_tx, _control_rx) = mpsc::channel(1);
         let core = SplitWriterCore {
             sink: Arc::new(tokio::sync::Mutex::new(SplitSink::new(
@@ -3582,7 +3630,7 @@ mod tests {
     #[tokio::test]
     async fn cancelling_a_flushed_close_does_not_abort_its_transport() {
         let (io, mut peer) = tokio::io::duplex(64);
-        let shared = SplitShared::new(false);
+        let shared = SplitShared::new(false, true);
         let (control_tx, _control_rx) = mpsc::channel(2);
         // Leave room for the reserved start notification, then keep the final
         // LocalCloseSent notification pending after the frame is flushed.

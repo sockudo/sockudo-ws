@@ -401,6 +401,20 @@ impl Protocol {
     /// If a later frame fails, messages accepted earlier in this call remain in wire order.
     #[inline]
     pub fn process_into(&mut self, buf: &mut BytesMut, messages: &mut Vec<Message>) -> Result<()> {
+        self.process_into_with_activity(buf, messages, &mut false)
+    }
+
+    /// Report only newly accepted non-final data frames, not reassembly state.
+    /// Preserve accepted messages and the fragment flag even if a later frame fails.
+    /// Readers terminating on that error may ignore the fragment activity flag.
+    #[inline]
+    pub(crate) fn process_into_with_activity(
+        &mut self,
+        buf: &mut BytesMut,
+        messages: &mut Vec<Message>,
+        accepted_fragment: &mut bool,
+    ) -> Result<()> {
+        *accepted_fragment = false;
         messages.clear();
 
         while !buf.is_empty() {
@@ -409,6 +423,8 @@ impl Protocol {
                     let prevalidated = std::mem::take(&mut self.partial_checked);
                     if let Some(msg) = self.handle_frame(frame, prevalidated)? {
                         messages.push(msg);
+                    } else {
+                        *accepted_fragment = true;
                     }
                 }
                 None => {
@@ -913,6 +929,20 @@ impl CompressedProtocol {
     /// If a later frame fails, messages accepted earlier in this call remain in wire order.
     #[inline]
     pub fn process_into(&mut self, buf: &mut BytesMut, messages: &mut Vec<Message>) -> Result<()> {
+        self.process_into_with_activity(buf, messages, &mut false)
+    }
+
+    /// Report only newly accepted non-final data frames, not reassembly state.
+    /// Preserve accepted messages and the fragment flag even if a later frame fails.
+    /// Readers terminating on that error may ignore the fragment activity flag.
+    #[inline]
+    pub(crate) fn process_into_with_activity(
+        &mut self,
+        buf: &mut BytesMut,
+        messages: &mut Vec<Message>,
+        accepted_fragment: &mut bool,
+    ) -> Result<()> {
+        *accepted_fragment = false;
         const DEBUG: bool = false;
         messages.clear();
 
@@ -930,8 +960,11 @@ impl CompressedProtocol {
                         if DEBUG {
                             eprintln!("[PROTOCOL] Added message to output");
                         }
-                    } else if DEBUG {
-                        eprintln!("[PROTOCOL] No message from handle_frame (fragment or control)");
+                    } else {
+                        *accepted_fragment = true;
+                        if DEBUG {
+                            eprintln!("[PROTOCOL] No message from handle_frame (fragment)");
+                        }
                     }
                 }
                 None => {
@@ -1245,6 +1278,20 @@ impl CompressedReaderProtocol {
     ///
     /// If a later frame fails, messages accepted earlier in this call remain in wire order.
     pub fn process_into(&mut self, buf: &mut BytesMut, messages: &mut Vec<Message>) -> Result<()> {
+        self.process_into_with_activity(buf, messages, &mut false)
+    }
+
+    /// Report only newly accepted non-final data frames, not reassembly state.
+    /// Preserve accepted messages and the fragment flag even if a later frame fails.
+    /// Readers terminating on that error may ignore the fragment activity flag.
+    #[inline]
+    pub(crate) fn process_into_with_activity(
+        &mut self,
+        buf: &mut BytesMut,
+        messages: &mut Vec<Message>,
+        accepted_fragment: &mut bool,
+    ) -> Result<()> {
+        *accepted_fragment = false;
         messages.clear();
 
         // Enable compression in parser
@@ -1255,6 +1302,8 @@ impl CompressedReaderProtocol {
                 Some(frame) => {
                     if let Some(msg) = self.handle_frame(frame)? {
                         messages.push(msg);
+                    } else {
+                        *accepted_fragment = true;
                     }
                 }
                 None => break,
