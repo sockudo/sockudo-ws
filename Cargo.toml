@@ -357,3 +357,17 @@ required-features = ["tokio-runtime", "permessage-deflate"]
 name = "services_bench"
 harness = false
 required-features = ["tokio-runtime", "permessage-deflate"]
+
+[[bench]]
+name = "stream_bench"
+harness = false
+required-features = ["tokio-runtime"]
+
+[[bench]]
+name = "receive_state_bench"
+harness = false
+required-features = ["tokio-runtime"]
+
+[[example]]
+name = "send_latency_diagnostic"
+required-features = ["tokio-runtime"]
