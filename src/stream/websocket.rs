@@ -1121,6 +1121,7 @@ struct SplitShared {
     epoch: tokio::time::Instant,
     /// Milliseconds since `epoch` of the last inbound data frame (reader -> driver)
     last_inbound_ms: AtomicU64,
+    /// Snapshot of the unified heartbeat's activity tracking state at split time.
     tracks_inbound_activity: bool,
 }
 

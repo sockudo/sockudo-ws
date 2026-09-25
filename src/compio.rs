@@ -136,6 +136,7 @@ struct CompioSplitShared {
     epoch: Instant,
     /// Milliseconds since `epoch` of the last inbound data frame (reader -> driver)
     last_inbound_ms: Cell<u64>,
+    /// Snapshot of the unified heartbeat's activity tracking state at split time.
     tracks_inbound_activity: bool,
 }
 

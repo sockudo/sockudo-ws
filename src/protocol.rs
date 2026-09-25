@@ -405,7 +405,8 @@ impl Protocol {
     }
 
     /// Report only newly accepted non-final data frames, not reassembly state.
-    /// Keep the accepted prefix visible even if a later frame in this batch fails.
+    /// Preserve accepted messages and the fragment flag even if a later frame fails.
+    /// Readers terminating on that error may ignore the fragment activity flag.
     #[inline]
     pub(crate) fn process_into_with_activity(
         &mut self,
@@ -932,7 +933,8 @@ impl CompressedProtocol {
     }
 
     /// Report only newly accepted non-final data frames, not reassembly state.
-    /// Keep the accepted prefix visible even if a later frame in this batch fails.
+    /// Preserve accepted messages and the fragment flag even if a later frame fails.
+    /// Readers terminating on that error may ignore the fragment activity flag.
     #[inline]
     pub(crate) fn process_into_with_activity(
         &mut self,
@@ -961,9 +963,7 @@ impl CompressedProtocol {
                     } else {
                         *accepted_fragment = true;
                         if DEBUG {
-                            eprintln!(
-                                "[PROTOCOL] No message from handle_frame (fragment or control)"
-                            );
+                            eprintln!("[PROTOCOL] No message from handle_frame (fragment)");
                         }
                     }
                 }
@@ -1282,7 +1282,8 @@ impl CompressedReaderProtocol {
     }
 
     /// Report only newly accepted non-final data frames, not reassembly state.
-    /// Keep the accepted prefix visible even if a later frame in this batch fails.
+    /// Preserve accepted messages and the fragment flag even if a later frame fails.
+    /// Readers terminating on that error may ignore the fragment activity flag.
     #[inline]
     pub(crate) fn process_into_with_activity(
         &mut self,

@@ -276,3 +276,25 @@ async fn compressed_split_leftover_fragment_refreshes_activity_when_accepted() {
     }
     assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), b"abc");
 }
+
+#[tokio::test(start_paused = true)]
+async fn split_leftover_fragment_refreshes_activity_when_accepted() {
+    let (io, mut peer) = tokio::io::duplex(1024);
+    let config = Config::builder().auto_ping(false).idle_timeout(1).build();
+    let ws = WebSocketStream::from_raw_with_leftover(
+        io,
+        sockudo_ws::Role::Client,
+        config,
+        Some(bytes::Bytes::from_static(fragments(false)[0])),
+    );
+    let (mut reader, _writer) = ws.split();
+    tokio::time::advance(Duration::from_millis(600)).await;
+    assert!(poll!(std::pin::pin!(reader.next())).is_pending());
+    tokio::time::advance(Duration::from_millis(600)).await;
+    tokio::task::yield_now().await;
+    assert!(poll!(std::pin::pin!(reader.next())).is_pending());
+    for frame in &fragments(false)[1..] {
+        peer.write_all(frame).await.unwrap();
+    }
+    assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), b"abc");
+}
