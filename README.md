@@ -29,7 +29,7 @@ git clone https://github.com/nurmohammed840/web-socket-benchmark
 cd web-socket-benchmark
 
 # Add sockudo-ws to the benchmark suite, then run:
-cargo bench
+RUSTFLAGS="-C target-cpu=native" cargo bench
 ```
 
 The benchmark measures:
@@ -72,7 +72,8 @@ sockudo-ws matches or exceeds uWebSockets performance while providing a safe, er
 
 ## Features
 
-- **SIMD Acceleration**: AVX2/AVX-512/SSE2/NEON/AltiVec/LSX for frame masking and UTF-8 validation
+- **SIMD Frame Masking**: Architecture-specific AVX2/AVX-512/SSE2/NEON/AltiVec/LSX/LASX/z13 implementations
+- **UTF-8 Validation**: `simdutf8` acceleration on supported x86, AArch64, and wasm32 targets, with a portable validator elsewhere
 - **Zero-Copy Parsing**: Direct buffer access without intermediate allocations
 - **Write Batching (Corking)**: Minimizes syscalls via vectored I/O
 - **permessage-deflate**: Full compression support with shared/dedicated compressors
@@ -560,7 +561,7 @@ let mut ws2 = conn.open_websocket("wss://example.com/notifications", None).await
 
 ## HTTP/3 WebSocket (RFC 9220)
 
-HTTP/3 WebSocket runs over QUIC, providing benefits like 0-RTT, no head-of-line blocking, and better mobile performance.
+HTTP/3 WebSocket runs over QUIC, with independent streams and connection migration. Built-in endpoints apply the configured QUIC transport settings and reject `enable_0rtt = true`; TLS resumption does not enable early data.
 
 ```rust
 use sockudo_ws::{WebSocketServer, Http3, Config, Message};
@@ -603,78 +604,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | Feature | Benefit |
 |---------|---------|
 | No head-of-line blocking | One slow stream doesn't block others |
-| 0-RTT connection resumption | Faster reconnections |
+| TLS connection resumption | Reuse session state without 0-RTT early data |
 | Better mobile performance | Handles network changes gracefully |
 | Multiple streams per connection | Efficient multiplexing |
 
 ## io_uring Support (Linux)
 
-io_uring provides kernel-level async I/O with zero-copy operations. It's a **transport layer** that can be combined with any protocol.
+io_uring provides completion-based kernel I/O. `UringStream` is a buffered TCP transport bridge: its poll-based API copies between borrowed buffers and owned completion buffers. HTTP/3 uses a separate UDP transport. Run inside `tokio_uring::start` on Linux 5.10 or later.
 
 ### io_uring with HTTP/1.1
 
 ```rust
+use futures_util::{SinkExt, StreamExt};
 use sockudo_ws::io_uring::UringStream;
 use sockudo_ws::{Config, WebSocketStream};
 
-#[tokio_uring::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let listener = tokio_uring::net::TcpListener::bind("127.0.0.1:8080".parse()?)?;
-
-    loop {
-        let (tcp_stream, _) = listener.accept().await?;
-        
-        // Wrap in UringStream for io_uring I/O
-        let uring_stream = UringStream::new(tcp_stream);
-        
-        tokio_uring::spawn(async move {
-            let mut ws = WebSocketStream::server(uring_stream, Config::default());
-            
-            while let Some(msg) = ws.next().await {
-                if let Ok(msg) = msg {
-                    ws.send(msg).await.ok();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tokio_uring::start(async {
+        let listener = tokio_uring::net::TcpListener::bind("127.0.0.1:8080".parse()?)?;
+        loop {
+            let (tcp, _) = listener.accept().await?;
+            // Wrap TCP in UringStream for io_uring I/O.
+            let uring = UringStream::new(tcp);
+            tokio_uring::spawn(async move {
+                // Direct WebSocket framing; an HTTP upgrade must be handled separately.
+                let mut ws = WebSocketStream::server(uring, Config::default());
+                while let Some(Ok(message)) = ws.next().await {
+                    if ws.send(message).await.is_err() {
+                        break;
+                    }
                 }
-            }
-        });
-    }
+            });
+        }
+    })
 }
 ```
 
 ### io_uring with HTTP/2
 
-Combine io_uring transport with HTTP/2 protocol for maximum performance:
+Enable `io-uring`, `http2`, and a `rustls-*` feature for this TLS example. Supply a TLS acceptor configured with a certificate and ALPN `h2`:
 
 ```rust
+use futures_util::{SinkExt, StreamExt};
 use sockudo_ws::io_uring::UringStream;
-use sockudo_ws::{WebSocketServer, Http2, Config};
+use sockudo_ws::{Config, Http2, WebSocketServer};
 
-#[tokio_uring::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let listener = tokio_uring::net::TcpListener::bind("127.0.0.1:8080".parse()?)?;
-    let server = WebSocketServer::<Http2>::new(Config::default());
-
-    loop {
-        let (tcp_stream, _) = listener.accept().await?;
-        
-        // 1. Wrap TCP in UringStream for io_uring I/O
-        let uring_stream = UringStream::new(tcp_stream);
-        
-        // 2. Add TLS (required for HTTP/2)
-        // let tls_stream = tls_acceptor.accept(uring_stream).await?;
-        
-        // 3. Run HTTP/2 WebSocket over io_uring transport
-        let server = server.clone();
-        tokio_uring::spawn(async move {
-            server.serve(uring_stream, |mut ws, req| async move {
-                // WebSocket over HTTP/2 over io_uring!
-                while let Some(msg) = ws.next().await {
-                    if let Ok(msg) = msg {
-                        ws.send(msg).await.ok();
+// Configure the TLS acceptor with a certificate and ALPN protocol h2.
+fn serve(tls_acceptor: tokio_rustls::TlsAcceptor) -> Result<(), Box<dyn std::error::Error>> {
+    tokio_uring::start(async move {
+        let listener = tokio_uring::net::TcpListener::bind("127.0.0.1:8443".parse()?)?;
+        let server = WebSocketServer::<Http2>::new(Config::default());
+        loop {
+            let (tcp, _) = listener.accept().await?;
+            // Wrap TCP in UringStream for io_uring I/O.
+            let uring = UringStream::new(tcp);
+            // Add TLS for this HTTP/2 endpoint: TCP -> TLS -> HTTP/2 -> WebSocket.
+            let tls = tls_acceptor.accept(uring).await?;
+            let server = server.clone();
+            tokio_uring::spawn(async move {
+                server.serve(tls, |mut ws, _req| async move {
+                    // Handle WebSocket over HTTP/2 over TLS over io_uring.
+                    while let Some(Ok(message)) = ws.next().await {
+                        if ws.send(message).await.is_err() {
+                            break;
+                        }
                     }
-                }
-            }).await.ok();
-        });
-    }
+                }).await
+            });
+        }
+    })
 }
 ```
 
@@ -688,7 +686,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ├─────────────────────────────┤
 │      HTTP/2 (h2 crate)      │  ← Extended CONNECT framing
 ├─────────────────────────────┤
-│     TLS (rustls/openssl)    │  ← Required for HTTP/2
+│     TLS (rustls/openssl)    │  ← TLS for this endpoint
 ├─────────────────────────────┤
 │        UringStream          │  ← io_uring async I/O
 ├─────────────────────────────┤
@@ -705,10 +703,10 @@ All transports use the same `WebSocketStream<S>` API:
 let ws = WebSocketStream::server(tcp_stream, config);
 
 // HTTP/2
-let ws = WebSocketStream::server(h2_stream, config);
+let ws = WebSocketStream::server(h2_stream, config).with_immediate_write_shutdown();
 
 // HTTP/3
-let ws = WebSocketStream::server(h3_stream, config);
+let ws = WebSocketStream::server(h3_stream, config).with_immediate_write_shutdown();
 
 // io_uring
 let ws = WebSocketStream::server(uring_stream, config);
@@ -718,6 +716,10 @@ while let Some(msg) = ws.next().await {
     ws.send(msg?).await?;
 }
 ```
+
+The built-in HTTP/2 and HTTP/3 client/server entry points enable immediate send-side shutdown automatically. When constructing a unified stream directly over a multiplexed transport, call `with_immediate_write_shutdown()` so `close()` sends END_STREAM after the WebSocket Close frame. TCP/TLS streams keep their write half open until the peer's Close.
+
+Unified closing uses one absolute `close_timeout` budget, starting when a local Close is queued or a peer Close is received. Continue polling `next()` after local `close()` to receive the peer's response; a silent peer produces `ConnectionClosed` once, then the stream ends. Crossing Pings do not reset the budget. Cleanup errors or expiration do not replace an accepted Close or an existing idle/Pong timeout. Deadline expiry alone leaves parsed messages deliverable in wire order. A control write failure or timeout instead terminates immediately and may discard undelivered Ping/data messages; an accepted Close remains protected. No new Pong is started after expiry or when Close is already accepted. Every budget permits at most one nonwaiting transport read after expiry across subsequent `next()` calls; a cancelled Compio owned read is never restarted. Zero also limits closing writes and shutdown to one poll. This does not guarantee completion or transmission of Close: Compio drivers may require a runtime turn even for an otherwise writable socket. No hidden grace period is added. Compio `next()` is not generally cancellation-safe: cancelling it during Close cleanup can lose that Close; these delivery guarantees assume the receive future is driven to completion.
 
 ## Configuration
 
@@ -734,7 +736,7 @@ let config = Config::builder()
     .pong_timeout_close(4201, "Pong reply not received in time")
     .idle_timeout(0)                       // Independent hard idle limit disabled
     .close_timeout(5)                      // Bounded Close flush/shutdown
-    .max_backpressure(1024 * 1024)         // 1MB backpressure limit
+    .max_backpressure(1024 * 1024)         // 1 MiB queued-write threshold
     .build();
 
 // Or use uWebSockets-style defaults
@@ -767,14 +769,51 @@ let config = Config::builder()
 | `max_message_size` | 64MB | Maximum message size |
 | `max_frame_size` | 16MB | Maximum single frame size |
 | `idle_timeout` | 120s | Hard inbound-idle deadline, independent of Pong detection (0 = disabled) |
-| `max_backpressure` | 1MB | Max write buffer before dropping connection |
+| `max_backpressure` | 1 MiB | Soft queued-write threshold: with coalescing enabled, Tokio Sink readiness drains at the smaller of this and the high-water mark (default 64 KiB); not a message-size limit or a disconnect condition (0 = drain any pending output) |
+| `write_coalescing` | true | Allow Tokio Sink `feed` batching up to the readiness threshold; false drains any pending output before accepting another frame; `send` and `flush` always flush |
 | `auto_ping` | true | Enable proactive native Ping; automatic Pong/Close responses remain enabled when false |
 | `ping_interval` | 30s | Inbound inactivity before one native Ping (0 = disabled) |
 | `pong_timeout` | 10s | Matching Pong deadline after Ping flush (0 = no deadline and no second Ping until a match) |
 | `pong_timeout_close_code` | 1001 | Close code for a missed Pong |
 | `pong_timeout_close_reason` | `Pong reply not received in time` | Close reason for a missed Pong |
-| `close_timeout` | 5s | Bound for timeout Close flush and transport shutdown |
+| `close_timeout` | 5s | Bound for Close handling; Tokio split `close()` includes waiting for the shared sink (0 = one immediate attempt without waiting) |
 | `write_buffer_size` | 16KB | Cork buffer size |
+
+### Queued-write backpressure
+
+`feed`, `send_all`, and `forward` may wait when queued output reaches the effective readiness threshold: the smaller of the high-water mark and `max_backpressure` with coalescing enabled, or any pending output with coalescing disabled. A single message may exceed this soft threshold; large messages do not cause a disconnect. A pending drain continues until the transport flush finishes, even if fewer bytes remain than the threshold.
+
+On a unified stream, waiting for writable capacity does not poll the read side, so automatic Pong and inbound heartbeat/idle processing do not advance during that wait. An open connection has no write deadline from `close_timeout`. A peer that never reads can therefore stall a sequential fan-out loop. Monitor `write_buffer_len()` / `is_backpressured()` to choose an application-level slow-consumer policy; these observations do not guarantee that a later send cannot wait. Native `split()` lets reading/control processing progress independently, but sequentially awaiting each split writer still permits head-of-line blocking.
+
+With `write_coalescing=true` (the default), Tokio Sink readiness drains at the smaller of the high-water mark (default 64 KiB) and `max_backpressure` (default 1 MiB). `is_backpressured()` reports whether queued bytes exceed the high-water mark; readiness starts draining when a threshold is reached. With `write_coalescing=false`, readiness drains any pending output before accepting another frame. Zero thresholds never flush an empty buffer merely to become ready.
+
+`SinkExt::send()` and `SinkExt::flush()` always complete the transport flush, even while parsed inbound messages remain unread. Applications previously relying on implicit batching across `send()` calls should use `feed()` and then `flush()` at each batch boundary. Flush before waiting for a reply or pausing reads; the read path also drains output before waiting for more input. A successful flush does not mean the peer has received or processed the message.
+
+For a Tokio unified echo loop, explicitly queue data replies with `feed`. When the parsed input batch is exhausted, `next()` drains queued output before reading more input:
+
+```rust
+use futures_util::{SinkExt, StreamExt};
+use sockudo_ws::{Message, WebSocketStream};
+use tokio::io::{AsyncRead, AsyncWrite};
+
+async fn echo<S>(ws: &mut WebSocketStream<S>) -> sockudo_ws::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    while let Some(message) = ws.next().await {
+        match message? {
+            message @ (Message::Text(_) | Message::Binary(_)) => {
+                ws.feed(message).await?;
+            }
+            Message::Close(_) => return Ok(()),
+            _ => {} // Ping/Pong are handled by the stream.
+        }
+    }
+    Ok(())
+}
+```
+
+Do not add an unconditional final `flush()` after Close, EOF or a stream error: the stream may already be closed. If the application stops this loop while the connection is still open, or pauses it to await a database/channel operation, explicitly flush queued replies before that break or await. This example batches replies; keep `send()` when each reply must be flushed before proceeding. Read-batch batching does not guarantee delivery of queued replies if a Close or error terminates the stream.
 
 ### Native keepalive semantics
 
@@ -892,25 +931,27 @@ Transport features are runtime-neutral. Pair `http2` or `http3` with either `tok
 
 sockudo-ws uses SIMD acceleration for frame masking and UTF-8 validation:
 
-| Architecture | Instructions | Masking | UTF-8 | Stable | Nightly |
-|--------------|--------------|---------|-------|--------|---------|
-| x86_64 | SSE2 | ✅ | ✅ | ✅ | ✅ |
-| x86_64 | SSE4.2 | ✅ | ✅ | ✅ | ✅ |
-| x86_64 | AVX2 | ✅ | ✅ | ✅ | ✅ |
-| x86_64 | AVX-512 | ✅ | ✅ | ✅ | ✅ |
-| aarch64 | NEON | ✅ | ✅ | ✅ | ✅ |
-| arm | NEON | ✅ | ✅ | ❌ | ✅ |
-| loongarch64 | LSX | ✅ | ✅* | ❌ | ✅ |
-| loongarch64 | LASX | ✅ | ✅* | ❌ | ✅ |
-| powerpc | AltiVec | ✅ | ✅* | ❌ | ✅ |
-| powerpc64 | AltiVec | ✅ | ✅* | ❌ | ✅ |
-| s390x | z13 vectors | ✅ | ✅* | ❌ | ✅ |
+| Architecture | Instructions | Masking | UTF-8 backend | Stable | Nightly |
+|--------------|--------------|---------|---------------|--------|---------|
+| x86_64 | SSE2 | ✅ | Portable fallback | ✅ | ✅ |
+| x86_64 | SSE4.2 | ✅ | SSE4.2 | ✅ | ✅ |
+| x86_64 | AVX2 | ✅ | AVX2 | ✅ | ✅ |
+| x86_64 | AVX-512 | ✅ | AVX2 | ✅ | ✅ |
+| aarch64 | NEON | ✅ | NEON | ✅ | ✅ |
+| arm | NEON | ✅ | Portable fallback | ❌ | ✅ |
+| loongarch64 | LSX | ✅ | Portable fallback | ❌ | ✅ |
+| loongarch64 | LASX | ✅ | Portable fallback | ❌ | ✅ |
+| powerpc | AltiVec | ✅ | Portable fallback | ❌ | ✅ |
+| powerpc64 | AltiVec | ✅ | Portable fallback | ❌ | ✅ |
+| s390x | z13 vectors | ✅ | Portable fallback | ❌ | ✅ |
 
-*Custom SIMD UTF-8 validation with ASCII fast-path (requires `nightly` feature).
+The UTF-8 backend column describes acceleration, not validation availability.
+Portable fallback uses the dependency's standard validator, so all targets validate complete UTF-8 inputs.
+The Stable and Nightly columns describe availability of the listed masking implementation.
 
 UTF-8 validation uses:
-- [simdutf8](https://github.com/rusticstuff/simdutf8) for x86_64 (SSE4.2, AVX2, AVX-512), aarch64 (NEON), arm (NEON), wasm32
-- Custom SIMD implementations for LoongArch64, PowerPC, and s390x (with `nightly` feature)
+- [simdutf8](https://github.com/rusticstuff/simdutf8) for x86/x86_64 (SSE4.2 or AVX2), aarch64 (NEON), and SIMD-enabled wasm32
+- The dependency's standard UTF-8 validator fallback on other targets, including arm, LoongArch64, PowerPC, and s390x
 
 ## API Reference
 
@@ -996,20 +1037,26 @@ if let Message::Text(bytes) = msg {
 
 ## Running Tests
 
-### Unit Tests
+### Unit and Integration Tests
 
 ```bash
-cargo test
+cargo nextest run
+cargo test --doc
 ```
+
+Install [`cargo-nextest`](https://nexte.st/docs/installation/) before using these commands. Nextest runs each test as a separate process and reports parameterized cases independently; doctests remain a separate `cargo test --doc` target because nextest does not execute them.
+
+Nextest can run tests from different binaries concurrently, so integration tests must bind OS-assigned ports instead of fixed ports.
 
 ### With Features
 
 ```bash
-cargo test --features http2
-cargo test --features http3
-cargo test --no-default-features --features compio-runtime,http2
-cargo test --no-default-features --features compio-runtime,http3
-cargo test --features full
+cargo nextest run --features http2
+cargo nextest run --features http3
+cargo nextest run --features full
+cargo nextest run --all-features
+cargo nextest run --no-default-features --features tokio-runtime,http2,http3
+cargo nextest run --no-default-features --features compio-runtime,http2,http3
 ```
 
 ### End-to-End Transport Tests
@@ -1017,9 +1064,9 @@ cargo test --features full
 These tests bind real loopback TCP/QUIC endpoints and use the public runtime APIs for HTTP/2 and HTTP/3 WebSocket handshakes.
 
 ```bash
-cargo test --all-features --test e2e_runtime_transports
-cargo test --no-default-features --features tokio-runtime,http2,http3 --test e2e_runtime_transports
-cargo test --no-default-features --features compio-runtime,http2,http3 --test e2e_runtime_transports
+cargo nextest run --all-features --test e2e_runtime_transports
+cargo nextest run --no-default-features --features tokio-runtime,http2,http3 --test e2e_runtime_transports
+cargo nextest run --no-default-features --features compio-runtime,http2,http3 --test e2e_runtime_transports
 ```
 
 ### Autobahn Test Suite
@@ -1033,7 +1080,7 @@ for process management.
 make -C autobahn test
 ```
 
-The command builds both binaries, waits for the server, runs four cases at a
+The command builds both binaries, waits for the server, runs eight cases at a
 time, and stops the server on completion or failure. Reports and logs are saved
 in `autobahn/reports/`; open `index.html` for case details. A failing case or close
 handshake makes the command fail. Concurrent runs are for conformance checking;
@@ -1123,7 +1170,7 @@ sockudo-ws/
 │   └── io_uring/         # Linux io_uring transport
 │       ├── mod.rs
 │       ├── stream.rs     # UringStream wrapper
-│       └── buffer.rs     # Registered buffer pool
+│       └── buffer.rs     # Owned buffer pool (not kernel-registered)
 ├── fuzz/                 # Fuzzing targets
 │   └── fuzz_targets/
 │       ├── parse_frame.rs

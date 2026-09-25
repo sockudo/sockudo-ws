@@ -209,15 +209,24 @@ impl Default for Http2Config {
 #[cfg(feature = "http3")]
 #[derive(Debug, Clone)]
 pub struct Http3Config {
-    /// Maximum idle timeout for QUIC connection in milliseconds (default: 30000)
+    /// Maximum idle timeout for QUIC connection in milliseconds (default: 30000).
+    /// Zero disables the local timeout; the peer can still impose its own limit.
     pub max_idle_timeout_ms: u64,
-    /// Initial stream-level flow control window size (default: 1MB)
+    /// Initial per-stream receive window size (default: 1,250,000 bytes, as in Quinn).
+    /// Must be nonzero: zero also blocks HTTP/3 control streams and request headers.
     pub initial_stream_window_size: u64,
-    /// Enable 0-RTT for faster reconnection (default: false)
+    /// Request 0-RTT support (default: false)
+    ///
+    /// The built-in HTTP/3 client and server reject `true` because their H3 layer
+    /// cannot safely restore peer settings after resumption.
     pub enable_0rtt: bool,
     /// Enable Extended CONNECT protocol for WebSocket (default: true)
     pub enable_connect_protocol: bool,
-    /// Maximum UDP payload size (default: 1350)
+    /// Maximum accepted UDP payload size (1200–65527 bytes; default: 1472, as in Quinn).
+    /// This advertised receive limit is not a fixed outgoing packet size.
+    /// Increasing it linearly increases endpoint datagram receive-buffer memory;
+    /// the multiplier depends on the runtime and platform. Each built-in Tokio
+    /// client connection creates its own endpoint.
     pub max_udp_payload_size: u16,
 }
 
@@ -226,10 +235,10 @@ impl Default for Http3Config {
     fn default() -> Self {
         Self {
             max_idle_timeout_ms: 30_000,
-            initial_stream_window_size: 1024 * 1024, // 1MB
+            initial_stream_window_size: 1_250_000, // Quinn's default stream receive window
             enable_0rtt: false,
             enable_connect_protocol: true,
-            max_udp_payload_size: 1350,
+            max_udp_payload_size: 1472,
         }
     }
 }
@@ -264,13 +273,64 @@ impl Default for IoUringConfig {
 // Compression
 // ============================================================================
 
+/// LZ77 window sizes supported by the configured compression backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum DeflateWindowBits {
+    /// 512-byte window.
+    Bits9 = 9,
+    /// 1KB window.
+    Bits10 = 10,
+    /// 2KB window.
+    Bits11 = 11,
+    /// 4KB window.
+    Bits12 = 12,
+    /// 8KB window.
+    Bits13 = 13,
+    /// 16KB window.
+    Bits14 = 14,
+    /// 32KB window.
+    Bits15 = 15,
+}
+
+impl TryFrom<u8> for DeflateWindowBits {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            9 => Ok(Self::Bits9),
+            10 => Ok(Self::Bits10),
+            11 => Ok(Self::Bits11),
+            12 => Ok(Self::Bits12),
+            13 => Ok(Self::Bits13),
+            14 => Ok(Self::Bits14),
+            15 => Ok(Self::Bits15),
+            _ => Err(Error::Compression(format!(
+                "unsupported deflate window bits {value}; backend supports 9-15"
+            ))),
+        }
+    }
+}
+
+impl From<DeflateWindowBits> for u8 {
+    fn from(value: DeflateWindowBits) -> Self {
+        value as Self
+    }
+}
+
 /// Compression mode for WebSocket connections (RFC 7692 permessage-deflate)
 ///
 /// This enum controls how compression is handled for WebSocket connections.
 ///
-/// Per RFC 7692, the LZ77 sliding window size is limited to 8-15 bits
-/// (256 bytes to 32KB). Larger windows provide better compression but
-/// use more memory per connection.
+/// Per RFC 7692, the LZ77 sliding window size is limited to 8-15 bits. The
+/// configured compression backend supports 9-15, so valid configurations start
+/// at a 512-byte window. Larger windows provide better compression but use more
+/// memory per connection.
+///
+/// Window-specific modes constrain both endpoint directions. During server
+/// negotiation, modes below 32KB require the client to offer
+/// `client_max_window_bits`; clients that send only `permessage-deflate` remain
+/// uncompressed rather than exceeding the configured client window limit.
 ///
 /// # Memory Usage per Connection
 ///
@@ -279,7 +339,6 @@ impl Default for IoUringConfig {
 /// | `Disabled` | No compression | - | - |
 /// | `Dedicated` | Per-connection compressor | 15 | 32KB |
 /// | `Shared` | Shared compressor pool | 15 | 32KB |
-/// | `Window256B` | Minimal memory | 8 | 256B |
 /// | `Window1KB` | 1KB sliding window | 10 | 1KB |
 /// | `Window2KB` | 2KB sliding window | 11 | 2KB |
 /// | `Window4KB` | 4KB sliding window | 12 | 4KB |
@@ -295,8 +354,6 @@ pub enum Compression {
     Dedicated,
     /// Shared compressor pool (32KB window, good for many connections)
     Shared,
-    /// 256 byte sliding window (window_bits=8, minimal memory)
-    Window256B,
     /// 1KB sliding window (window_bits=10)
     Window1KB,
     /// 2KB sliding window (window_bits=11)
@@ -332,18 +389,19 @@ impl Compression {
 
     /// Get the window bits for this compression mode
     ///
-    /// Returns the LZ77 window bits (8-15) for RFC 7692 compliance.
+    /// Returns the configured LZ77 window size, or `None` when disabled.
     #[inline]
-    pub fn window_bits(&self) -> u8 {
+    pub fn window_bits(&self) -> Option<DeflateWindowBits> {
         match self {
-            Compression::Disabled => 0,
-            Compression::Window256B => 8,
-            Compression::Window1KB => 10,
-            Compression::Window2KB => 11,
-            Compression::Window4KB => 12,
-            Compression::Window8KB => 13,
-            Compression::Window16KB => 14,
-            Compression::Dedicated | Compression::Shared | Compression::Window32KB => 15,
+            Compression::Disabled => None,
+            Compression::Window1KB => Some(DeflateWindowBits::Bits10),
+            Compression::Window2KB => Some(DeflateWindowBits::Bits11),
+            Compression::Window4KB => Some(DeflateWindowBits::Bits12),
+            Compression::Window8KB => Some(DeflateWindowBits::Bits13),
+            Compression::Window16KB => Some(DeflateWindowBits::Bits14),
+            Compression::Dedicated | Compression::Shared | Compression::Window32KB => {
+                Some(DeflateWindowBits::Bits15)
+            }
         }
     }
 
@@ -355,7 +413,6 @@ impl Compression {
     pub fn compression_threshold(&self) -> usize {
         match self {
             Compression::Disabled => usize::MAX,
-            Compression::Window256B => 128,
             Compression::Window1KB => 64,
             Compression::Window2KB => 48,
             Compression::Window4KB => 40,
@@ -377,7 +434,6 @@ impl Compression {
             self,
             Compression::Disabled
                 | Compression::Shared
-                | Compression::Window256B
                 | Compression::Window1KB
                 | Compression::Window2KB
         )
@@ -386,11 +442,7 @@ impl Compression {
     /// Convert to DeflateConfig
     #[cfg(feature = "permessage-deflate")]
     pub fn to_deflate_config(&self) -> Option<crate::deflate::DeflateConfig> {
-        if !self.is_enabled() {
-            return None;
-        }
-
-        let window_bits = self.window_bits();
+        let window_bits = self.window_bits()?;
         let no_context_takeover = !self.context_takeover();
 
         Some(crate::deflate::DeflateConfig {
@@ -399,10 +451,10 @@ impl Compression {
             server_no_context_takeover: no_context_takeover,
             client_no_context_takeover: no_context_takeover,
             compression_level: match self {
-                Compression::Window256B | Compression::Window1KB => 1, // Fast for small windows
-                Compression::Window2KB | Compression::Window4KB => 3,  // Balanced
+                Compression::Window1KB => 1, // Fast for small windows
+                Compression::Window2KB | Compression::Window4KB => 3, // Balanced
                 Compression::Window8KB | Compression::Window16KB => 5, // Good compression
-                _ => 6,                                                // Best for 32KB
+                _ => 6,                      // Best for 32KB
             },
             compression_threshold: self.compression_threshold(),
         })
@@ -441,8 +493,18 @@ pub struct Config {
     /// Every valid inbound frame resets this independent deadline. When it
     /// ties a Pong deadline, the more specific Pong timeout wins.
     pub idle_timeout: u32,
-    /// Maximum backpressure in bytes before dropping connection (default: 1MB)
-    /// If write buffer exceeds this, connection is closed
+    /// Queued-write backpressure threshold in bytes (default: 1 MiB).
+    /// The Tokio Sink drains pending encoded bytes before accepting another
+    /// message when this threshold is reached. One message may exceed it;
+    /// this is not an outbound message size limit or a peak memory bound.
+    /// Zero drains any pending output before accepting another message.
+    /// Split and Compio sends already drain each message before returning.
+    ///
+    /// Tokio `feed`, `send_all`, and `forward` may wait here. A blocked unified
+    /// write does not drive reads or inbound deadlines; applications must choose
+    /// their slow-consumer policy. With [`Config::write_coalescing`] enabled,
+    /// readiness drains at the smaller of this threshold and the high-water
+    /// mark (default: 64 KiB); disabling batching drains any pending output.
     pub max_backpressure: usize,
     /// Send native Pings after inbound inactivity (default: true).
     ///
@@ -459,19 +521,32 @@ pub struct Config {
     /// Close reason used when a native Pong deadline expires.
     pub pong_timeout_close_reason: String,
     /// Maximum time spent flushing a timeout/handshake Close and shutting down
-    /// the transport (default: 5 seconds, 0 = immediate best effort).
+    /// the transport (default: 5 seconds). A Tokio split `close()` starts this
+    /// budget when local closing begins, including time waiting for the shared
+    /// sink. Zero makes that path try the sink and write once without waiting.
+    /// Unified streams start one absolute budget when a local Close is queued
+    /// or a peer Close is received. It covers Close/control writes, waiting for
+    /// the peer Close, and transport shutdown; incoming traffic never resets it.
+    /// After expiry, every budget permits at most one nonwaiting transport read
+    /// across subsequent unified `next()` calls. A cancelled owned read is never
+    /// restarted. Zero also limits closing writes and shutdown to a single poll.
+    /// Deadline expiry alone preserves parsed messages in wire order. A control
+    /// write failure or timeout instead terminates immediately and may discard
+    /// undelivered Ping/data messages; accepted Close remains protected.
+    /// A poll does not guarantee completion: Compio drivers may need a runtime
+    /// turn even to write Close or shut down an otherwise writable socket.
+    /// No minimum grace period is added. Cleanup cannot
+    /// replace an accepted peer Close or an existing idle/Pong timeout error.
     pub close_timeout: u32,
-    /// Coalesce outbound frames while inbound messages are still queued
-    /// (default: true).
+    /// Enable batching across Tokio `SinkExt::feed` calls (default: true).
     ///
-    /// When the stream has already parsed more inbound messages than the
-    /// application has consumed, `poll_flush` keeps the encoded frames in the
-    /// write buffer instead of issuing a write per `send()`. Everything is
-    /// written in one vectored write before the stream next waits for the
-    /// transport, or as soon as the buffer reaches the high water mark. This
-    /// turns a read batch of N messages answered with N `send()` calls into
-    /// one syscall instead of N. Disable for strict "returned means written"
-    /// semantics on every `send()`.
+    /// Readiness drains at the smaller of the high-water mark and
+    /// [`Config::max_backpressure`] before accepting another message. Disabling
+    /// batching drains any pending output before accepting another message.
+    /// `SinkExt::send` and `SinkExt::flush` always flush regardless of this
+    /// setting. Use `feed` followed by `flush` at batch boundaries, before
+    /// waiting for replies or pausing reads. The read path also flushes before
+    /// waiting for more transport input. One message may exceed either threshold.
     pub write_coalescing: bool,
     /// Per-message deflate configuration (requires `permessage-deflate` feature)
     #[cfg(feature = "permessage-deflate")]
@@ -648,8 +723,7 @@ impl ConfigBuilder {
         self
     }
 
-    /// Enable or disable coalescing of outbound frames across `send()` calls
-    /// while inbound messages are still queued (see
+    /// Enable or disable batching across Tokio `SinkExt::feed` calls (see
     /// [`Config::write_coalescing`]).
     pub fn write_coalescing(mut self, enabled: bool) -> Self {
         self.config.write_coalescing = enabled;
@@ -710,21 +784,27 @@ impl ConfigBuilder {
     // HTTP/3 Configuration Methods
     // ========================================================================
 
-    /// Set HTTP/3 maximum idle timeout in milliseconds
+    /// Set HTTP/3 maximum idle timeout in milliseconds.
+    /// Values exceeding the QUIC variable-integer range are rejected when
+    /// creating a built-in endpoint; zero disables the local timeout.
     #[cfg(feature = "http3")]
     pub fn http3_idle_timeout(mut self, ms: u64) -> Self {
         self.config.http3.max_idle_timeout_ms = ms;
         self
     }
 
-    /// Set HTTP/3 initial stream window size
+    /// Set HTTP/3 initial stream window size.
+    /// Zero and values exceeding the QUIC variable-integer range are rejected
+    /// when creating a built-in endpoint.
     #[cfg(feature = "http3")]
     pub fn http3_stream_window_size(mut self, size: u64) -> Self {
         self.config.http3.initial_stream_window_size = size;
         self
     }
 
-    /// Enable or disable HTTP/3 0-RTT
+    /// Request HTTP/3 0-RTT support.
+    /// The built-in client and server reject `true`; their H3 layer cannot
+    /// safely restore peer settings after resumption.
     #[cfg(feature = "http3")]
     pub fn http3_enable_0rtt(mut self, enabled: bool) -> Self {
         self.config.http3.enable_0rtt = enabled;
@@ -738,7 +818,9 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set HTTP/3 maximum UDP payload size
+    /// Set HTTP/3 maximum accepted UDP payload size (1200–65527 bytes).
+    /// Values outside this range are rejected when creating a built-in endpoint.
+    /// Larger values linearly increase endpoint receive-buffer memory.
     #[cfg(feature = "http3")]
     pub fn http3_max_udp_payload_size(mut self, size: u16) -> Self {
         self.config.http3.max_udp_payload_size = size;
