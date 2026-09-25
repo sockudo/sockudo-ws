@@ -167,11 +167,10 @@ impl MultiplexedConnection<Http2> {
         let recv_stream = response.into_body();
         let h2_stream = Stream::<Http2>::from_h2(send_stream, recv_stream);
 
-        Ok(WebSocketStream::from_raw(
-            h2_stream,
-            Role::Client,
-            self.config.clone(),
-        ))
+        Ok(
+            WebSocketStream::from_raw(h2_stream, Role::Client, self.config.clone())
+                .with_immediate_write_shutdown(),
+        )
     }
 
     /// Check if the connection is still open
@@ -272,11 +271,10 @@ impl MultiplexedConnection<Http3> {
             Some(send_request_guard),
         );
 
-        Ok(WebSocketStream::from_raw(
-            h3_stream,
-            Role::Client,
-            self.config.clone(),
-        ))
+        Ok(
+            WebSocketStream::from_raw(h3_stream, Role::Client, self.config.clone())
+                .with_immediate_write_shutdown(),
+        )
     }
 
     /// Check if the connection is still open
