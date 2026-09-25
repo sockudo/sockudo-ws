@@ -308,6 +308,7 @@ impl WebSocketClient<Http1> {
     /// Connect to a WebSocket server using a URI and additional HTTP headers.
     ///
     /// This is the custom-header counterpart to [`Self::connect_to_url`].
+    /// The newly created TCP socket has `TCP_NODELAY` enabled.
     /// Headers managed by the HTTP upgrade handshake cannot be overridden.
     /// Once writing begins, cancelling this future leaves the stream in an
     /// indeterminate handshake state and the stream should not be reused.
@@ -358,6 +359,7 @@ impl WebSocketClient<Http1> {
         // Connect to the server
         let addr = format!("{}:{}", host, port);
         let stream = TcpStream::connect(&addr).await.map_err(Error::Io)?;
+        stream.set_nodelay(true).map_err(Error::Io)?;
 
         // Perform handshake
         self.connect_with_headers(stream, host, path, protocol, extra_headers)
@@ -529,7 +531,8 @@ impl WebSocketClient<Http2> {
         let h2_stream = Stream::<Http2>::from_h2(send_stream, recv_stream);
 
         // Create and return WebSocketStream
-        Ok(WebSocketStream::from_raw(h2_stream, Role::Client, config))
+        Ok(WebSocketStream::from_raw(h2_stream, Role::Client, config)
+            .with_immediate_write_shutdown())
     }
 
     /// Connect to multiple WebSocket endpoints over the same HTTP/2 connection
@@ -660,18 +663,30 @@ impl WebSocketClient<Http3> {
         path: &str,
         subprotocol: Option<&str>,
         origin: Option<&str>,
-        tls_config: rustls::ClientConfig,
+        mut tls_config: rustls::ClientConfig,
     ) -> Result<WebSocketStream<Stream<Http3>>> {
         use http::{Method, Request};
+
+        if !self.config.http3.enable_connect_protocol {
+            return Err(Error::ExtendedConnectNotSupported);
+        }
+        let transport_config = crate::http3::quic_transport_config(&self.config.http3)?;
+        let endpoint_config = crate::http3::quic_endpoint_config(&self.config.http3)?;
+        // Do not let caller-provided TLS settings bypass the 0-RTT rejection above.
+        tls_config.enable_early_data = false;
 
         // Create QUIC client config
         let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
             .map_err(|_| Error::HandshakeFailed("invalid TLS config"))?;
 
-        let client_config = ClientConfig::new(Arc::new(quic_config));
+        let mut client_config = ClientConfig::new(Arc::new(quic_config));
+        client_config.transport_config(transport_config);
 
         // Create endpoint (bind to any available port)
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).map_err(Error::Io)?;
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(Error::Io)?;
+        let mut endpoint =
+            Endpoint::new(endpoint_config, None, socket, Arc::new(quinn::TokioRuntime))
+                .map_err(Error::Io)?;
         endpoint.set_default_client_config(client_config);
 
         // Connect to server via QUIC
@@ -682,7 +697,10 @@ impl WebSocketClient<Http3> {
             .map_err(Error::from)?;
 
         // Create HTTP/3 connection using h3 crate
-        let (mut driver, mut send_request) = h3::client::new(h3_quinn::Connection::new(connection))
+        let mut builder = h3::client::builder();
+        builder.enable_extended_connect(true);
+        let (mut driver, mut send_request) = builder
+            .build(h3_quinn::Connection::new(connection))
             .await
             .map_err(Error::from)?;
 
@@ -730,11 +748,10 @@ impl WebSocketClient<Http3> {
                     Some(send_request.clone()),
                 );
 
-                Ok(WebSocketStream::from_raw(
-                    h3_stream,
-                    Role::Client,
-                    self.config.clone(),
-                ))
+                Ok(
+                    WebSocketStream::from_raw(h3_stream, Role::Client, self.config.clone())
+                        .with_immediate_write_shutdown(),
+                )
             }
             StatusCode::NOT_IMPLEMENTED => Err(Error::ExtendedConnectNotSupported),
             StatusCode::FORBIDDEN => Err(Error::HandshakeFailed(
@@ -752,14 +769,26 @@ impl WebSocketClient<Http3> {
         &self,
         server_addr: SocketAddr,
         server_name: &str,
-        tls_config: rustls::ClientConfig,
+        mut tls_config: rustls::ClientConfig,
     ) -> Result<MultiplexedConnection<Http3>> {
+        if !self.config.http3.enable_connect_protocol {
+            return Err(Error::ExtendedConnectNotSupported);
+        }
+        let transport_config = crate::http3::quic_transport_config(&self.config.http3)?;
+        let endpoint_config = crate::http3::quic_endpoint_config(&self.config.http3)?;
+        // Do not let caller-provided TLS settings bypass the 0-RTT rejection above.
+        tls_config.enable_early_data = false;
+
         let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
             .map_err(|_| Error::HandshakeFailed("invalid TLS config"))?;
 
-        let client_config = ClientConfig::new(Arc::new(quic_config));
+        let mut client_config = ClientConfig::new(Arc::new(quic_config));
+        client_config.transport_config(transport_config);
 
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).map_err(Error::Io)?;
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(Error::Io)?;
+        let mut endpoint =
+            Endpoint::new(endpoint_config, None, socket, Arc::new(quinn::TokioRuntime))
+                .map_err(Error::Io)?;
         endpoint.set_default_client_config(client_config);
 
         let connection = endpoint
@@ -769,10 +798,12 @@ impl WebSocketClient<Http3> {
             .map_err(Error::from)?;
 
         // Create HTTP/3 connection
-        let (mut driver, send_request) =
-            h3::client::new(h3_quinn::Connection::new(connection.clone()))
-                .await
-                .map_err(Error::from)?;
+        let mut builder = h3::client::builder();
+        builder.enable_extended_connect(true);
+        let (mut driver, send_request) = builder
+            .build(h3_quinn::Connection::new(connection.clone()))
+            .await
+            .map_err(Error::from)?;
 
         // Spawn driver
         tokio::spawn(async move {
