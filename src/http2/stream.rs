@@ -25,7 +25,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 ///
 /// // After HTTP/2 handshake and Extended CONNECT negotiation
 /// let stream = Http2Stream::new(send_stream, recv_stream);
-/// let mut ws = WebSocketStream::server(stream, Config::default());
+/// let mut ws = WebSocketStream::server(stream, Config::default())
+///     .with_immediate_write_shutdown();
 ///
 /// // Use the same API as regular WebSocket
 /// while let Some(msg) = ws.next().await {
