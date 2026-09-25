@@ -1,7 +1,8 @@
 //! Stream API benchmarks: local completion cost, not per-message P99 latency.
 //!
 //! Each Criterion iteration represents 1,024 messages on one connection. Setup,
-//! runtime entry, task placement, and final peer validation are outside the clock.
+//! runtime entry, task placement, and the final peer join are outside the clock.
+//! The sending peer validates bytes concurrently with the timed writer.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -18,7 +19,8 @@ use tokio::net::{TcpListener, TcpStream};
 const MESSAGES_PER_ITERATION: usize = 1024;
 const PAYLOAD: [u8; 32] = [0x41; 32];
 const BATCH_SIZE: usize = 16;
-// Match the production split driver's application queue capacity.
+// Fixed queue capacity for the data-only model; the production split writer
+// now uses a shared sink instead of an application-message queue.
 const PROTOTYPE_QUEUE_CAPACITY: usize = 32;
 
 #[derive(Clone, Copy)]

@@ -29,7 +29,10 @@ async fn connection(
         let mut peer =
             tokio_tungstenite::WebSocketStream::from_raw_socket(peer, Role::Client, None).await;
         for _ in 0..WARMUP_MESSAGES {
-            assert_eq!(peer.next().await.unwrap().unwrap().into_data().len(), 32);
+            let PeerMessage::Binary(payload) = peer.next().await.unwrap().unwrap() else {
+                panic!("expected Binary warm-up message");
+            };
+            assert_eq!(payload.as_ref(), &[0; 32]);
         }
         peer_ready.send(()).unwrap();
         let mut samples = Delivery {
@@ -45,6 +48,7 @@ async fn connection(
             };
             let now = u64::try_from(epoch.elapsed().as_nanos()).unwrap();
             assert_eq!(payload.len(), 32);
+            assert_eq!(&payload[24..], &[0; 8]);
             assert_eq!(
                 u64::from_le_bytes(payload[..8].try_into().unwrap()),
                 sequence as u64

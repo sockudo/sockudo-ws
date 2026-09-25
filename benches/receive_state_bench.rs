@@ -92,7 +92,9 @@ async fn measure<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         }
         samples.push(start.elapsed().as_nanos() as f64 / (256 * readers.len()) as f64);
     }
-    for held in &retained {
+    // Check each reader after measurement even when retain=0 drops every sample.
+    for (reader, held) in readers.iter_mut().zip(&retained) {
+        assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), payload);
         for message in held {
             assert_eq!(message.as_bytes(), payload);
         }

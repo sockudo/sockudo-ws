@@ -371,4 +371,3 @@ required-features = ["tokio-runtime"]
 [[example]]
 name = "send_latency_diagnostic"
 required-features = ["tokio-runtime"]
-
