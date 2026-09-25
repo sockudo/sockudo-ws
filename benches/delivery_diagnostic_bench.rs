@@ -1,7 +1,9 @@
 //! Per-connection TCP delivery timelines for saturated or paced 32-byte messages.
 //! Receiver placement changes both runtime ownership and the available worker count.
 //! CSV connection rows: id, workers, count, rate, delivery_p99_ns, send_p99_ns,
-//! late_p99_ns, first_sent_ns, last_received_ns, max_gap_ns, gap_before_ns, gap_after_ns.
+//! late_p99_ns, first_sent_ns, last_received_ns, max_gap_ns, gap_before_ns, gap_after_ns,
+//! scheduled_p99_ns, scheduled_p99_p1_ns, sender_late_p99_p1_ns.
+//! Scheduling fields are empty for saturated traffic; all percentiles are per connection.
 //! CSV slow rows: id, sequence, due_ns, sent_ns, completed_ns, received_ns, delivery_ns.
 //! Default: one worker and connection, 128 messages at 1,000 messages/second, WS, tracing off.
 //! Arguments: sender_workers receiver_workers connections count rate_per_connection.
@@ -213,7 +215,7 @@ async fn receive<const RAW: bool, const TRACE: bool>(
         ))
     };
     for _ in 0..WARMUP_MESSAGES {
-        assert_eq!(peer.payload().await.len(), 32);
+        assert_eq!(peer.payload().await.as_ref(), &[0; 32]);
     }
     let mut samples = Received {
         sent_ns: Vec::with_capacity(count),
@@ -225,6 +227,7 @@ async fn receive<const RAW: bool, const TRACE: bool>(
         let payload = peer.payload().await;
         let received = u64::try_from(epoch.elapsed().as_nanos()).unwrap();
         assert_eq!(payload.len(), 32);
+        assert_eq!(&payload[24..], &[0; 8]);
         assert_eq!(
             u64::from_le_bytes(payload[..8].try_into().unwrap()),
             sequence as u64
@@ -354,6 +357,24 @@ async fn run<const RAW: bool, const TRACE: bool>(
             .zip(&received.due_ns)
             .map(|(sent, due)| sent.checked_sub(*due).unwrap())
             .collect();
+        let scheduled: Vec<_> = received
+            .received_ns
+            .iter()
+            .zip(&received.due_ns)
+            .map(|(received, due)| received.checked_sub(*due).unwrap())
+            .collect();
+        // Saturated sends have no independent schedule; do not report setup cost as lateness.
+        let [late_p99, scheduled_p99, scheduled_spread, late_spread]: [String; 4] = if rate == 0 {
+            Default::default()
+        } else {
+            [
+                percentile(&late, 99),
+                percentile(&scheduled, 99),
+                percentile(&scheduled, 99) - percentile(&scheduled, 1),
+                percentile(&late, 99) - percentile(&late, 1),
+            ]
+            .map(|value| value.to_string())
+        };
         let mut slowest: Vec<_> = (0..count).collect();
         slowest.sort_unstable_by_key(|&i| std::cmp::Reverse(latency[i]));
         let max_gap = received
@@ -413,10 +434,9 @@ async fn run<const RAW: bool, const TRACE: bool>(
             }
         }
         println!(
-            "connection,{id},{workers},{count},{rate},{},{},{},{},{},{},{},{}",
+            "connection,{id},{workers},{count},{rate},{},{},{late_p99},{},{},{},{},{},{scheduled_p99},{scheduled_spread},{late_spread}",
             percentile(&latency, 99),
             percentile(&send, 99),
-            percentile(&late, 99),
             received.sent_ns[0],
             received.received_ns[count - 1],
             max_gap.0,
