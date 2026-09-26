@@ -50,3 +50,25 @@ fn discarded_incompressible_output_does_not_leak_into_next_message() {
         assert_eq!(decode(&encoded, payload.len()), payload);
     }
 }
+
+#[test]
+fn no_takeover_messages_decode_with_fresh_peer_contexts() {
+    for level in [1, 6, 9] {
+        let mut encoder = DeflateEncoder::new(MAX_WINDOW_BITS, true, level, 32);
+        let payloads = [
+            b"repeat one ".repeat(1000),
+            Vec::new(),
+            b"tiny".to_vec(),
+            incompressible(192 * 1024),
+            b"repeat two ".repeat(300),
+            b"repeat one ".repeat(1000),
+            b"large message ".repeat(100_000),
+            b"repeat two ".repeat(8),
+        ];
+        for payload in &payloads {
+            if let Some(encoded) = encoder.compress(payload).unwrap() {
+                assert_eq!(decode(&encoded, payload.len()), *payload);
+            }
+        }
+    }
+}

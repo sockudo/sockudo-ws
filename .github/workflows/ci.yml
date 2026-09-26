@@ -8,6 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Keep cached CI artifacts portable across hosted runner CPUs.
+  RUSTFLAGS: ""
 
 jobs:
   autobahn:
@@ -15,32 +17,51 @@ jobs:
     uses: ./.github/workflows/autobahn.yml
 
   test:
-    name: Test
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            runner: ubuntu-latest
+            args: ""
+          - name: arm64
+            runner: ubuntu-24.04-arm
+            args: ""
+          - name: all-features
+            runner: ubuntu-latest
+            args: --all-features
+          - name: tokio
+            runner: ubuntu-latest
+            args: --no-default-features --features tokio-runtime,http2,http3
+          - name: compio
+            runner: ubuntu-latest
+            args: --no-default-features --features compio-runtime,http2,http3
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.name }}
 
-      - name: Build
-        run: cargo build --all-features
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
 
       - name: Run tests
-        run: cargo test --all-features
+        run: cargo nextest run --locked ${{ matrix.args }} --profile ci
+
+      - name: Run doctests
+        if: matrix.name == 'all-features'
+        run: cargo test --locked --doc --all-features
 
       - name: Clippy
-        run: cargo clippy --all-features -- -D warnings
+        if: matrix.name == 'all-features' || matrix.name == 'default' || matrix.name == 'arm64'
+        run: cargo clippy --locked ${{ matrix.args }} --all-targets -- -D warnings
 
   fmt:
     name: Format
