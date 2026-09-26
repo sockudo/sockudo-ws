@@ -8,6 +8,8 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+use std::mem::MaybeUninit;
+
 use crate::error::{CloseReason, Error, Result};
 use crate::simd::{apply_mask, apply_mask_offset};
 use crate::utf8::validate_utf8;
@@ -935,7 +937,7 @@ impl FrameParser {
 ///
 /// This is the fast path for frame encoding. For masked frames (client mode),
 /// the payload will be copied and masked.
-#[inline]
+#[inline(always)]
 pub fn encode_frame(
     buf: &mut BytesMut,
     opcode: OpCode,
@@ -987,7 +989,7 @@ pub fn encode_frame_header_with_rsv(
 /// Encode a frame with RSV1 bit control (for compression)
 ///
 /// When `rsv1` is true, sets the RSV1 bit indicating compressed data.
-#[inline]
+#[inline(always)]
 pub fn encode_frame_with_rsv(
     buf: &mut BytesMut,
     opcode: OpCode,
@@ -1057,7 +1059,11 @@ pub fn encode_frame_with_rsv(
 
             // Copy and mask payload in a single pass
             let payload_dst = base.add(offset);
-            encode_payload_masked_inline(payload_dst, payload.as_ptr(), payload_len, m);
+            // SAFETY: The reserved destination is disjoint from payload. Its
+            // spare capacity is writable but must not be read before initialization.
+            let destination =
+                std::slice::from_raw_parts_mut(payload_dst.cast::<MaybeUninit<u8>>(), payload_len);
+            encode_payload_masked_inline(destination, payload, m);
         } else {
             // Fast path: just copy payload
             std::ptr::copy_nonoverlapping(payload.as_ptr(), base.add(offset), payload_len);
@@ -1068,38 +1074,94 @@ pub fn encode_frame_with_rsv(
     }
 }
 
-/// Inline masking during copy - single pass for masked frames
+/// Inline masking during copy - single pass for masked frames.
 ///
-/// SAFETY: Caller must ensure dst has at least `len` bytes available
+/// Disjoint slices expose the copy's aliasing contract to the optimizer. Like
+/// `apply_mask_words`, the 64-byte blocks leave vectorization and unrolling to
+/// LLVM. The destination may be uninitialized: only stores may access it.
+#[inline(always)]
+fn encode_payload_masked_inline(dst: &mut [MaybeUninit<u8>], src: &[u8], mask: [u8; 4]) {
+    if src.len() >= 256 {
+        copy_mask_long(dst, src, mask);
+    } else {
+        copy_mask_words(dst, src, mask);
+    }
+}
+
+// Keep the long vector loop out of frame-encoding call sites while allowing
+// short payloads to retain caller specialization.
+#[inline(never)]
+fn copy_mask_long(dst: &mut [MaybeUninit<u8>], src: &[u8], mask: [u8; 4]) {
+    copy_mask_words(dst, src, mask);
+}
+
+#[inline(always)]
+fn copy_mask_words(dst: &mut [MaybeUninit<u8>], src: &[u8], mask: [u8; 4]) {
+    assert_eq!(dst.len(), src.len());
+    let mask_u32 = u32::from_ne_bytes(mask);
+    let mask_u64 = u64::from(mask_u32) | (u64::from(mask_u32) << 32);
+    let (dst_blocks, mut dst_tail) = dst.as_chunks_mut::<64>();
+    let (src_blocks, mut src_tail) = src.as_chunks::<64>();
+    for (dst, src) in dst_blocks.iter_mut().zip(src_blocks) {
+        copy_mask_block(dst, src, mask_u64);
+    }
+
+    // Fixed-size tails avoid a vector loop with a runtime lane mask for just
+    // one or two words. Each block preserves mask phase zero.
+    if let Some((src, rest)) = src_tail.split_first_chunk::<32>() {
+        let (dst, tail) = dst_tail
+            .split_first_chunk_mut::<32>()
+            .expect("equal copy lengths");
+        copy_mask_block(dst, src, mask_u64);
+        src_tail = rest;
+        dst_tail = tail;
+    }
+    if let Some((src, rest)) = src_tail.split_first_chunk::<16>() {
+        let (dst, tail) = dst_tail
+            .split_first_chunk_mut::<16>()
+            .expect("equal copy lengths");
+        copy_mask_block(dst, src, mask_u64);
+        src_tail = rest;
+        dst_tail = tail;
+    }
+    // Process 8-byte chunk if remaining.
+    if let Some((src, rest)) = src_tail.split_first_chunk::<8>() {
+        let (dst, tail) = dst_tail
+            .split_first_chunk_mut::<8>()
+            .expect("equal copy lengths");
+        copy_mask_block(dst, src, mask_u64);
+        src_tail = rest;
+        dst_tail = tail;
+    }
+
+    // Process 4-byte chunk if remaining.
+    let (dst_words, dst_tail) = dst_tail.as_chunks_mut::<4>();
+    let (src_words, src_tail) = src_tail.as_chunks::<4>();
+    for (dst, src) in dst_words.iter_mut().zip(src_words) {
+        let word = (u32::from_ne_bytes(*src) ^ u32::from_ne_bytes(mask)).to_ne_bytes();
+        for (dst, byte) in dst.iter_mut().zip(word) {
+            dst.write(byte);
+        }
+    }
+
+    // Process remaining bytes.
+    for (i, (dst, src)) in dst_tail.iter_mut().zip(src_tail).enumerate() {
+        dst.write(src ^ mask[i]);
+    }
+}
+
+/// Mask complete words without reading the possibly uninitialized destination.
 #[inline]
-unsafe fn encode_payload_masked_inline(dst: *mut u8, src: *const u8, len: usize, mask: [u8; 4]) {
-    unsafe {
-        let mask_u32 = u32::from_ne_bytes(mask);
-
-        // Process 8 bytes at a time for better throughput
-        let mut i = 0;
-
-        // Process 8-byte chunks
-        while i + 8 <= len {
-            let mask_u64 = ((mask_u32 as u64) << 32) | (mask_u32 as u64);
-            let src_val = std::ptr::read_unaligned(src.add(i) as *const u64);
-            let masked = src_val ^ mask_u64;
-            std::ptr::write_unaligned(dst.add(i) as *mut u64, masked);
-            i += 8;
-        }
-
-        // Process 4-byte chunk if remaining
-        if i + 4 <= len {
-            let src_val = std::ptr::read_unaligned(src.add(i) as *const u32);
-            let masked = src_val ^ mask_u32;
-            std::ptr::write_unaligned(dst.add(i) as *mut u32, masked);
-            i += 4;
-        }
-
-        // Process remaining bytes
-        while i < len {
-            dst.add(i).write(src.add(i).read() ^ mask[i & 3]);
-            i += 1;
+fn copy_mask_block<const N: usize>(dst: &mut [MaybeUninit<u8>; N], src: &[u8; N], mask: u64) {
+    for (dst, src) in dst
+        .as_chunks_mut::<8>()
+        .0
+        .iter_mut()
+        .zip(src.as_chunks::<8>().0)
+    {
+        let word = (u64::from_ne_bytes(*src) ^ mask).to_ne_bytes();
+        for (dst, byte) in dst.iter_mut().zip(word) {
+            dst.write(byte);
         }
     }
 }
@@ -1107,6 +1169,52 @@ unsafe fn encode_payload_masked_inline(dst: *mut u8, src: *const u8, len: usize,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_mask_preserves_destination_boundaries() {
+        let mask = [0x37, 0xfa, 0x21, 0x3d];
+        for len in (0..=129).chain([255, 256, 257, 511, 512, 513]) {
+            for offset in 0..16 {
+                // The payload ends at the allocation boundary, without readable padding.
+                let source: Box<[u8]> = (0..offset + len).map(|i| (i * 37 + 17) as u8).collect();
+                let payload = &source[offset..];
+                let mut destination = vec![MaybeUninit::new(0xa5); offset + len + 16];
+                encode_payload_masked_inline(&mut destination[offset..offset + len], payload, mask);
+                // SAFETY: Sentinels were initialized above; the helper writes every
+                // byte of the payload range.
+                let destination: Vec<_> = destination
+                    .into_iter()
+                    .map(|b| unsafe { b.assume_init() })
+                    .collect();
+                let expected: Vec<_> = payload
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| b ^ mask[i & 3])
+                    .collect();
+                assert_eq!(&destination[offset..offset + len], expected);
+                assert!(destination[..offset].iter().all(|b| *b == 0xa5));
+                assert!(destination[offset + len..].iter().all(|b| *b == 0xa5));
+            }
+        }
+    }
+
+    #[test]
+    fn copy_mask_initializes_exact_destination() {
+        let mask = [0x37, 0xfa, 0x21, 0x3d];
+        for len in (0..=129).chain([255, 256, 257, 511, 512, 513]) {
+            let source: Box<[u8]> = (0..len).map(|i| (i * 37 + 17) as u8).collect();
+            let mut destination = Box::<[u8]>::new_uninit_slice(len);
+            encode_payload_masked_inline(&mut destination, &source, mask);
+            // SAFETY: The helper initializes every byte, including all remainders.
+            let destination = unsafe { destination.assume_init() };
+            let expected: Vec<_> = source
+                .iter()
+                .enumerate()
+                .map(|(i, b)| b ^ mask[i & 3])
+                .collect();
+            assert_eq!(&*destination, expected);
+        }
+    }
 
     #[test]
     fn test_opcode() {
