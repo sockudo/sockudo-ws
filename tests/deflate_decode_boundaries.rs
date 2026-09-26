@@ -1,5 +1,6 @@
 #![cfg(feature = "permessage-deflate")]
 
+use rstest::rstest;
 use sockudo_ws::Error;
 use sockudo_ws::deflate::{DeflateDecoder, DeflateEncoder};
 
@@ -47,7 +48,7 @@ fn decompression_rejects_invalid_data_after_a_final_block() {
 }
 
 #[test]
-fn decompression_accepts_the_rfc_final_block_example() {
+fn decompression_accepts_a_valid_final_block() {
     let mut decoder = DeflateDecoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, false);
 
     let decoded = decoder
@@ -55,6 +56,15 @@ fn decompression_accepts_the_rfc_final_block_example() {
         .unwrap();
 
     assert_eq!(decoded.as_ref(), b"Hello");
+}
+
+#[test]
+fn decompression_accepts_an_empty_final_stored_block() {
+    let mut decoder = DeflateDecoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, false);
+
+    let decoded = decoder.decompress(&[0x01], 0).unwrap();
+
+    assert!(decoded.is_empty());
 }
 
 #[test]
@@ -98,6 +108,20 @@ fn decompression_accepts_multiple_final_blocks_in_one_message() {
 }
 
 #[test]
+fn decompression_rejects_output_over_limit_across_final_streams() {
+    let first = vec![b'A'; 1024];
+    let second = [vec![b'A'; 768], vec![b'B'; 256]].concat();
+    let mut compressed = finish_deflate(&first, None);
+    compressed.extend_from_slice(&finish_deflate(&second, Some(&first)));
+    compressed.push(0);
+    let mut decoder = DeflateDecoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, true);
+
+    let result = decoder.decompress(&compressed, first.len());
+
+    assert!(matches!(result, Err(Error::MessageTooLarge)));
+}
+
+#[test]
 fn decompression_accepts_consecutive_final_blocks_without_context_takeover() {
     let payloads = [vec![b'A'; 1024], vec![b'B'; 1024]];
     let compressed = payloads
@@ -127,80 +151,95 @@ fn decompression_rejects_output_over_limit_in_the_final_call() {
     assert!(matches!(result, Err(Error::MessageTooLarge)));
 }
 
+#[rstest]
+#[case::empty(0)]
+#[case::bytes_32(32)]
+#[case::bytes_1024(1024)]
+#[case::bytes_1025(1025)]
+#[case::bytes_5120(5120)]
+#[case::bytes_65536(65536)]
+fn decompression_accepts_exact_limits_across_output_growth(#[case] size: usize) {
+    let payload = vec![b'A'; size];
+    let compressed = if size == 0 {
+        // An empty sync-flushed DEFLATE block with the four-byte trailer removed.
+        vec![0].into()
+    } else {
+        DeflateEncoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, true, 6, 0)
+            .compress(&payload)
+            .unwrap()
+            .unwrap()
+    };
+    let mut decoder = DeflateDecoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, true);
+
+    let result = decoder.decompress(&compressed, size).unwrap();
+
+    assert_eq!(result.as_ref(), payload);
+}
+
 #[test]
-fn decompression_accepts_exact_limits_across_output_growth() {
-    for size in [0, 32, 1024, 1025, 5120, 65536] {
-        let payload = vec![b'A'; size];
-        let compressed = if size == 0 {
-            // An empty sync-flushed DEFLATE block with the four-byte trailer removed.
-            vec![0].into()
-        } else {
-            DeflateEncoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, true, 6, 0)
-                .compress(&payload)
-                .unwrap()
-                .unwrap()
-        };
-        let mut decoder = DeflateDecoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, true);
+fn exact_limit_probe_preserves_context_takeover() {
+    let payload = vec![b'A'; 1024];
+    let mut encoder = DeflateEncoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, false, 6, 0);
+    let first = encoder.compress(&payload).unwrap().unwrap();
+    let second = encoder.compress(&payload).unwrap().unwrap();
+    let mut decoder = DeflateDecoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, false);
 
-        let result = decoder.decompress(&compressed, size).unwrap();
+    assert_eq!(decoder.decompress(&first, 1024).unwrap().as_ref(), payload);
+    assert_eq!(decoder.decompress(&second, 1024).unwrap().as_ref(), payload);
+}
 
-        assert_eq!(result.as_ref(), payload);
+#[rstest]
+#[case::takeover(false)]
+#[case::no_takeover(true)]
+fn decompression_reuses_input_without_retaining_previous_message_bytes(
+    #[case] no_context_takeover: bool,
+) {
+    let mut encoder = flate2::Compress::new(flate2::Compression::new(6), false);
+    let mut decoder =
+        DeflateDecoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, no_context_takeover);
+    let mut state = 0x1234_5678_9abc_def0u64;
+    for size in [32, 65536, 1, 4096, 0, 256, 32] {
+        let payload: Vec<u8> = (0..size)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        if no_context_takeover {
+            encoder.reset();
+        }
+        if size == 0 {
+            // Repeated Sync flush need not emit bytes; encode an empty stored block.
+            assert!(decoder.decompress(&[0], 0).unwrap().is_empty());
+            continue;
+        }
+        let mut encoded = vec![0; size * 2 + 128];
+        let before_in = encoder.total_in();
+        let before_out = encoder.total_out();
+        encoder
+            .compress(&payload, &mut encoded, flate2::FlushCompress::Sync)
+            .unwrap();
+        assert_eq!(encoder.total_in() - before_in, size as u64);
+        encoded.truncate((encoder.total_out() - before_out) as usize);
+        assert!(encoded.ends_with(&[0, 0, 255, 255]));
+        encoded.truncate(encoded.len() - 4);
+        assert_eq!(
+            decoder.decompress(&encoded, size).unwrap().as_ref(),
+            payload
+        );
     }
 }
 
 #[test]
-fn decompression_drains_output_after_filling_the_initial_capacity() {
-    use flate2::{Compress, Compression, FlushCompress};
-
-    // A random prefix keeps the compressed payload large. Find adjacent
-    // payloads where one exactly fills the decoder's initial 4x capacity and
-    // the other has one more output byte pending with the same input length.
-    let mut random = 0x9e37_79b9_7f4a_7c15u64;
-    let prefix: Vec<u8> = (0..8192)
-        .map(|_| {
-            random ^= random << 13;
-            random ^= random >> 7;
-            random ^= random << 17;
-            random as u8
-        })
-        .collect();
-    let compress = |run: usize| {
-        let payload = [prefix.clone(), vec![b'A'; run]].concat();
-        let mut encoder = Compress::new_with_window_bits(Compression::new(6), false, 15);
-        let mut output = Vec::with_capacity(payload.len() + 64);
-        encoder
-            .compress_vec(&payload, &mut output, FlushCompress::Sync)
-            .unwrap();
-        assert!(output.ends_with(&[0, 0, 0xff, 0xff]));
-        output.truncate(output.len() - 4);
-        (payload, output)
-    };
-    let (exact, longer) = (prefix.len() * 3..prefix.len() * 4)
-        .map(|run| (compress(run), compress(run + 1)))
-        .find(|((payload, compressed), (_, longer))| {
-            payload.len() == compressed.len() * 4 && longer.len() == compressed.len()
-        })
-        .expect("a payload exactly four times its compressed length");
-    let limit = exact.0.len();
-
+fn decoder_reset_allows_reuse_after_a_rejected_message() {
     let mut decoder = DeflateDecoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, false);
+    assert!(decoder.decompress(&[0x07; 4096], 1024).is_err());
+    decoder.reset();
+    let encoded = finish_message(b"valid after reset", None);
     assert_eq!(
-        decoder.decompress(&exact.1, limit).unwrap().as_ref(),
-        exact.0
-    );
-    assert_eq!(
-        decoder.decompress(&exact.1, limit).unwrap().as_ref(),
-        exact.0
-    );
-
-    let mut decoder = DeflateDecoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, false);
-    assert!(matches!(
-        decoder.decompress(&longer.1, limit),
-        Err(Error::MessageTooLarge)
-    ));
-    let mut decoder = DeflateDecoder::new(sockudo_ws::deflate::MAX_WINDOW_BITS, false);
-    assert_eq!(
-        decoder.decompress(&longer.1, limit + 1).unwrap().as_ref(),
-        longer.0
+        decoder.decompress(&encoded, 17).unwrap().as_ref(),
+        b"valid after reset"
     );
 }

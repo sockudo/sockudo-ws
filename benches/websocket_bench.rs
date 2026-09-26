@@ -2,8 +2,10 @@
 //!
 //! Run with: cargo bench
 
+use std::hint::black_box;
+
 use bytes::BytesMut;
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use sockudo_ws::frame::{FrameParser, OpCode, encode_frame};
 use sockudo_ws::simd::apply_mask;
@@ -29,12 +31,40 @@ fn bench_mask(c: &mut Criterion) {
     group.finish();
 }
 
+/// Mask realistic payload offsets relative to a known aligned base.
+fn bench_mask_alignment(c: &mut Criterion) {
+    let mut group = c.benchmark_group("mask_alignment");
+    for size in [0, 8, 16, 32, 63, 64, 65, 125, 128, 256, 1024, 4096] {
+        group.throughput(Throughput::Bytes(size as u64));
+        for offset in [0, 6, 13] {
+            let mut storage = vec![0x42; size + 128];
+            let start = storage.as_ptr().align_offset(64) + offset;
+            let data = &mut storage[start..start + size];
+            let mask = [0x37, 0xfa, 0x21, 0x3d];
+            let expected: Vec<_> = data
+                .iter()
+                .enumerate()
+                .map(|(i, value)| value ^ mask[i & 3])
+                .collect();
+            apply_mask(data, mask);
+            assert_eq!(data, expected);
+
+            group.bench_function(BenchmarkId::new(format!("offset_{offset}"), size), |b| {
+                b.iter(|| apply_mask(black_box(data), black_box(mask)));
+            });
+        }
+    }
+    group.finish();
+}
+
 /// Benchmark UTF-8 validation
 fn bench_utf8(c: &mut Criterion) {
     let mut group = c.benchmark_group("utf8");
 
     // ASCII-only strings
-    for size in [64, 256, 1024, 4096, 16384] {
+    for size in [
+        0, 8, 16, 32, 34, 63, 64, 65, 128, 256, 1024, 4096, 8192, 16384,
+    ] {
         let ascii = "a".repeat(size);
         group.throughput(Throughput::Bytes(size as u64));
 
@@ -44,7 +74,7 @@ fn bench_utf8(c: &mut Criterion) {
     }
 
     // Mixed UTF-8
-    for size in [64, 256, 1024, 4096] {
+    for size in [32, 48, 64, 256, 1024, 4096] {
         let mixed = "Hello, 世界! 🎉 ".repeat(size / 20);
         group.throughput(Throughput::Bytes(mixed.len() as u64));
 
@@ -60,7 +90,7 @@ fn bench_utf8(c: &mut Criterion) {
 fn bench_parse(c: &mut Criterion) {
     let mut group = c.benchmark_group("parse");
 
-    for size in [8, 64, 256, 1024, 4096] {
+    for size in [8, 64, 125, 126, 256, 1024, 4096, 65535, 65536] {
         // Create a masked frame
         let mask = [0x37, 0xfa, 0x21, 0x3d];
         let mut buf = BytesMut::new();
@@ -76,11 +106,18 @@ fn bench_parse(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("masked", size), &frame_data, |b, data| {
             let mut parser = FrameParser::new(1024 * 1024, true);
+            let mut check = BytesMut::from(data.as_ref());
+            assert_eq!(
+                parser.parse(&mut check).unwrap().unwrap().payload.as_ref(),
+                payload.as_slice()
+            );
+            assert!(check.is_empty());
 
-            b.iter(|| {
-                let mut buf = BytesMut::from(data.as_ref());
-                parser.parse(black_box(&mut buf)).unwrap()
-            });
+            b.iter_batched(
+                || BytesMut::from(data.as_ref()),
+                |mut buf| parser.parse(black_box(&mut buf)).unwrap(),
+                BatchSize::SmallInput,
+            );
         });
     }
 
@@ -153,6 +190,7 @@ fn bench_handshake(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_mask,
+    bench_mask_alignment,
     bench_utf8,
     bench_parse,
     bench_encode,
