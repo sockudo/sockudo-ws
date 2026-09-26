@@ -191,10 +191,13 @@ impl DeflateEncoder {
             return Ok(None);
         }
 
-        // Reset context if required
-        if self.no_context_takeover {
-            self.compress.reset();
-        }
+        // Forget history at the preceding message boundary so each no-takeover
+        // message remains independently decodable without a pre-message reset.
+        let flush = if self.no_context_takeover {
+            FlushCompress::Full
+        } else {
+            FlushCompress::Sync
+        };
 
         // Estimate output size (compressed data is often smaller, but we need headroom)
         let max_output = data.len() + 64;
@@ -207,6 +210,10 @@ impl DeflateEncoder {
         loop {
             iterations += 1;
             if iterations > 100_000 {
+                // A failed flush cannot establish the next message boundary.
+                if self.no_context_takeover {
+                    self.compress.reset();
+                }
                 return Err(Error::Compression(
                     "compression took too many iterations".into(),
                 ));
@@ -228,10 +235,16 @@ impl DeflateEncoder {
             let spare = output.spare_capacity_mut();
             let spare_len = spare.len();
 
-            let status = self
-                .compress
-                .compress_uninit(input, spare, FlushCompress::Sync)
-                .map_err(|e| Error::Compression(format!("deflate error: {}", e)))?;
+            let status = match self.compress.compress_uninit(input, spare, flush) {
+                Ok(status) => status,
+                Err(error) => {
+                    // Restore independence before the caller can reuse this encoder.
+                    if self.no_context_takeover {
+                        self.compress.reset();
+                    }
+                    return Err(Error::Compression(format!("deflate error: {error}")));
+                }
+            };
 
             let consumed = (self.compress.total_in() - before_in) as usize;
             let produced = (self.compress.total_out() - before_out) as usize;
@@ -261,7 +274,7 @@ impl DeflateEncoder {
             output.truncate(output.len() - 4);
         }
 
-        // Only skip where the encoder resets per message. Otherwise the caller
+        // Only skip where the encoder clears history per message. Otherwise the caller
         // sends these bytes raw, so they stay in our window without ever
         // entering the peer's, and every later back-reference resolves against
         // different history: corrupt messages, or a connection that dies.
