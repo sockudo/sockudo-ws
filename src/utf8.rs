@@ -16,6 +16,11 @@
 /// the standard validator on other targets. Validation spans vector boundaries.
 #[inline]
 pub fn validate_utf8(data: &[u8]) -> bool {
+    // Below simdutf8's 64-byte threshold, ASCII can skip the scalar UTF-8 decoder.
+    if data.len() < 64 && data.is_ascii() {
+        return true;
+    }
+
     simdutf8::basic::from_utf8(data).is_ok()
 }
 
