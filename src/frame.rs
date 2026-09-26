@@ -1081,7 +1081,23 @@ pub fn encode_frame_with_rsv(
 /// LLVM. The destination may be uninitialized: only stores may access it.
 #[inline(always)]
 fn encode_payload_masked_inline(dst: &mut [MaybeUninit<u8>], src: &[u8], mask: [u8; 4]) {
-    debug_assert_eq!(dst.len(), src.len());
+    if src.len() >= 256 {
+        copy_mask_long(dst, src, mask);
+    } else {
+        copy_mask_words(dst, src, mask);
+    }
+}
+
+// Keep the long vector loop out of frame-encoding call sites while allowing
+// short payloads to retain caller specialization.
+#[inline(never)]
+fn copy_mask_long(dst: &mut [MaybeUninit<u8>], src: &[u8], mask: [u8; 4]) {
+    copy_mask_words(dst, src, mask);
+}
+
+#[inline(always)]
+fn copy_mask_words(dst: &mut [MaybeUninit<u8>], src: &[u8], mask: [u8; 4]) {
+    assert_eq!(dst.len(), src.len());
     let mask_u32 = u32::from_ne_bytes(mask);
     let mask_u64 = u64::from(mask_u32) | (u64::from(mask_u32) << 32);
     let (dst_blocks, mut dst_tail) = dst.as_chunks_mut::<64>();
@@ -1151,12 +1167,54 @@ fn copy_mask_block<const N: usize>(dst: &mut [MaybeUninit<u8>; N], src: &[u8; N]
 }
 
 #[cfg(test)]
-#[path = "frame_mask_tests.rs"]
-mod frame_mask_tests;
-
-#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_mask_preserves_destination_boundaries() {
+        let mask = [0x37, 0xfa, 0x21, 0x3d];
+        for len in (0..=129).chain([255, 256, 257, 511, 512, 513]) {
+            for offset in 0..16 {
+                // The payload ends at the allocation boundary, without readable padding.
+                let source: Box<[u8]> = (0..offset + len).map(|i| (i * 37 + 17) as u8).collect();
+                let payload = &source[offset..];
+                let mut destination = vec![MaybeUninit::new(0xa5); offset + len + 16];
+                encode_payload_masked_inline(&mut destination[offset..offset + len], payload, mask);
+                // SAFETY: Sentinels were initialized above; the helper writes every
+                // byte of the payload range.
+                let destination: Vec<_> = destination
+                    .into_iter()
+                    .map(|b| unsafe { b.assume_init() })
+                    .collect();
+                let expected: Vec<_> = payload
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| b ^ mask[i & 3])
+                    .collect();
+                assert_eq!(&destination[offset..offset + len], expected);
+                assert!(destination[..offset].iter().all(|b| *b == 0xa5));
+                assert!(destination[offset + len..].iter().all(|b| *b == 0xa5));
+            }
+        }
+    }
+
+    #[test]
+    fn copy_mask_initializes_exact_destination() {
+        let mask = [0x37, 0xfa, 0x21, 0x3d];
+        for len in (0..=129).chain([255, 256, 257, 511, 512, 513]) {
+            let source: Box<[u8]> = (0..len).map(|i| (i * 37 + 17) as u8).collect();
+            let mut destination = Box::<[u8]>::new_uninit_slice(len);
+            encode_payload_masked_inline(&mut destination, &source, mask);
+            // SAFETY: The helper initializes every byte, including all remainders.
+            let destination = unsafe { destination.assume_init() };
+            let expected: Vec<_> = source
+                .iter()
+                .enumerate()
+                .map(|(i, b)| b ^ mask[i & 3])
+                .collect();
+            assert_eq!(&*destination, expected);
+        }
+    }
 
     #[test]
     fn test_opcode() {
