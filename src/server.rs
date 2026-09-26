@@ -398,6 +398,7 @@ impl WebSocketServer<Http2> {
         let mut h2_builder = server::Builder::new();
 
         h2_builder
+            .max_frame_size(config.http2.validated_max_frame_size()?)
             .initial_window_size(config.http2.initial_stream_window_size)
             .initial_connection_window_size(config.http2.initial_connection_window_size)
             .max_concurrent_streams(config.http2.max_concurrent_streams);
@@ -448,6 +449,7 @@ impl WebSocketServer<Http2> {
         let mut h2_builder = server::Builder::new();
 
         h2_builder
+            .max_frame_size(config.http2.validated_max_frame_size()?)
             .initial_window_size(config.http2.initial_stream_window_size)
             .initial_connection_window_size(config.http2.initial_connection_window_size)
             .max_concurrent_streams(config.http2.max_concurrent_streams);
@@ -529,6 +531,7 @@ where
 
         // Create WebSocketStream over Stream<Http2>
         let ws = WebSocketStream::from_raw(h2_stream, Role::Server, config)
+            .with_http2_receive_chunks()
             .with_immediate_write_shutdown();
 
         // Call user handler
@@ -583,6 +586,7 @@ where
         let recv_stream = request.into_body();
         let h2_stream = Stream::<Http2>::from_h2(send_stream, recv_stream);
         let ws = WebSocketStream::from_raw(h2_stream, Role::Server, config)
+            .with_http2_receive_chunks()
             .with_immediate_write_shutdown();
 
         handler(ws, ws_req).await;

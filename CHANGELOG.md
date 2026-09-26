@@ -9,13 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Breaking for exhaustive struct literals:** `Http2Config::max_frame_size` and `ConfigBuilder::http2_max_frame_size` configure the advertised HTTP/2 receive frame limit on Tokio and Compio endpoints. The default remains 16 KiB; values outside 16,384–16,777,215 return a handshake error. Larger settings trade framing overhead for receive memory and latency of other streams.
 - Compressed Tokio streams now accept post-handshake frame bytes through `client_with_leftover` and `server_with_leftover`, including when split before the first read; existing constructors continue to start with an empty receive buffer.
 - `WebSocketServer<Http1>::protocols` configures HTTP/1 subprotocol selection in server preference order while preserving the existing first-offered default when no list is configured.
 
 ### Changed
 
-- Tokio HTTP/2 adapters retain unread DATA chunks instead of copying their remainder into a preallocated 64 KiB buffer. Fully consumed chunks are released immediately; flow-control capacity is returned at the same point as before.
-
+- Tokio HTTP/2 adapters no longer preallocate a 64 KiB receive buffer or copy DATA remainders into one. Built-in HTTP/2 WebSocket clients and servers consume owned DATA chunks, including after splitting; complete unmasked frames share their payload storage with h2. Custom HTTP/2 wrappers can enable this with `with_http2_receive_chunks()`. Cross-chunk frames and masked payloads still require writable storage; held messages can retain the underlying connection allocation.
 - Tokio unified and split readers try reclaiming an empty receive window once buffered input has reached half the window, avoiding later movement of partially received frames when the storage can be reused. Small buffered inputs avoid repeated shared-buffer ownership checks; retained payloads can prevent reclamation, and continuously nonempty receive buffers cannot use this reclaim point. Compio readers are unchanged.
 - Reduce compression overhead for outgoing messages with `no_context_takeover` by clearing DEFLATE history at completed message boundaries. This includes the no-takeover settings selected by `Compression::Shared`, `Compression::Window1KB`, `Compression::Window2KB`, and `DeflateConfig::low_memory()`. Context-takeover compression is unchanged; this does not accelerate receiving existing compressed traffic. Measured improvements use a 32 KiB window and do not establish the same gain for smaller windows.
 - Reduce client frame encoding latency for medium and large payloads with compiler-vectorized copy-and-mask blocks. Results depend on payload size, alignment and target CPU features; the copy-and-mask kernel is used only for masked client frames.
@@ -49,6 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Tokio HTTP/2 adapters skip empty DATA frames without reporting premature EOF; END_STREAM still terminates reads after queued bytes.
 - Accepted non-final data frames, including empty continuations and compressed fragments, refresh inbound activity for Tokio and Compio streams and split readers. Partial frame bytes and repeated polls do not extend inactivity deadlines, and fragment activity does not postpone an outstanding Pong or Close deadline.
 - HTTP/1 `Stream` forwards vectored writes and reports the underlying transport's vectored-write capability; Axum `UpgradedStream` now reports that capability as well. Partial writes, pending operations and transport errors retain their underlying semantics.
 - HTTP/1 handshake nonces now use the selected RNG backend (`getrandom`, then `rand_rng`, then `fastrand`) instead of a timestamp-seeded byte loop. The default fastrand nonce generator forks the thread RNG once, then keeps separate state from frame masking; no-RNG builds also keep separate fallback states. Native fastrand seeds from a clock and thread ID, not OS entropy. These non-cryptographic backends do not provide a cryptographic isolation guarantee; use `getrandom` or `rand_rng` when cryptographically secure output is required.

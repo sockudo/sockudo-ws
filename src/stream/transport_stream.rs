@@ -242,12 +242,31 @@ impl Stream<Http2> {
 }
 
 #[cfg(feature = "http2")]
+impl crate::http2::stream::Http2Receive for Stream<Http2> {
+    fn poll_recv_chunk(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<Bytes>> {
+        let StreamInner::Http2(inner) = &mut self.inner else {
+            unreachable!()
+        };
+        crate::http2::stream::poll_recv_chunk(
+            &mut inner.recv,
+            &mut inner.recv_buf,
+            &mut inner.recv_eof,
+            cx,
+        )
+    }
+}
+
+#[cfg(feature = "http2")]
 impl AsyncRead for Stream<Http2> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
         let inner = match &mut self.inner {
             StreamInner::Http2(inner) => inner,
             _ => unreachable!(),
@@ -271,32 +290,23 @@ impl AsyncRead for Stream<Http2> {
             return Poll::Ready(Ok(()));
         }
 
-        // Poll the h2 RecvStream for more data
-        match Pin::new(&mut inner.recv).poll_data(cx) {
-            Poll::Ready(Some(Ok(mut data))) => {
-                // Release flow control capacity back to sender
-                let len = data.len();
-                let _ = inner.recv.flow_control().release_capacity(len);
-
-                // Copy what we can to the output buffer
-                let to_copy = std::cmp::min(buf.remaining(), data.len());
-                buf.put_slice(&data[..to_copy]);
-                // Retain the owned h2 DATA remainder for the next read.
-                // Fully consumed chunks are dropped immediately, including at EOF.
-                if to_copy < data.len() {
-                    data.advance(to_copy);
-                    inner.recv_buf = data;
-                }
-
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(e))),
-            Poll::Ready(None) => {
-                inner.recv_eof = true;
-                Poll::Ready(Ok(()))
-            }
-            Poll::Pending => Poll::Pending,
+        // Poll the h2 RecvStream for more data, skipping empty DATA frames.
+        let mut data = std::task::ready!(crate::http2::stream::poll_recv_chunk(
+            &mut inner.recv,
+            &mut inner.recv_buf,
+            &mut inner.recv_eof,
+            cx
+        ))?;
+        // Copy what we can to the output buffer.
+        let to_copy = buf.remaining().min(data.len());
+        buf.put_slice(&data[..to_copy]);
+        // Retain the owned h2 DATA remainder for the next read.
+        // Fully consumed chunks are dropped immediately, including at EOF.
+        if to_copy < data.len() {
+            data.advance(to_copy);
+            inner.recv_buf = data;
         }
+        Poll::Ready(Ok(()))
     }
 }
 

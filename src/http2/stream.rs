@@ -12,6 +12,57 @@ use bytes::{Buf, Bytes};
 use h2::{RecvStream, SendStream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+/// An HTTP/2 transport that can transfer ownership of received DATA chunks.
+/// Empty DATA frames are skipped; an empty returned chunk denotes END_STREAM.
+/// Flow-control capacity is released when a chunk is received, as with AsyncRead.
+/// Dropping a pending poll does not consume data.
+pub trait Http2Receive: AsyncRead {
+    fn poll_recv_chunk(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<Bytes>>;
+}
+
+pub(crate) type ChunkReader<S> = fn(Pin<&mut S>, &mut Context<'_>) -> Poll<io::Result<Bytes>>;
+
+pub(crate) fn poll_recv_chunk(
+    recv: &mut RecvStream,
+    cached: &mut Bytes,
+    eof: &mut bool,
+    cx: &mut Context<'_>,
+) -> Poll<io::Result<Bytes>> {
+    if !cached.is_empty() {
+        return Poll::Ready(Ok(std::mem::take(cached)));
+    }
+    if *eof {
+        return Poll::Ready(Ok(Bytes::new()));
+    }
+    loop {
+        match recv.poll_data(cx) {
+            Poll::Ready(Some(Ok(data))) => {
+                // Release flow control capacity back to sender.
+                let _ = recv.flow_control().release_capacity(data.len());
+                // Empty DATA without END_STREAM is not AsyncRead EOF.
+                if data.is_empty() {
+                    continue;
+                }
+                return Poll::Ready(Ok(data));
+            }
+            Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(io::Error::other(error))),
+            Poll::Ready(None) => {
+                // Stream ended (END_STREAM received).
+                *eof = true;
+                return Poll::Ready(Ok(Bytes::new()));
+            }
+            Poll::Pending => return Poll::Pending,
+        }
+    }
+}
+
+impl Http2Receive for Http2Stream {
+    fn poll_recv_chunk(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<Bytes>> {
+        let this = &mut *self;
+        poll_recv_chunk(&mut this.recv, &mut this.recv_buf, &mut this.recv_eof, cx)
+    }
+}
+
 /// A wrapper around h2 send/receive streams that implements AsyncRead + AsyncWrite
 ///
 /// This allows HTTP/2 streams to be used with `WebSocketStream<Http2Stream>`,
@@ -82,6 +133,10 @@ impl AsyncRead for Http2Stream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
         // First, try to satisfy from the internal buffer
         if !self.recv_buf.is_empty() {
             let to_copy = std::cmp::min(buf.remaining(), self.recv_buf.len());
@@ -100,33 +155,18 @@ impl AsyncRead for Http2Stream {
             return Poll::Ready(Ok(()));
         }
 
-        // Poll the h2 RecvStream for more data
-        match Pin::new(&mut self.recv).poll_data(cx) {
-            Poll::Ready(Some(Ok(mut data))) => {
-                // Release flow control capacity back to sender
-                let len = data.len();
-                let _ = self.recv.flow_control().release_capacity(len);
-
-                // Copy what we can to the output buffer
-                let to_copy = std::cmp::min(buf.remaining(), data.len());
-                buf.put_slice(&data[..to_copy]);
-                // Retain the owned h2 DATA remainder for the next read.
-                // Fully consumed chunks are dropped immediately, including at EOF.
-                if to_copy < data.len() {
-                    data.advance(to_copy);
-                    self.recv_buf = data;
-                }
-
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(e))),
-            Poll::Ready(None) => {
-                // Stream ended (END_STREAM received)
-                self.recv_eof = true;
-                Poll::Ready(Ok(()))
-            }
-            Poll::Pending => Poll::Pending,
+        // Poll the h2 RecvStream for more data, skipping empty DATA frames.
+        let mut data = std::task::ready!(self.as_mut().poll_recv_chunk(cx))?;
+        // Copy what we can to the output buffer.
+        let to_copy = buf.remaining().min(data.len());
+        buf.put_slice(&data[..to_copy]);
+        // Retain the owned h2 DATA remainder for the next read.
+        // Fully consumed chunks are dropped immediately, including at EOF.
+        if to_copy < data.len() {
+            data.advance(to_copy);
+            self.recv_buf = data;
         }
+        Poll::Ready(Ok(()))
     }
 }
 

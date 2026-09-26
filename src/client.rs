@@ -472,6 +472,7 @@ impl WebSocketClient<Http2> {
         let mut h2_builder = client::Builder::new();
 
         h2_builder
+            .max_frame_size(config.http2.validated_max_frame_size()?)
             .initial_window_size(config.http2.initial_stream_window_size)
             .initial_connection_window_size(config.http2.initial_connection_window_size);
 
@@ -532,6 +533,7 @@ impl WebSocketClient<Http2> {
 
         // Create and return WebSocketStream
         Ok(WebSocketStream::from_raw(h2_stream, Role::Client, config)
+            .with_http2_receive_chunks()
             .with_immediate_write_shutdown())
     }
 
@@ -549,6 +551,7 @@ impl WebSocketClient<Http2> {
         let mut h2_builder = client::Builder::new();
 
         h2_builder
+            .max_frame_size(config.http2.validated_max_frame_size()?)
             .initial_window_size(config.http2.initial_stream_window_size)
             .initial_connection_window_size(config.http2.initial_connection_window_size);
 
