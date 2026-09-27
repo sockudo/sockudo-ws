@@ -2948,10 +2948,12 @@ where
         let heartbeat = Heartbeat::new(&config, 0);
         Self {
             inner,
-            protocol: CompressedProtocol::server(
+            protocol: CompressedProtocol::with_config(
+                Role::Server,
                 config.max_frame_size,
                 config.max_message_size,
                 deflate_config,
+                config.compression.is_shared(),
             ),
             read_buf,
             write_buf: BytesMut::with_capacity(config.write_buffer_size),
@@ -2992,10 +2994,12 @@ where
         let heartbeat = Heartbeat::new(&config, 0);
         Self {
             inner,
-            protocol: CompressedProtocol::client(
+            protocol: CompressedProtocol::with_config(
+                Role::Client,
                 config.max_frame_size,
                 config.max_message_size,
                 deflate_config,
+                config.compression.is_shared(),
             ),
             read_buf,
             write_buf: BytesMut::with_capacity(config.write_buffer_size),

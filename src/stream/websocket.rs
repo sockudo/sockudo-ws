@@ -2194,10 +2194,12 @@ where
         deflate_config: crate::deflate::DeflateConfig,
         leftover: Option<Bytes>,
     ) -> Self {
-        let protocol = crate::protocol::CompressedProtocol::server(
+        let protocol = crate::protocol::CompressedProtocol::with_config(
+            Role::Server,
             config.max_frame_size,
             config.max_message_size,
             deflate_config,
+            config.compression.is_shared(),
         );
 
         let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);
@@ -2249,10 +2251,12 @@ where
         deflate_config: crate::deflate::DeflateConfig,
         leftover: Option<Bytes>,
     ) -> Self {
-        let protocol = crate::protocol::CompressedProtocol::client(
+        let protocol = crate::protocol::CompressedProtocol::with_config(
+            Role::Client,
             config.max_frame_size,
             config.max_message_size,
             deflate_config,
+            config.compression.is_shared(),
         );
 
         let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);

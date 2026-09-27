@@ -238,15 +238,24 @@ async fn tokio_compressed_split_preserves_parser_and_fragment_state() {
 }
 
 #[cfg(all(feature = "tokio-runtime", feature = "permessage-deflate"))]
+#[rstest::rstest]
+#[case(sockudo_ws::Compression::Dedicated)]
+#[case(sockudo_ws::Compression::Shared)]
 #[tokio::test]
-async fn tokio_compressed_split_preserves_decoder_history_and_compressed_fragment_state() {
+async fn tokio_compressed_split_preserves_decoder_history_and_compressed_fragment_state(
+    #[case] compression: sockudo_ws::Compression,
+) {
     use sockudo_ws::deflate::DeflateConfig;
     use sockudo_ws::{CompressedWebSocketStream, Config};
     use tokio::io::AsyncWriteExt;
 
     let (buffered, remainder, first, second) = compressed_fragment_scenario();
     let (io, mut peer) = tokio::io::duplex(4096);
-    let config = Config::builder().auto_ping(false).idle_timeout(0).build();
+    let config = Config::builder()
+        .compression(compression)
+        .auto_ping(false)
+        .idle_timeout(0)
+        .build();
     let mut socket = CompressedWebSocketStream::client(
         io,
         config,
@@ -336,8 +345,13 @@ async fn compio_compressed_split_preserves_parser_and_fragment_state() {
 }
 
 #[cfg(all(feature = "compio-runtime", feature = "permessage-deflate"))]
+#[rstest::rstest]
+#[case(sockudo_ws::Compression::Dedicated)]
+#[case(sockudo_ws::Compression::Shared)]
 #[compio::test]
-async fn compio_compressed_split_preserves_decoder_history_and_compressed_fragment_state() {
+async fn compio_compressed_split_preserves_decoder_history_and_compressed_fragment_state(
+    #[case] compression: sockudo_ws::Compression,
+) {
     use compio::io::AsyncWriteExt;
     use compio::net::{TcpListener, TcpStream};
     use sockudo_ws::Config;
@@ -350,7 +364,11 @@ async fn compio_compressed_split_preserves_decoder_history_and_compressed_fragme
         .await
         .unwrap();
     let (mut peer, _) = listener.accept().await.unwrap();
-    let config = Config::builder().auto_ping(false).idle_timeout(0).build();
+    let config = Config::builder()
+        .compression(compression)
+        .auto_ping(false)
+        .idle_timeout(0)
+        .build();
     let mut socket = CompioCompressedWebSocketStream::client_with_leftover(
         stream,
         config,

@@ -6,7 +6,8 @@
 //! - **Shared**: Connections share a pool of compressors
 //! - **Window sizes**: Various window sizes for memory/compression tradeoffs
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Weak};
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -33,6 +34,18 @@ pub enum CompressionContext {
 }
 
 impl CompressionContext {
+    pub(crate) fn with_config(config: DeflateConfig, shared: bool, is_server: bool) -> Self {
+        if shared {
+            return Self::with_shared_pool(shared_pool_for_config(&config), is_server);
+        }
+
+        Self::Dedicated(if is_server {
+            DeflateContext::server(config)
+        } else {
+            DeflateContext::client(config)
+        })
+    }
+
     /// Create a new compression context for the given mode (server role)
     pub fn server(mode: Compression) -> Self {
         match mode.to_deflate_config() {
@@ -120,6 +133,31 @@ impl CompressionContext {
             CompressionContext::Disabled => None,
             CompressionContext::Dedicated(ctx) => Some(&ctx.config),
             CompressionContext::Shared { config, .. } => Some(config),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (CompressionEncoder, DeflateDecoder) {
+        match self {
+            Self::Disabled => panic!("compressed protocol must have a compression context"),
+            Self::Dedicated(context) => (
+                CompressionEncoder::Dedicated(context.encoder),
+                context.decoder,
+            ),
+            Self::Shared { pool, decoder, .. } => (CompressionEncoder::Shared(pool), decoder),
+        }
+    }
+}
+
+pub(crate) enum CompressionEncoder {
+    Dedicated(DeflateEncoder),
+    Shared(Arc<SharedCompressorPool>),
+}
+
+impl CompressionEncoder {
+    pub(crate) fn compress(&mut self, data: &[u8]) -> Result<Option<Bytes>> {
+        match self {
+            Self::Dedicated(encoder) => encoder.compress(data),
+            Self::Shared(pool) => pool.compress(data),
         }
     }
 }
@@ -252,6 +290,35 @@ pub fn global_shared_pool() -> Arc<SharedCompressorPool> {
         })
         .clone()
 }
+
+// Negotiation can narrow either window. Cache the inner allocation, which is
+// retained by role-specific handles even after the original pool handle drops.
+// Weak entries let the last connection release non-default encoder state.
+static CONFIGURED_POOLS: LazyLock<Mutex<HashMap<DeflateConfig, Weak<SharedCompressorPoolInner>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn shared_pool_for_config(config: &DeflateConfig) -> Arc<SharedCompressorPool> {
+    if Some(config) == Compression::Shared.to_deflate_config().as_ref() {
+        return global_shared_pool();
+    }
+
+    let mut pools = CONFIGURED_POOLS.lock();
+    if let Some(inner) = pools.get(config).and_then(Weak::upgrade) {
+        return Arc::new(SharedCompressorPool {
+            inner,
+            is_server: true,
+        });
+    }
+
+    // Retired configurations must not accumulate as connections renegotiate.
+    pools.retain(|_, pool| pool.strong_count() != 0);
+    let pool = Arc::new(SharedCompressorPool::new(config.clone()));
+    pools.insert(config.clone(), Arc::downgrade(&pool.inner));
+    pool
+}
+
+#[cfg(test)]
+mod runtime_tests;
 
 #[cfg(test)]
 mod tests {

@@ -14,7 +14,9 @@ use crate::frame::{Frame, FrameParser, OpCode, encode_frame};
 use crate::utf8::{Utf8Stream, validate_utf8};
 
 #[cfg(feature = "permessage-deflate")]
-use crate::deflate::{DeflateConfig, DeflateContext};
+use crate::compression::{CompressionContext, CompressionEncoder};
+#[cfg(feature = "permessage-deflate")]
+use crate::deflate::{DeflateConfig, DeflateEncoder};
 
 /// WebSocket endpoint role
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -897,7 +899,7 @@ pub struct CompressedProtocol {
     /// Base protocol handler
     inner: Protocol,
     /// Deflate compression context
-    deflate: DeflateContext,
+    deflate: CompressionContext,
     /// Whether the current fragmented message is compressed
     fragment_compressed: bool,
     /// Buffer for decompressed fragment data
@@ -908,25 +910,39 @@ pub struct CompressedProtocol {
 impl CompressedProtocol {
     /// Create a new compressed protocol handler for server role
     pub fn server(max_frame_size: usize, max_message_size: usize, config: DeflateConfig) -> Self {
-        let mut inner = Protocol::new(Role::Server, max_frame_size, max_message_size);
-        inner.enable_compression();
-
-        Self {
-            inner,
-            deflate: DeflateContext::server(config),
-            fragment_compressed: false,
-            decompress_buf: BytesMut::new(),
-        }
+        Self::with_config(
+            Role::Server,
+            max_frame_size,
+            max_message_size,
+            config,
+            false,
+        )
     }
 
     /// Create a new compressed protocol handler for client role
     pub fn client(max_frame_size: usize, max_message_size: usize, config: DeflateConfig) -> Self {
-        let mut inner = Protocol::new(Role::Client, max_frame_size, max_message_size);
+        Self::with_config(
+            Role::Client,
+            max_frame_size,
+            max_message_size,
+            config,
+            false,
+        )
+    }
+
+    pub(crate) fn with_config(
+        role: Role,
+        max_frame_size: usize,
+        max_message_size: usize,
+        config: DeflateConfig,
+        shared: bool,
+    ) -> Self {
+        let mut inner = Protocol::new(role, max_frame_size, max_message_size);
         inner.enable_compression();
 
         Self {
             inner,
-            deflate: DeflateContext::client(config),
+            deflate: CompressionContext::with_config(config, shared, role == Role::Server),
             fragment_compressed: false,
             decompress_buf: BytesMut::new(),
         }
@@ -1217,6 +1233,7 @@ impl CompressedProtocol {
     ) -> (CompressedReaderProtocol, CompressedWriterProtocol) {
         let role = self.inner.role;
         self.inner.parser.set_max_frame_size(max_frame_size);
+        let (encoder, decoder) = self.deflate.into_parts();
 
         // Keep parser and fragment state already consumed by the unified stream.
         let reader = CompressedReaderProtocol {
@@ -1225,15 +1242,12 @@ impl CompressedProtocol {
             fragment_buf: self.inner.fragment_buf,
             fragment_opcode: self.inner.fragment_opcode,
             max_message_size,
-            decoder: self.deflate.decoder,
+            decoder,
             fragment_compressed: self.fragment_compressed,
         };
 
         // Create fresh writer protocol (encoder state)
-        let writer = CompressedWriterProtocol {
-            role,
-            encoder: self.deflate.encoder,
-        };
+        let writer = CompressedWriterProtocol { role, encoder };
 
         (reader, writer)
     }
@@ -1497,7 +1511,7 @@ pub struct CompressedWriterProtocol {
     /// Endpoint role
     role: Role,
     /// Deflate encoder
-    encoder: crate::deflate::DeflateEncoder,
+    encoder: CompressionEncoder,
 }
 
 #[cfg(feature = "permessage-deflate")]
@@ -1506,12 +1520,12 @@ impl CompressedWriterProtocol {
     pub fn server(config: &DeflateConfig) -> Self {
         Self {
             role: Role::Server,
-            encoder: crate::deflate::DeflateEncoder::new(
+            encoder: CompressionEncoder::Dedicated(DeflateEncoder::new(
                 config.server_max_window_bits,
                 config.server_no_context_takeover,
                 config.compression_level,
                 config.compression_threshold,
-            ),
+            )),
         }
     }
 
@@ -1519,12 +1533,12 @@ impl CompressedWriterProtocol {
     pub fn client(config: &DeflateConfig) -> Self {
         Self {
             role: Role::Client,
-            encoder: crate::deflate::DeflateEncoder::new(
+            encoder: CompressionEncoder::Dedicated(DeflateEncoder::new(
                 config.client_max_window_bits,
                 config.client_no_context_takeover,
                 config.compression_level,
                 config.compression_threshold,
-            ),
+            )),
         }
     }
 
