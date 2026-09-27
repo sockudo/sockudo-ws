@@ -1558,6 +1558,33 @@ where
                 return result;
             }
 
+            if self.pending_messages.is_empty()
+                && self.pending_parse_error.is_none()
+                && self.has_unprocessed_read_data
+            {
+                self.has_unprocessed_read_data = false;
+                debug_assert!(self.pending_messages.is_empty());
+                let mut accepted_fragment = false;
+                match self.protocol.process_next_with_activity(
+                    &mut self.read_buf,
+                    &mut self.pending_messages,
+                    &mut accepted_fragment,
+                ) {
+                    Ok(()) => {
+                        if accepted_fragment {
+                            self.shared.note_inbound();
+                        }
+                        if !self.pending_messages.is_empty() {
+                            self.has_unprocessed_read_data = !self.read_buf.is_empty();
+                        }
+                    }
+                    Err(error) => {
+                        self.pending_parse_error = Some(error);
+                        self.shared.begin_read_error();
+                    }
+                }
+            }
+
             if let Some(msg) = self.pending_messages.pop() {
                 let request = match &msg {
                     Message::Ping(data) => {
@@ -1591,34 +1618,6 @@ where
                 let _ = self.control_tx.send(ControlRequest::ReadError).await;
                 self.terminal_reported = true;
                 return Some(Err(error));
-            }
-
-            if self.has_unprocessed_read_data {
-                self.has_unprocessed_read_data = false;
-                debug_assert!(self.pending_messages.is_empty());
-                let mut accepted_fragment = false;
-                match self.protocol.process_next_with_activity(
-                    &mut self.read_buf,
-                    &mut self.pending_messages,
-                    &mut accepted_fragment,
-                ) {
-                    Ok(()) => {
-                        if accepted_fragment {
-                            self.shared.note_inbound();
-                        }
-                        self.pending_messages.reverse();
-                        if !self.pending_messages.is_empty() {
-                            self.has_unprocessed_read_data = !self.read_buf.is_empty();
-                            continue;
-                        }
-                    }
-                    Err(error) => {
-                        self.pending_messages.reverse();
-                        self.pending_parse_error = Some(error);
-                        self.shared.begin_read_error();
-                        continue;
-                    }
-                }
             }
 
             // Reuse an empty receive window when no delivered payload still owns it.
