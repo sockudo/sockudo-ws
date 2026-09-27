@@ -704,6 +704,10 @@ impl CompioHttp2Stream {
 #[cfg(feature = "http2")]
 impl AsyncRead for CompioHttp2Stream {
     async fn read<B: IoBufMut>(&mut self, mut buf: B) -> BufResult<usize, B> {
+        if buf.buf_capacity() == 0 {
+            return BufResult(Ok(0), buf);
+        }
+
         if !self.recv_buf.is_empty() {
             let len = copy_into_compio_buf(&mut buf, &mut self.recv_buf);
             return BufResult(Ok(len), buf);
@@ -714,7 +718,14 @@ impl AsyncRead for CompioHttp2Stream {
         }
 
         let Some(result) = poll_read_until_cancelled(std::future::poll_fn(|cx| {
-            Pin::new(&mut self.recv).poll_data(cx)
+            loop {
+                match Pin::new(&mut self.recv).poll_data(cx) {
+                    // Empty DATA without END_STREAM is not EOF. Keep this polling
+                    // inside the cancellation wrapper so a waiting read can yield.
+                    std::task::Poll::Ready(Some(Ok(data))) if data.is_empty() => continue,
+                    result => return result,
+                }
+            }
         }))
         .await
         else {

@@ -87,7 +87,7 @@ async fn empty_read_buffer_completes_without_waiting_for_data(#[case] generic_tr
             .send_response(http::Response::new(()), false)
             .unwrap();
         ready.send(send).unwrap();
-        // Continue driving the connection until the client has consumed the DATA.
+        // Keep the connection alive without sending DATA or ending the stream.
         while connection.accept().await.is_some() {}
     });
     let (mut client, connection) = h2::client::handshake(client_io).await.unwrap();
