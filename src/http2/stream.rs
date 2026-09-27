@@ -8,7 +8,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use h2::{RecvStream, SendStream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -25,7 +25,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 ///
 /// // After HTTP/2 handshake and Extended CONNECT negotiation
 /// let stream = Http2Stream::new(send_stream, recv_stream);
-/// let mut ws = WebSocketStream::server(stream, Config::default());
+/// let mut ws = WebSocketStream::server(stream, Config::default())
+///     .with_immediate_write_shutdown();
 ///
 /// // Use the same API as regular WebSocket
 /// while let Some(msg) = ws.next().await {
@@ -35,7 +36,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 pub struct Http2Stream {
     send: SendStream<Bytes>,
     recv: RecvStream,
-    recv_buf: BytesMut,
+    recv_buf: Bytes,
     /// Track if we've received END_STREAM
     recv_eof: bool,
     /// Track if we need to reserve capacity
@@ -48,7 +49,7 @@ impl Http2Stream {
         Self {
             send,
             recv,
-            recv_buf: BytesMut::with_capacity(64 * 1024),
+            recv_buf: Bytes::new(),
             recv_eof: false,
             capacity_needed: 0,
         }
@@ -81,10 +82,20 @@ impl AsyncRead for Http2Stream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
         // First, try to satisfy from the internal buffer
         if !self.recv_buf.is_empty() {
             let to_copy = std::cmp::min(buf.remaining(), self.recv_buf.len());
-            buf.put_slice(&self.recv_buf.split_to(to_copy));
+            buf.put_slice(&self.recv_buf[..to_copy]);
+            if to_copy == self.recv_buf.len() {
+                // An empty Bytes cursor can still retain its entire allocation.
+                self.recv_buf = Bytes::new();
+            } else {
+                self.recv_buf.advance(to_copy);
+            }
             return Poll::Ready(Ok(()));
         }
 
@@ -93,31 +104,36 @@ impl AsyncRead for Http2Stream {
             return Poll::Ready(Ok(()));
         }
 
-        // Poll the h2 RecvStream for more data
-        match Pin::new(&mut self.recv).poll_data(cx) {
-            Poll::Ready(Some(Ok(mut data))) => {
-                // Release flow control capacity back to sender
-                let len = data.len();
-                let _ = self.recv.flow_control().release_capacity(len);
+        loop {
+            // Poll the h2 RecvStream for more data
+            return match Pin::new(&mut self.recv).poll_data(cx) {
+                // Empty DATA without END_STREAM must not appear as AsyncRead EOF.
+                Poll::Ready(Some(Ok(data))) if data.is_empty() => continue,
+                Poll::Ready(Some(Ok(mut data))) => {
+                    // Release flow control capacity back to sender
+                    let len = data.len();
+                    let _ = self.recv.flow_control().release_capacity(len);
 
-                // Copy what we can to the output buffer
-                let to_copy = std::cmp::min(buf.remaining(), data.len());
-                buf.put_slice(&data.split_to(to_copy));
+                    // Copy what we can to the output buffer
+                    let to_copy = std::cmp::min(buf.remaining(), data.len());
+                    buf.put_slice(&data[..to_copy]);
+                    // Retain the owned h2 DATA remainder for the next read.
+                    // Fully consumed chunks are dropped immediately, including at EOF.
+                    if to_copy < data.len() {
+                        data.advance(to_copy);
+                        self.recv_buf = data;
+                    }
 
-                // Buffer any remainder
-                if data.has_remaining() {
-                    self.recv_buf.extend_from_slice(data.chunk());
+                    Poll::Ready(Ok(()))
                 }
-
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(e))),
-            Poll::Ready(None) => {
-                // Stream ended (END_STREAM received)
-                self.recv_eof = true;
-                Poll::Ready(Ok(()))
-            }
-            Poll::Pending => Poll::Pending,
+                Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(e))),
+                Poll::Ready(None) => {
+                    // Stream ended (END_STREAM received)
+                    self.recv_eof = true;
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Pending => Poll::Pending,
+            };
         }
     }
 }
@@ -195,4 +211,19 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<super::Http2Stream>();
     }
+}
+
+#[cfg(all(test, feature = "http2", feature = "tokio-runtime"))]
+#[path = "../../tests/support/h2_receive_owner.rs"]
+pub(crate) mod receive_owner;
+
+#[cfg(all(test, feature = "http2", feature = "tokio-runtime"))]
+#[tokio::test]
+async fn consumed_h2_chunk_releases_its_owner() {
+    receive_owner::check_consumed_chunk_is_released(|send, recv, bytes| {
+        let mut stream = Http2Stream::new(send, recv);
+        stream.recv_buf = bytes;
+        stream
+    })
+    .await;
 }
