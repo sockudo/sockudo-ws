@@ -185,12 +185,6 @@ pub const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 #[cfg(feature = "http2")]
 #[derive(Debug, Clone)]
 pub struct Http2Config {
-    /// Maximum HTTP/2 frame payload accepted from the peer (default: 16 KiB).
-    /// Must be in 16,384..=16,777,215. This advertises SETTINGS_MAX_FRAME_SIZE;
-    /// it does not set the WebSocket message limit or the peer's receive limit.
-    /// Larger values can reduce DATA framing overhead but retain larger connection
-    /// buffers and delay other streams sharing the connection.
-    pub max_frame_size: u32,
     /// Initial stream-level flow control window size (default: 1MB)
     pub initial_stream_window_size: u32,
     /// Initial connection-level flow control window size (default: 2MB)
@@ -202,23 +196,10 @@ pub struct Http2Config {
 }
 
 #[cfg(feature = "http2")]
-impl Http2Config {
-    pub(crate) fn validated_max_frame_size(&self) -> Result<u32> {
-        if !(16_384..=16_777_215).contains(&self.max_frame_size) {
-            return Err(Error::HandshakeFailed(
-                "HTTP/2 max_frame_size must be in 16384..=16777215",
-            ));
-        }
-        Ok(self.max_frame_size)
-    }
-}
-
-#[cfg(feature = "http2")]
 impl Default for Http2Config {
     fn default() -> Self {
         Self {
-            max_frame_size: 16_384,
-            initial_stream_window_size: 1024 * 1024, // 1MB
+            initial_stream_window_size: 1024 * 1024,         // 1MB
             initial_connection_window_size: 2 * 1024 * 1024, // 2MB
             max_concurrent_streams: 100,
             enable_connect_protocol: true,
@@ -784,16 +765,6 @@ impl ConfigBuilder {
     #[cfg(feature = "http2")]
     pub fn http2_connection_window_size(mut self, size: u32) -> Self {
         self.config.http2.initial_connection_window_size = size;
-        self
-    }
-
-    /// Advertise the largest HTTP/2 frame payload accepted from the peer.
-    /// The valid range is 16,384..=16,777,215; invalid values fail the handshake.
-    /// Defaults to 16 KiB. Larger frames trade framing overhead for memory and
-    /// latency of other streams on the same connection.
-    #[cfg(feature = "http2")]
-    pub fn http2_max_frame_size(mut self, size: u32) -> Self {
-        self.config.http2.max_frame_size = size;
         self
     }
 
