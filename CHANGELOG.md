@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Tokio and Compio readers cooperate with their executor while delivering buffered receive bursts, including plain, compressed, unified, and split streams. Tokio uses the task cooperative budget; Compio yields after 32 additional buffered deliveries and preserves that budget across splitting. This bounds consecutive deliveries, not the work needed to parse or decompress an individual read batch, and trades burst completion time for opportunities to run other tasks.
 - **Breaking for paused-time tests:** Tokio heartbeat and activity timestamps, including unified Close deadlines, use quanta with runtime wakeups rechecked against the logical deadline. The first clock read can block for calibration; preinitialize with `init_clock()` to move that cost out of latency-sensitive work. Paused Tokio time now requires this crate's `test-util` feature, not just `tokio/test-util`. Compio clocks are unchanged.
 - Unified Tokio plain and compressed streams write contiguous cork buffers directly, avoiding vectored-write setup when there are no separately owned segments. Segmented output retains vectored writes on capable transports and preserves partial-write ordering otherwise.
 - Ordinary Tokio split readers poll transport reads before terminal notifications, avoiding notification waiter registration for immediately ready reads. A terminal cause published during the read is rechecked before handling its data, EOF or I/O error.

@@ -62,7 +62,9 @@ pub use ::compio::net;
 /// Re-exported Compio runtime utilities for users of `compio-runtime`.
 pub use ::compio::runtime;
 
-// Compio has no task-wide cooperative budget. Bound each reader's ready burst.
+// Only extra deliveries from an accepted batch spend this budget; calls
+// requiring I/O retain the transport's existing yielding behavior. Carry the
+// remaining budget across next() calls and split().
 const READ_BURST_LIMIT: usize = 32;
 
 async fn consume_buffered_read_budget(budget: &mut usize) {
@@ -1542,6 +1544,7 @@ pub struct CompioWebSocketStream<S> {
     write_shutdown_complete: bool,
     config: Config,
     pending_messages: Vec<Message>,
+    // Remaining deliveries from an already accepted batch before yielding.
     read_budget: usize,
     // Deliver accepted messages before a later parse failure.
     pending_parse_error: Option<Error>,
@@ -1695,6 +1698,9 @@ where
 
     /// Receive the next WebSocket message.
     ///
+    /// Buffered deliveries yield cooperatively in bounded bursts. Cancelling
+    /// at that yield retains the next message and permits progress on retry.
+    ///
     /// This future is not cancellation-safe. Cancelling it during Close cleanup
     /// can lose the accepted Close; drive it to completion for ordered delivery.
     ///
@@ -1706,12 +1712,18 @@ where
     /// time; expiry returns `HeartbeatTimeout` even if Ping could not be sent.
     /// Recovery is unbounded only when idle and Pong timeouts are both disabled.
     pub async fn next(&mut self) -> Option<Result<Message>> {
-        if !self.pending_messages.is_empty() {
-            consume_buffered_read_budget(&mut self.read_budget).await;
-        }
+        let mut buffered_delivery = !self.pending_messages.is_empty();
         loop {
             if self.state == CompioStreamState::Closed {
                 return None;
+            }
+
+            if buffered_delivery {
+                buffered_delivery = false;
+                // Keep the message in the reader across a cooperative yield;
+                // recheck closure before delivering it after resumption.
+                consume_buffered_read_budget(&mut self.read_budget).await;
+                continue;
             }
 
             if let Some(msg) = self.next_pending_message() {
@@ -2203,6 +2215,7 @@ pub struct CompioSplitReader<R> {
     protocol: Protocol,
     read_buf: BytesMut,
     pending_messages: Vec<Message>,
+    // Remaining deliveries from an already accepted batch before yielding.
     read_budget: usize,
     // Deliver accepted messages before a later parse failure.
     pending_parse_error: Option<Error>,
@@ -2230,10 +2243,9 @@ where
     R: AsyncRead,
 {
     /// Receive the next message, including Ping and Pong control frames.
+    /// Buffered deliveries yield cooperatively without removing the next message.
     pub async fn next(&mut self) -> Option<Result<Message>> {
-        if !self.pending_messages.is_empty() {
-            consume_buffered_read_budget(&mut self.read_budget).await;
-        }
+        let mut buffered_delivery = !self.pending_messages.is_empty();
         loop {
             if self.terminal_reported {
                 return None;
@@ -2247,6 +2259,14 @@ where
                     Some(CompioTerminalCause::IdleTimeout) => Some(Err(Error::IdleTimeout)),
                     _ => None,
                 };
+            }
+
+            if buffered_delivery {
+                buffered_delivery = false;
+                // Keep the message in the reader across a cooperative yield;
+                // recheck closure before delivering it after resumption.
+                consume_buffered_read_budget(&mut self.read_budget).await;
+                continue;
             }
 
             if let Some(msg) = self.pending_messages.pop() {
@@ -2947,6 +2967,7 @@ pub struct CompioCompressedWebSocketStream<S> {
     write_shutdown_complete: bool,
     config: Config,
     pending_messages: Vec<Message>,
+    // Remaining deliveries from an already accepted batch before yielding.
     read_budget: usize,
     // Deliver accepted messages before a later parse failure.
     pending_parse_error: Option<Error>,
@@ -3069,6 +3090,9 @@ where
 
     /// Receive the next WebSocket message.
     ///
+    /// Buffered deliveries yield cooperatively in bounded bursts. Cancelling
+    /// at that yield retains the next message and permits progress on retry.
+    ///
     /// This future is not cancellation-safe. Cancelling it during Close cleanup
     /// can lose the accepted Close; drive it to completion for ordered delivery.
     ///
@@ -3080,12 +3104,18 @@ where
     /// time; expiry returns `HeartbeatTimeout` even if Ping could not be sent.
     /// Recovery is unbounded only when idle and Pong timeouts are both disabled.
     pub async fn next(&mut self) -> Option<Result<Message>> {
-        if !self.pending_messages.is_empty() {
-            consume_buffered_read_budget(&mut self.read_budget).await;
-        }
+        let mut buffered_delivery = !self.pending_messages.is_empty();
         loop {
             if self.state == CompioStreamState::Closed {
                 return None;
+            }
+
+            if buffered_delivery {
+                buffered_delivery = false;
+                // Keep the message in the reader across a cooperative yield;
+                // recheck closure before delivering it after resumption.
+                consume_buffered_read_budget(&mut self.read_budget).await;
+                continue;
             }
 
             if let Some(msg) = self.next_pending_message() {
@@ -3528,6 +3558,7 @@ pub struct CompioCompressedSplitReader<R> {
     protocol: CompressedReaderProtocol,
     read_buf: BytesMut,
     pending_messages: Vec<Message>,
+    // Remaining deliveries from an already accepted batch before yielding.
     read_budget: usize,
     // Deliver accepted messages before a later parse failure.
     pending_parse_error: Option<Error>,
@@ -3556,10 +3587,9 @@ where
     R: AsyncRead,
 {
     /// Receive the next non-control message.
+    /// Buffered deliveries yield cooperatively without removing the next message.
     pub async fn next(&mut self) -> Option<Result<Message>> {
-        if !self.pending_messages.is_empty() {
-            consume_buffered_read_budget(&mut self.read_budget).await;
-        }
+        let mut buffered_delivery = !self.pending_messages.is_empty();
         loop {
             if self.terminal_reported {
                 return None;
@@ -3573,6 +3603,14 @@ where
                     Some(CompioTerminalCause::IdleTimeout) => Some(Err(Error::IdleTimeout)),
                     _ => None,
                 };
+            }
+
+            if buffered_delivery {
+                buffered_delivery = false;
+                // Keep the message in the reader across a cooperative yield;
+                // recheck closure before delivering it after resumption.
+                consume_buffered_read_budget(&mut self.read_budget).await;
+                continue;
             }
 
             if let Some(msg) = self.pending_messages.pop() {

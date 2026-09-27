@@ -204,3 +204,35 @@ async fn compressed_split_reports_terminal_cause_before_notification(#[case] cau
 
     assert!(observed);
 }
+
+macro_rules! exhausted_budget_terminal_case {
+    ($name:ident, $make:expr) => {
+        #[tokio::test]
+        async fn $name() {
+            let (io, _peer) = tokio::io::duplex(128);
+            let config = Config::builder().auto_ping(false).idle_timeout(0).build();
+            let (mut reader, _writer) = ($make)(io, config).split();
+            reader
+                .pending_messages
+                .push(Message::binary(b"accepted".to_vec()));
+            reader.shared.terminate(TerminalCause::IdleTimeout);
+            while tokio::task::coop::has_budget_remaining() {
+                tokio::task::coop::consume_budget().await;
+            }
+
+            let result = futures_util::poll!(std::pin::pin!(reader.next()));
+
+            assert!(matches!(result, Poll::Ready(Some(Err(Error::IdleTimeout)))));
+        }
+    };
+}
+
+exhausted_budget_terminal_case!(
+    split_terminal_precedes_exhausted_delivery_budget,
+    WebSocketStream::client
+);
+#[cfg(feature = "permessage-deflate")]
+exhausted_budget_terminal_case!(
+    compressed_split_terminal_precedes_exhausted_delivery_budget,
+    |io, cfg| CompressedWebSocketStream::client(io, cfg, crate::DeflateConfig::default())
+);

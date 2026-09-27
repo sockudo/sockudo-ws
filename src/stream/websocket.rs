@@ -1552,14 +1552,14 @@ where
     /// call. Writes remain allowed until a read error is discovered; a terminal
     /// heartbeat or idle timeout takes precedence over an unparsed tail.
     /// Messages and errors already parsed before splitting keep their order.
-    /// Cancelling a pending call retains parser and fragment state.
+    /// Cancelling a pending call retains parser and fragment state. Buffered
+    /// deliveries participate in Tokio's task cooperative budget.
     ///
     /// Ping and Pong frames remain visible after their automatic state-machine
     /// processing. A terminal heartbeat/idle cause is yielded once as an error.
     pub async fn next(&mut self) -> Option<Result<Message>> {
-        if !self.pending_messages.is_empty() {
-            tokio::task::coop::consume_budget().await;
-        }
+        let mut buffered_delivery = !self.pending_messages.is_empty()
+            || (self.pending_parse_error.is_none() && self.has_unprocessed_read_data);
         loop {
             if self.terminal_reported {
                 return None;
@@ -1568,6 +1568,15 @@ where
                 && let Some(result) = self.take_terminal()
             {
                 return result;
+            }
+
+            if buffered_delivery {
+                buffered_delivery = false;
+                // Yield before removing a message or advancing the parser, so
+                // cancellation retains the next delivery. Recheck termination
+                // after the scheduler can have run the connection driver.
+                tokio::task::coop::consume_budget().await;
+                continue;
             }
 
             let message = if let Some(msg) = self.pending_messages.pop() {
@@ -3130,10 +3139,10 @@ where
     ///
     /// Returns `None` when the connection is closed.
     /// This method NEVER blocks the writer - true concurrent I/O!
+    /// Buffered deliveries participate in Tokio's task cooperative budget;
+    /// cancelling at that yield retains the next message.
     pub async fn next(&mut self) -> Option<Result<Message>> {
-        if !self.pending_messages.is_empty() {
-            tokio::task::coop::consume_budget().await;
-        }
+        let mut buffered_delivery = !self.pending_messages.is_empty();
         loop {
             if self.terminal_reported {
                 return None;
@@ -3142,6 +3151,15 @@ where
                 && let Some(result) = self.take_terminal()
             {
                 return result;
+            }
+
+            if buffered_delivery {
+                buffered_delivery = false;
+                // Yield before removing a message or advancing the parser, so
+                // cancellation retains the next delivery. Recheck termination
+                // after the scheduler can have run the connection driver.
+                tokio::task::coop::consume_budget().await;
+                continue;
             }
 
             if let Some(msg) = self.pending_messages.pop() {
