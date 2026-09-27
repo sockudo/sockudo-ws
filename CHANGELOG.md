@@ -53,6 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Tokio plain and compressed split readers and writers observe closure and its terminal cause atomically, preserving the first cause before notification completes. Compressed split reads also preserve a terminal cause published during I/O over the returned transport error.
 - Compio HTTP/3 adapters complete zero-capacity reads without waiting for incoming DATA.
 - Tokio HTTP/3 request adapters complete zero-capacity reads immediately without waiting for or consuming data.
 - Tokio and Compio HTTP/2 adapters skip empty DATA frames without reporting premature EOF; zero-capacity read buffers complete immediately without consuming DATA. END_STREAM still terminates reads after queued bytes, and pending Compio reads remain cancellable.

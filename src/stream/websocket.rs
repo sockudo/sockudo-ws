@@ -1094,12 +1094,15 @@ const SPLIT_LOCAL_CLOSING: u8 = 1;
 const SPLIT_PEER_CLOSING: u8 = 2;
 const SPLIT_READ_ERROR_PENDING: u8 = 3;
 const SPLIT_CLOSED: u8 = 4;
+const SPLIT_CLOSED_HEARTBEAT: u8 = 5;
+const SPLIT_CLOSED_IDLE: u8 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 enum TerminalCause {
-    ConnectionClosed,
-    HeartbeatTimeout,
-    IdleTimeout,
+    ConnectionClosed = SPLIT_CLOSED,
+    HeartbeatTimeout = SPLIT_CLOSED_HEARTBEAT,
+    IdleTimeout = SPLIT_CLOSED_IDLE,
 }
 
 impl TerminalCause {
@@ -1128,7 +1131,7 @@ enum ControlRequest {
 
 struct SplitShared {
     status: AtomicU8,
-    terminal_tx: watch::Sender<Option<TerminalCause>>,
+    terminal_tx: watch::Sender<()>,
     cancel: CancellationToken,
     /// Clock epoch shared by the reader and the writer driver
     epoch: tokio::time::Instant,
@@ -1140,7 +1143,7 @@ struct SplitShared {
 
 impl SplitShared {
     fn new(closed: bool, tracks_inbound_activity: bool) -> Arc<Self> {
-        let (terminal_tx, _) = watch::channel(closed.then_some(TerminalCause::ConnectionClosed));
+        let (terminal_tx, _) = watch::channel(());
         Arc::new(Self {
             status: AtomicU8::new(if closed { SPLIT_CLOSED } else { SPLIT_OPEN }),
             terminal_tx,
@@ -1198,8 +1201,28 @@ impl SplitShared {
     }
 
     fn terminate(&self, cause: TerminalCause) {
-        if self.status.swap(SPLIT_CLOSED, Ordering::AcqRel) != SPLIT_CLOSED {
-            self.terminal_tx.send_replace(Some(cause));
+        // Publish closure and its cause together. The first terminal cause
+        // wins, even if another task terminates before watch notification.
+        if self
+            .status
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |status| {
+                (status < SPLIT_CLOSED).then_some(cause as u8)
+            })
+            .is_ok()
+        {
+            self.terminal_tx.send_replace(());
+        }
+    }
+
+    fn terminal_cause(&self) -> Option<TerminalCause> {
+        match self.status.load(Ordering::Acquire) {
+            SPLIT_OPEN | SPLIT_LOCAL_CLOSING | SPLIT_PEER_CLOSING | SPLIT_READ_ERROR_PENDING => {
+                None
+            }
+            SPLIT_CLOSED => Some(TerminalCause::ConnectionClosed),
+            SPLIT_CLOSED_HEARTBEAT => Some(TerminalCause::HeartbeatTimeout),
+            SPLIT_CLOSED_IDLE => Some(TerminalCause::IdleTimeout),
+            _ => unreachable!("invalid split connection state"),
         }
     }
 
@@ -1394,7 +1417,7 @@ where
         };
         drop(sink);
         if result.is_err() {
-            if self.shared.status.load(Ordering::Acquire) == SPLIT_CLOSED {
+            if self.shared.terminal_cause().is_some() {
                 return Err(self.current_error());
             }
             self.shared.terminate(TerminalCause::ConnectionClosed);
@@ -1408,13 +1431,12 @@ where
 
     fn current_error(&self) -> Error {
         self.shared
-            .terminal_tx
-            .borrow()
+            .terminal_cause()
             .map_or(Error::ConnectionClosed, TerminalCause::error)
     }
 
     fn preferred_write_error(&self, error: Error) -> Error {
-        match *self.shared.terminal_tx.borrow() {
+        match self.shared.terminal_cause() {
             Some(TerminalCause::HeartbeatTimeout) => Error::HeartbeatTimeout,
             Some(TerminalCause::IdleTimeout) => Error::IdleTimeout,
             _ => error,
@@ -1448,7 +1470,7 @@ pub struct SplitReader<S> {
     // Deliver successfully parsed messages before a later parse failure.
     pending_parse_error: Option<Error>,
     control_tx: mpsc::Sender<ControlRequest>,
-    terminal_rx: watch::Receiver<Option<TerminalCause>>,
+    terminal_rx: watch::Receiver<()>,
     shared: Arc<SplitShared>,
     terminal_reported: bool,
 }
@@ -1666,14 +1688,12 @@ where
     }
 
     fn take_terminal(&mut self) -> Option<Option<Result<Message>>> {
-        if self.shared.status.load(Ordering::Acquire) != SPLIT_CLOSED {
-            return None;
-        }
+        let cause = self.shared.terminal_cause()?;
         self.terminal_reported = true;
-        match *self.terminal_rx.borrow() {
-            Some(TerminalCause::HeartbeatTimeout) => Some(Some(Err(Error::HeartbeatTimeout))),
-            Some(TerminalCause::IdleTimeout) => Some(Some(Err(Error::IdleTimeout))),
-            _ => Some(None),
+        match cause {
+            TerminalCause::HeartbeatTimeout => Some(Some(Err(Error::HeartbeatTimeout))),
+            TerminalCause::IdleTimeout => Some(Some(Err(Error::IdleTimeout))),
+            TerminalCause::ConnectionClosed => Some(None),
         }
     }
 
@@ -3007,7 +3027,7 @@ pub struct CompressedSplitReader<S> {
     // Deliver successfully parsed messages before a later parse failure.
     pending_parse_error: Option<Error>,
     control_tx: mpsc::Sender<ControlRequest>,
-    terminal_rx: watch::Receiver<Option<TerminalCause>>,
+    terminal_rx: watch::Receiver<()>,
     shared: Arc<SplitShared>,
     terminal_reported: bool,
 }
@@ -3237,6 +3257,11 @@ where
                     }
                 }
                 result = self.reader.read_buf(&mut self.read_buf) => {
+                    // A terminal cause published during this poll takes
+                    // precedence over data, EOF and transport errors.
+                    if let Some(result) = self.take_terminal() {
+                        return result;
+                    }
                     match result {
                         Ok(0) => {
                             let _ = self.control_tx.send(ControlRequest::Eof).await;
@@ -3274,14 +3299,12 @@ where
     }
 
     fn take_terminal(&mut self) -> Option<Option<Result<Message>>> {
-        if self.shared.status.load(Ordering::Acquire) != SPLIT_CLOSED {
-            return None;
-        }
+        let cause = self.shared.terminal_cause()?;
         self.terminal_reported = true;
-        match *self.terminal_rx.borrow() {
-            Some(TerminalCause::HeartbeatTimeout) => Some(Some(Err(Error::HeartbeatTimeout))),
-            Some(TerminalCause::IdleTimeout) => Some(Some(Err(Error::IdleTimeout))),
-            _ => Some(None),
+        match cause {
+            TerminalCause::HeartbeatTimeout => Some(Some(Err(Error::HeartbeatTimeout))),
+            TerminalCause::IdleTimeout => Some(Some(Err(Error::IdleTimeout))),
+            TerminalCause::ConnectionClosed => Some(None),
         }
     }
 
@@ -3352,89 +3375,14 @@ impl<S> Drop for CompressedSplitWriter<S> {
 }
 
 #[cfg(test)]
+#[path = "terminal_publication_tests.rs"]
+mod terminal_publication_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    #[derive(Clone, Copy)]
-    enum ReadCompletion {
-        Data,
-        Eof,
-        Error,
-        Pending,
-    }
-
-    struct TerminatingRead {
-        shared: Arc<std::sync::OnceLock<Arc<SplitShared>>>,
-        completion: ReadCompletion,
-    }
-
-    impl AsyncRead for TerminatingRead {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            _: &mut Context<'_>,
-            buf: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            // Publish after next()'s initial terminal check, while the transport
-            // is being polled. This fixes the race order without a timed sleep.
-            self.shared
-                .get()
-                .unwrap()
-                .terminate(TerminalCause::IdleTimeout);
-            match self.completion {
-                ReadCompletion::Data => {
-                    buf.put_slice(b"\x82\x01a");
-                    Poll::Ready(Ok(()))
-                }
-                ReadCompletion::Eof => Poll::Ready(Ok(())),
-                ReadCompletion::Error => Poll::Ready(Err(io::Error::other("read failed"))),
-                ReadCompletion::Pending => Poll::Pending,
-            }
-        }
-    }
-
-    impl AsyncWrite for TerminatingRead {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            Poll::Ready(Ok(buf.len()))
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    #[rstest::rstest]
-    #[case::data(ReadCompletion::Data)]
-    #[case::eof(ReadCompletion::Eof)]
-    #[case::error(ReadCompletion::Error)]
-    #[case::pending(ReadCompletion::Pending)]
-    #[tokio::test]
-    async fn split_terminal_published_during_read_takes_priority(
-        #[case] completion: ReadCompletion,
-    ) {
-        let shared = Arc::new(std::sync::OnceLock::new());
-        let io = TerminatingRead {
-            shared: shared.clone(),
-            completion,
-        };
-        let config = Config::builder().auto_ping(false).idle_timeout(0).build();
-        let (mut reader, _writer) = WebSocketStream::client(io, config).split();
-        assert!(shared.set(reader.shared.clone()).is_ok());
-
-        let result = reader.next().await;
-
-        assert!(matches!(result, Some(Err(Error::IdleTimeout))));
-        assert!(reader.next().await.is_none());
-    }
 
     struct FailingWriter {
         polls: Arc<std::sync::atomic::AtomicUsize>,
