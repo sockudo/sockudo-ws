@@ -1094,12 +1094,15 @@ const SPLIT_LOCAL_CLOSING: u8 = 1;
 const SPLIT_PEER_CLOSING: u8 = 2;
 const SPLIT_READ_ERROR_PENDING: u8 = 3;
 const SPLIT_CLOSED: u8 = 4;
+const SPLIT_CLOSED_HEARTBEAT: u8 = 5;
+const SPLIT_CLOSED_IDLE: u8 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 enum TerminalCause {
-    ConnectionClosed,
-    HeartbeatTimeout,
-    IdleTimeout,
+    ConnectionClosed = SPLIT_CLOSED,
+    HeartbeatTimeout = SPLIT_CLOSED_HEARTBEAT,
+    IdleTimeout = SPLIT_CLOSED_IDLE,
 }
 
 impl TerminalCause {
@@ -1128,7 +1131,7 @@ enum ControlRequest {
 
 struct SplitShared {
     status: AtomicU8,
-    terminal_tx: watch::Sender<Option<TerminalCause>>,
+    terminal_tx: watch::Sender<()>,
     cancel: CancellationToken,
     /// Clock epoch shared by the reader and the writer driver
     epoch: tokio::time::Instant,
@@ -1140,7 +1143,7 @@ struct SplitShared {
 
 impl SplitShared {
     fn new(closed: bool, tracks_inbound_activity: bool) -> Arc<Self> {
-        let (terminal_tx, _) = watch::channel(closed.then_some(TerminalCause::ConnectionClosed));
+        let (terminal_tx, _) = watch::channel(());
         Arc::new(Self {
             status: AtomicU8::new(if closed { SPLIT_CLOSED } else { SPLIT_OPEN }),
             terminal_tx,
@@ -1198,8 +1201,28 @@ impl SplitShared {
     }
 
     fn terminate(&self, cause: TerminalCause) {
-        if self.status.swap(SPLIT_CLOSED, Ordering::AcqRel) != SPLIT_CLOSED {
-            self.terminal_tx.send_replace(Some(cause));
+        // Publish closure and its cause together. The first terminal cause
+        // wins, even if another task terminates before watch notification.
+        if self
+            .status
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |status| {
+                (status < SPLIT_CLOSED).then_some(cause as u8)
+            })
+            .is_ok()
+        {
+            self.terminal_tx.send_replace(());
+        }
+    }
+
+    fn terminal_cause(&self) -> Option<TerminalCause> {
+        match self.status.load(Ordering::Acquire) {
+            SPLIT_OPEN | SPLIT_LOCAL_CLOSING | SPLIT_PEER_CLOSING | SPLIT_READ_ERROR_PENDING => {
+                None
+            }
+            SPLIT_CLOSED => Some(TerminalCause::ConnectionClosed),
+            SPLIT_CLOSED_HEARTBEAT => Some(TerminalCause::HeartbeatTimeout),
+            SPLIT_CLOSED_IDLE => Some(TerminalCause::IdleTimeout),
+            _ => unreachable!("invalid split connection state"),
         }
     }
 
@@ -1394,7 +1417,7 @@ where
         };
         drop(sink);
         if result.is_err() {
-            if self.shared.status.load(Ordering::Acquire) == SPLIT_CLOSED {
+            if self.shared.terminal_cause().is_some() {
                 return Err(self.current_error());
             }
             self.shared.terminate(TerminalCause::ConnectionClosed);
@@ -1408,13 +1431,12 @@ where
 
     fn current_error(&self) -> Error {
         self.shared
-            .terminal_tx
-            .borrow()
+            .terminal_cause()
             .map_or(Error::ConnectionClosed, TerminalCause::error)
     }
 
     fn preferred_write_error(&self, error: Error) -> Error {
-        match *self.shared.terminal_tx.borrow() {
+        match self.shared.terminal_cause() {
             Some(TerminalCause::HeartbeatTimeout) => Error::HeartbeatTimeout,
             Some(TerminalCause::IdleTimeout) => Error::IdleTimeout,
             _ => error,
@@ -1448,7 +1470,7 @@ pub struct SplitReader<S> {
     // Deliver successfully parsed messages before a later parse failure.
     pending_parse_error: Option<Error>,
     control_tx: mpsc::Sender<ControlRequest>,
-    terminal_rx: watch::Receiver<Option<TerminalCause>>,
+    terminal_rx: watch::Receiver<()>,
     shared: Arc<SplitShared>,
     terminal_reported: bool,
 }
@@ -1632,12 +1654,13 @@ where
 
             tokio::select! {
                 biased;
-                changed = self.terminal_rx.changed() => {
-                    if changed.is_err() {
-                        self.shared.terminate(TerminalCause::ConnectionClosed);
-                    }
-                }
                 result = self.reader.read_buf(&mut self.read_buf) => {
+                    // A terminal cause published while the read was pending wins
+                    // over new bytes or an I/O error. Immediately ready reads do
+                    // not need to register a terminal waiter.
+                    if let Some(result) = self.take_terminal() {
+                        return result;
+                    }
                     match result {
                         Ok(0) => {
                             let _ = self.control_tx.send(ControlRequest::Eof).await;
@@ -1655,19 +1678,22 @@ where
                         }
                     }
                 }
+                changed = self.terminal_rx.changed() => {
+                    if changed.is_err() {
+                        self.shared.terminate(TerminalCause::ConnectionClosed);
+                    }
+                }
             }
         }
     }
 
     fn take_terminal(&mut self) -> Option<Option<Result<Message>>> {
-        if self.shared.status.load(Ordering::Acquire) != SPLIT_CLOSED {
-            return None;
-        }
+        let cause = self.shared.terminal_cause()?;
         self.terminal_reported = true;
-        match *self.terminal_rx.borrow() {
-            Some(TerminalCause::HeartbeatTimeout) => Some(Some(Err(Error::HeartbeatTimeout))),
-            Some(TerminalCause::IdleTimeout) => Some(Some(Err(Error::IdleTimeout))),
-            _ => Some(None),
+        match cause {
+            TerminalCause::HeartbeatTimeout => Some(Some(Err(Error::HeartbeatTimeout))),
+            TerminalCause::IdleTimeout => Some(Some(Err(Error::IdleTimeout))),
+            TerminalCause::ConnectionClosed => Some(None),
         }
     }
 
@@ -3001,7 +3027,7 @@ pub struct CompressedSplitReader<S> {
     // Deliver successfully parsed messages before a later parse failure.
     pending_parse_error: Option<Error>,
     control_tx: mpsc::Sender<ControlRequest>,
-    terminal_rx: watch::Receiver<Option<TerminalCause>>,
+    terminal_rx: watch::Receiver<()>,
     shared: Arc<SplitShared>,
     terminal_reported: bool,
 }
@@ -3231,6 +3257,11 @@ where
                     }
                 }
                 result = self.reader.read_buf(&mut self.read_buf) => {
+                    // A terminal cause published during this poll takes
+                    // precedence over data, EOF and transport errors.
+                    if let Some(result) = self.take_terminal() {
+                        return result;
+                    }
                     match result {
                         Ok(0) => {
                             let _ = self.control_tx.send(ControlRequest::Eof).await;
@@ -3268,14 +3299,12 @@ where
     }
 
     fn take_terminal(&mut self) -> Option<Option<Result<Message>>> {
-        if self.shared.status.load(Ordering::Acquire) != SPLIT_CLOSED {
-            return None;
-        }
+        let cause = self.shared.terminal_cause()?;
         self.terminal_reported = true;
-        match *self.terminal_rx.borrow() {
-            Some(TerminalCause::HeartbeatTimeout) => Some(Some(Err(Error::HeartbeatTimeout))),
-            Some(TerminalCause::IdleTimeout) => Some(Some(Err(Error::IdleTimeout))),
-            _ => Some(None),
+        match cause {
+            TerminalCause::HeartbeatTimeout => Some(Some(Err(Error::HeartbeatTimeout))),
+            TerminalCause::IdleTimeout => Some(Some(Err(Error::IdleTimeout))),
+            TerminalCause::ConnectionClosed => Some(None),
         }
     }
 
@@ -3344,6 +3373,10 @@ impl<S> Drop for CompressedSplitWriter<S> {
         self.core.shared.cancel.cancel();
     }
 }
+
+#[cfg(test)]
+#[path = "terminal_publication_tests.rs"]
+mod terminal_publication_tests;
 
 #[cfg(test)]
 mod tests {

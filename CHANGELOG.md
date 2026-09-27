@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Ordinary Tokio split readers poll transport reads before terminal notifications, avoiding notification waiter registration for immediately ready reads. A terminal cause published during the read is rechecked before handling its data, EOF or I/O error.
 - Ordinary Tokio split readers deliver each newly parsed message without first parsing the rest of a buffered burst. Later malformed frames are discovered by a subsequent `next()` call, so writes remain allowed until that discovery and a terminal heartbeat or idle timeout can take precedence over the unparsed tail. Messages and errors parsed before splitting preserve their order. Unified, compressed and Compio readers retain batch parsing.
 - Compio HTTP/2 and HTTP/3 adapters retain owned DATA chunks instead of staging every byte in a preallocated 64 KiB buffer. The last read releases the retained owner; reads still copy into the caller buffer.
 - Tokio HTTP/3 client and server adapters retain unread DATA chunks instead of copying them into a preallocated 64 KiB buffer, and release fully consumed chunks immediately. Raw QUIC wrappers also stop allocating an unused 64 KiB receive buffer.
@@ -52,6 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Tokio plain and compressed split readers and writers observe closure and its terminal cause atomically, preserving the first cause before notification completes. Compressed split reads also preserve a terminal cause published during I/O over the returned transport error.
 - Compio HTTP/3 adapters complete zero-capacity reads without waiting for incoming DATA.
 - Tokio HTTP/3 request adapters complete zero-capacity reads immediately without waiting for or consuming data.
 - Tokio and Compio HTTP/2 adapters skip empty DATA frames without reporting premature EOF; zero-capacity read buffers complete immediately without consuming DATA. END_STREAM still terminates reads after queued bytes, and pending Compio reads remain cancellable.
