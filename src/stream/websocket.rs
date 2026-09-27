@@ -620,9 +620,9 @@ where
                 .pending_parse_error
                 .is_none()
                 .then(|| self.heartbeat.next_deadline())
-                .flatten();
-            if let Some(deadline) = deadline {
-                let now = self.clock_epoch.elapsed().as_millis() as u64;
+                .flatten()
+                .map(|deadline| (deadline, self.clock_epoch.elapsed().as_millis() as u64));
+            if let Some((deadline, now)) = deadline {
                 if deadline.at() <= now {
                     let this = self.as_mut().get_mut();
                     match deadline {
@@ -688,7 +688,15 @@ where
             // First, return any pending messages
             if let Some(msg) = self.as_mut().get_mut().next_pending_message() {
                 let this = self.as_mut().get_mut();
-                let now = this.clock_epoch.elapsed().as_millis() as u64;
+                // Reuse only within this iteration, before any further read/parse.
+                // A Pong must use fresh time: preemption during timer polling
+                // must not let a late response clear its outstanding deadline.
+                let now = match (&msg, deadline) {
+                    (Message::Pong(_), _) | (_, None) => {
+                        this.clock_epoch.elapsed().as_millis() as u64
+                    }
+                    (_, Some((_, now))) => now,
+                };
                 let pong = match &msg {
                     Message::Pong(payload) => Some(payload),
                     _ => None,
@@ -2638,9 +2646,9 @@ where
                 .pending_parse_error
                 .is_none()
                 .then(|| self.heartbeat.next_deadline())
-                .flatten();
-            if let Some(deadline) = deadline {
-                let now = self.clock_epoch.elapsed().as_millis() as u64;
+                .flatten()
+                .map(|deadline| (deadline, self.clock_epoch.elapsed().as_millis() as u64));
+            if let Some((deadline, now)) = deadline {
                 if deadline.at() <= now {
                     let this = self.as_mut().get_mut();
                     match deadline {
@@ -2705,7 +2713,15 @@ where
 
             if let Some(msg) = self.as_mut().get_mut().next_pending_message() {
                 let this = self.as_mut().get_mut();
-                let now = this.clock_epoch.elapsed().as_millis() as u64;
+                // Reuse only within this iteration, before any further read/parse.
+                // A Pong must use fresh time: preemption during timer polling
+                // must not let a late response clear its outstanding deadline.
+                let now = match (&msg, deadline) {
+                    (Message::Pong(_), _) | (_, None) => {
+                        this.clock_epoch.elapsed().as_millis() as u64
+                    }
+                    (_, Some((_, now))) => now,
+                };
                 let pong = match &msg {
                     Message::Pong(payload) => Some(payload),
                     _ => None,
@@ -3329,6 +3345,10 @@ impl<S> Drop for CompressedSplitWriter<S> {
 #[cfg(test)]
 #[path = "terminal_publication_tests.rs"]
 mod terminal_publication_tests;
+
+#[cfg(all(test, not(feature = "test-util")))]
+#[path = "receive_timestamp_tests.rs"]
+mod receive_timestamp_tests;
 
 #[cfg(test)]
 mod tests {
