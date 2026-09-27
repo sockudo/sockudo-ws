@@ -139,26 +139,43 @@ macro_rules! write_cases {
                 let (io, written, config) = setup(vectored, None);
                 let mut ws = ($make)(io, config);
                 let payload = Bytes::from(vec![0x5a; size]);
-                for bytes in [Bytes::from_static(b"before"), payload.clone(), Bytes::from_static(b"after")] {
+                for bytes in [
+                    Bytes::from_static(b"before"),
+                    payload.clone(),
+                    Bytes::from_static(b"after"),
+                ] {
                     ws.feed(Message::Binary(bytes)).await.unwrap();
                 }
 
                 // close() exercises the async flush; Sink::flush exercises poll_write_out.
-                if close { ws.close(1000, "done").await.unwrap(); }
-                else { ws.flush().await.unwrap(); }
+                if close {
+                    ws.close(1000, "done").await.unwrap();
+                } else {
+                    ws.flush().await.unwrap();
+                }
 
                 let written = written.lock().unwrap();
                 assert!(written.flushed);
                 assert_eq!(written.vectored > 0, $segments && size >= 8192 && vectored);
-                if !vectored || !$segments || size < 8192 { assert!(written.scalar > 0); }
+                if !vectored || !$segments || size < 8192 {
+                    assert!(written.scalar > 0);
+                }
                 let mut wire = BytesMut::from(written.bytes.as_slice());
-                let messages = Protocol::new(Role::Client, 65536, 65536).process(&mut wire).unwrap();
+                let messages = Protocol::new(Role::Client, 65536, 65536)
+                    .process(&mut wire)
+                    .unwrap();
                 assert!(wire.is_empty());
                 assert_eq!(messages.len(), if close { 4 } else { 3 });
                 assert_eq!(messages[0].as_bytes(), b"before");
                 assert_eq!(messages[1].as_bytes(), payload.as_ref());
                 assert_eq!(messages[2].as_bytes(), b"after");
-                if close { assert!(matches!(&messages[3], Message::Close(Some(reason)) if reason.code == 1000 && reason.reason == "done")); }
+                if close {
+                    assert!(matches!(
+                        &messages[3],
+                        Message::Close(Some(reason))
+                            if reason.code == 1000 && reason.reason == "done"
+                    ));
+                }
             }
 
             #[rstest::rstest]
@@ -167,15 +184,29 @@ macro_rules! write_cases {
                 #[values(false, true)] close: bool,
                 #[values(false, true)] error: bool,
             ) {
-                let terminal = if error { Err(io::Error::from(io::ErrorKind::Other)) } else { Ok(0) };
+                let terminal = if error {
+                    Err(io::Error::from(io::ErrorKind::Other))
+                } else {
+                    Ok(0)
+                };
                 let (io, written, config) = setup(true, Some(terminal));
                 let mut ws = ($make)(io, config);
                 ws.feed(Message::binary(vec![1; 32])).await.unwrap();
 
-                let result = if close { ws.close(1000, "done").await } else { ws.flush().await };
+                let result = if close {
+                    ws.close(1000, "done").await
+                } else {
+                    ws.flush().await
+                };
 
-                if error { assert!(matches!(result, Err(Error::Io(error)) if error.kind() == io::ErrorKind::Other)); }
-                else { assert!(matches!(result, Err(Error::ConnectionClosed))); }
+                if error {
+                    assert!(matches!(
+                        result,
+                        Err(Error::Io(error)) if error.kind() == io::ErrorKind::Other
+                    ));
+                } else {
+                    assert!(matches!(result, Err(Error::ConnectionClosed)));
+                }
                 assert!(written.lock().unwrap().bytes.is_empty());
             }
         }
@@ -183,6 +214,39 @@ macro_rules! write_cases {
 }
 
 write_cases!(plain, WebSocketStream::server, true);
+
+#[rstest::rstest]
+#[tokio::test]
+async fn vectored_zero_and_error_writes_remain_terminal(
+    #[values(false, true)] close: bool,
+    #[values(false, true)] error: bool,
+) {
+    let terminal = if error {
+        Err(io::Error::from(io::ErrorKind::Other))
+    } else {
+        Ok(0)
+    };
+    let (io, written, config) = setup(true, Some(terminal));
+    let mut ws = WebSocketStream::server(io, config);
+    // Large server payloads keep the header and payload in separate segments.
+    ws.feed(Message::binary(vec![1; 8192])).await.unwrap();
+
+    let result = if close {
+        ws.close(1000, "done").await
+    } else {
+        ws.flush().await
+    };
+
+    if error {
+        assert!(matches!(result, Err(Error::Io(error)) if error.kind() == io::ErrorKind::Other));
+    } else {
+        assert!(matches!(result, Err(Error::ConnectionClosed)));
+    }
+    let written = written.lock().unwrap();
+    assert!(written.vectored > 0);
+    assert_eq!(written.scalar, 0);
+    assert!(written.bytes.is_empty());
+}
 
 #[cfg(feature = "permessage-deflate")]
 write_cases!(
