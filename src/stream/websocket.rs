@@ -1632,12 +1632,13 @@ where
 
             tokio::select! {
                 biased;
-                changed = self.terminal_rx.changed() => {
-                    if changed.is_err() {
-                        self.shared.terminate(TerminalCause::ConnectionClosed);
-                    }
-                }
                 result = self.reader.read_buf(&mut self.read_buf) => {
+                    // A terminal cause published while the read was pending wins
+                    // over new bytes or an I/O error. Immediately ready reads do
+                    // not need to register a terminal waiter.
+                    if let Some(result) = self.take_terminal() {
+                        return result;
+                    }
                     match result {
                         Ok(0) => {
                             let _ = self.control_tx.send(ControlRequest::Eof).await;
@@ -1653,6 +1654,11 @@ where
                             self.shared.terminate(TerminalCause::ConnectionClosed);
                             return Some(Err(error.into()));
                         }
+                    }
+                }
+                changed = self.terminal_rx.changed() => {
+                    if changed.is_err() {
+                        self.shared.terminate(TerminalCause::ConnectionClosed);
                     }
                 }
             }
@@ -3350,6 +3356,85 @@ mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Clone, Copy)]
+    enum ReadCompletion {
+        Data,
+        Eof,
+        Error,
+        Pending,
+    }
+
+    struct TerminatingRead {
+        shared: Arc<std::sync::OnceLock<Arc<SplitShared>>>,
+        completion: ReadCompletion,
+    }
+
+    impl AsyncRead for TerminatingRead {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            // Publish after next()'s initial terminal check, while the transport
+            // is being polled. This fixes the race order without a timed sleep.
+            self.shared
+                .get()
+                .unwrap()
+                .terminate(TerminalCause::IdleTimeout);
+            match self.completion {
+                ReadCompletion::Data => {
+                    buf.put_slice(b"\x82\x01a");
+                    Poll::Ready(Ok(()))
+                }
+                ReadCompletion::Eof => Poll::Ready(Ok(())),
+                ReadCompletion::Error => Poll::Ready(Err(io::Error::other("read failed"))),
+                ReadCompletion::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl AsyncWrite for TerminatingRead {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::data(ReadCompletion::Data)]
+    #[case::eof(ReadCompletion::Eof)]
+    #[case::error(ReadCompletion::Error)]
+    #[case::pending(ReadCompletion::Pending)]
+    #[tokio::test]
+    async fn split_terminal_published_during_read_takes_priority(
+        #[case] completion: ReadCompletion,
+    ) {
+        let shared = Arc::new(std::sync::OnceLock::new());
+        let io = TerminatingRead {
+            shared: shared.clone(),
+            completion,
+        };
+        let config = Config::builder().auto_ping(false).idle_timeout(0).build();
+        let (mut reader, _writer) = WebSocketStream::client(io, config).split();
+        assert!(shared.set(reader.shared.clone()).is_ok());
+
+        let result = reader.next().await;
+
+        assert!(matches!(result, Some(Err(Error::IdleTimeout))));
+        assert!(reader.next().await.is_none());
+    }
 
     struct FailingWriter {
         polls: Arc<std::sync::atomic::AtomicUsize>,
