@@ -53,7 +53,7 @@ def main():
                         str(RUNNER_TARGET / "release" / "wstest"),
                         "--mode", "fuzzingclient",
                         "--spec", "fuzzingclient.json",
-                        "--concurrency", "4",
+                        "--concurrency", "8",
                     ],
                     cwd=ROOT / "autobahn",
                     stdout=subprocess.PIPE,

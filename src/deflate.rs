@@ -4,29 +4,62 @@
 //! which compresses message payloads using the DEFLATE algorithm.
 
 use bytes::{Bytes, BytesMut};
-use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
+use flate2::{Compress, Compression, FlushCompress, Status};
+use libz_rs_sys::{
+    Z_BUF_ERROR, Z_OK, Z_STREAM_END, Z_SYNC_FLUSH, inflate, inflateEnd, inflateInit2_,
+    inflateReset, inflateResetKeep, z_stream, zlibVersion,
+};
+use std::mem::MaybeUninit;
 
+pub use crate::DeflateWindowBits;
 use crate::error::{Error, Result};
+use crate::handshake::trim_optional_whitespace;
 
 /// Trailer bytes that must be removed after compression and added before decompression
 const DEFLATE_TRAILER: [u8; 4] = [0x00, 0x00, 0xff, 0xff];
 
-/// Default LZ77 window size (32KB = 2^15)
-pub const DEFAULT_WINDOW_BITS: u8 = 15;
+const MIN_RFC_WINDOW_BITS: u8 = 8;
+const MAX_RFC_WINDOW_BITS: u8 = 15;
 
-/// Minimum LZ77 window size (256 bytes = 2^8)
-pub const MIN_WINDOW_BITS: u8 = 8;
+/// Default LZ77 window size (32KB = 2^15).
+pub const DEFAULT_WINDOW_BITS: DeflateWindowBits = DeflateWindowBits::Bits15;
 
-/// Maximum LZ77 window size (32KB = 2^15)
-pub const MAX_WINDOW_BITS: u8 = 15;
+/// Minimum LZ77 window size supported by the configured backend.
+pub const MIN_WINDOW_BITS: DeflateWindowBits = DeflateWindowBits::Bits9;
+
+/// Maximum LZ77 window size (32KB = 2^15).
+pub const MAX_WINDOW_BITS: DeflateWindowBits = DeflateWindowBits::Bits15;
+
+fn response_header(
+    config: &DeflateConfig,
+    server_max_window_bits: Option<u8>,
+    client_max_window_bits: Option<u8>,
+) -> String {
+    let mut parts = vec!["permessage-deflate".to_string()];
+
+    if config.server_no_context_takeover {
+        parts.push("server_no_context_takeover".to_string());
+    }
+    if config.client_no_context_takeover {
+        parts.push("client_no_context_takeover".to_string());
+    }
+    if let Some(bits) = server_max_window_bits {
+        parts.push(format!("server_max_window_bits={bits}"));
+    }
+    if let Some(bits) = client_max_window_bits {
+        parts.push(format!("client_max_window_bits={bits}"));
+    }
+
+    parts.join("; ")
+}
 
 /// Configuration for permessage-deflate extension
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DeflateConfig {
     /// Server's maximum LZ77 window bits (for compression when server, decompression when client)
-    pub server_max_window_bits: u8,
+    pub server_max_window_bits: DeflateWindowBits,
     /// Client's maximum LZ77 window bits (for compression when client, decompression when server)
-    pub client_max_window_bits: u8,
+    pub client_max_window_bits: DeflateWindowBits,
     /// If true, server must reset compression context after each message
     pub server_no_context_takeover: bool,
     /// If true, client must reset compression context after each message
@@ -51,11 +84,17 @@ impl Default for DeflateConfig {
 }
 
 impl DeflateConfig {
-    /// Create config optimized for low memory usage
+    /// Create config optimized for low memory usage.
+    ///
+    /// This reduces encoder and retained takeover-history windows. The
+    /// configured zlib-rs decoder may still retain its internal 32 KiB window.
+    /// When used as a server negotiation policy, clients must offer
+    /// `client_max_window_bits`; a bare `permessage-deflate` offer is declined
+    /// rather than exceeding the configured client window limit.
     pub fn low_memory() -> Self {
         Self {
-            server_max_window_bits: 10, // 1KB window
-            client_max_window_bits: 10,
+            server_max_window_bits: DeflateWindowBits::Bits10, // 1KB window
+            client_max_window_bits: DeflateWindowBits::Bits10,
             server_no_context_takeover: true,
             client_no_context_takeover: true,
             compression_level: 1, // Fast compression
@@ -77,62 +116,22 @@ impl DeflateConfig {
 
     /// Parse extension parameters from handshake
     pub fn from_params(params: &[(&str, Option<&str>)]) -> Result<Self> {
-        let mut config = Self::default();
+        let parsed = DeflateOffer::from_params(params).map_err(Error::HandshakeFailed)?;
+        let mut config = Self {
+            server_no_context_takeover: parsed.server_no_context_takeover,
+            client_no_context_takeover: parsed.client_no_context_takeover,
+            ..Self::default()
+        };
 
-        for (name, value) in params {
-            match *name {
-                "server_no_context_takeover" => {
-                    if value.is_some() {
-                        return Err(Error::HandshakeFailed(
-                            "server_no_context_takeover must not have a value",
-                        ));
-                    }
-                    config.server_no_context_takeover = true;
-                }
-                "client_no_context_takeover" => {
-                    if value.is_some() {
-                        return Err(Error::HandshakeFailed(
-                            "client_no_context_takeover must not have a value",
-                        ));
-                    }
-                    config.client_no_context_takeover = true;
-                    // When client uses no_context_takeover, server should too
-                    // to ensure decompression works correctly on client side
-                    config.server_no_context_takeover = true;
-                }
-                "server_max_window_bits" => {
-                    if let Some(v) = value {
-                        let bits: u8 = v.parse().map_err(|_| {
-                            Error::HandshakeFailed("invalid server_max_window_bits value")
-                        })?;
-                        if !(MIN_WINDOW_BITS..=MAX_WINDOW_BITS).contains(&bits) {
-                            return Err(Error::HandshakeFailed(
-                                "server_max_window_bits out of range (8-15)",
-                            ));
-                        }
-                        config.server_max_window_bits = bits;
-                    }
-                }
-                "client_max_window_bits" => {
-                    if let Some(v) = value {
-                        let bits: u8 = v.parse().map_err(|_| {
-                            Error::HandshakeFailed("invalid client_max_window_bits value")
-                        })?;
-                        if !(MIN_WINDOW_BITS..=MAX_WINDOW_BITS).contains(&bits) {
-                            return Err(Error::HandshakeFailed(
-                                "client_max_window_bits out of range (8-15)",
-                            ));
-                        }
-                        config.client_max_window_bits = bits;
-                    }
-                    // If no value, client just indicates support
-                }
-                _ => {
-                    return Err(Error::HandshakeFailed(
-                        "unknown permessage-deflate parameter",
-                    ));
-                }
-            }
+        if let Some(bits) = parsed.server_max_window_bits {
+            config.server_max_window_bits = DeflateWindowBits::try_from(bits)
+                .map_err(|_| Error::HandshakeFailed("unsupported server_max_window_bits value"))?;
+        }
+        if let Some(Some(bits)) = parsed.client_max_window_bits {
+            // This config can construct a client encoder or a response header;
+            // unlike server negotiation, it cannot silently widen a wire limit.
+            config.client_max_window_bits = DeflateWindowBits::try_from(bits)
+                .map_err(|_| Error::HandshakeFailed("unsupported client_max_window_bits value"))?;
         }
 
         Ok(config)
@@ -140,28 +139,13 @@ impl DeflateConfig {
 
     /// Generate extension response header value for server
     pub fn to_response_header(&self) -> String {
-        let mut parts = vec!["permessage-deflate".to_string()];
-
-        if self.server_no_context_takeover {
-            parts.push("server_no_context_takeover".to_string());
-        }
-        if self.client_no_context_takeover {
-            parts.push("client_no_context_takeover".to_string());
-        }
-        if self.server_max_window_bits < MAX_WINDOW_BITS {
-            parts.push(format!(
-                "server_max_window_bits={}",
-                self.server_max_window_bits
-            ));
-        }
-        if self.client_max_window_bits < MAX_WINDOW_BITS {
-            parts.push(format!(
-                "client_max_window_bits={}",
-                self.client_max_window_bits
-            ));
-        }
-
-        parts.join("; ")
+        response_header(
+            self,
+            (self.server_max_window_bits < MAX_WINDOW_BITS)
+                .then(|| self.server_max_window_bits.into()),
+            (self.client_max_window_bits < MAX_WINDOW_BITS)
+                .then(|| self.client_max_window_bits.into()),
+        )
     }
 }
 
@@ -170,7 +154,7 @@ pub struct DeflateEncoder {
     compress: Compress,
     no_context_takeover: bool,
     #[allow(dead_code)]
-    window_bits: u8,
+    window_bits: DeflateWindowBits,
     #[allow(dead_code)]
     compression_level: Compression,
     threshold: usize,
@@ -178,11 +162,16 @@ pub struct DeflateEncoder {
 
 impl DeflateEncoder {
     /// Create a new encoder
-    pub fn new(window_bits: u8, no_context_takeover: bool, level: u32, threshold: usize) -> Self {
+    pub fn new(
+        window_bits: DeflateWindowBits,
+        no_context_takeover: bool,
+        level: u32,
+        threshold: usize,
+    ) -> Self {
         let compression_level = Compression::new(level);
         // Use the negotiated window_bits for compression
         // This ensures the compressed data can be decompressed by clients with smaller windows
-        let compress = Compress::new_with_window_bits(compression_level, false, window_bits);
+        let compress = Compress::new_with_window_bits(compression_level, false, window_bits.into());
 
         Self {
             compress,
@@ -202,10 +191,13 @@ impl DeflateEncoder {
             return Ok(None);
         }
 
-        // Reset context if required
-        if self.no_context_takeover {
-            self.compress.reset();
-        }
+        // Forget history at the preceding message boundary so each no-takeover
+        // message remains independently decodable without a pre-message reset.
+        let flush = if self.no_context_takeover {
+            FlushCompress::Full
+        } else {
+            FlushCompress::Sync
+        };
 
         // Estimate output size (compressed data is often smaller, but we need headroom)
         let max_output = data.len() + 64;
@@ -218,6 +210,10 @@ impl DeflateEncoder {
         loop {
             iterations += 1;
             if iterations > 100_000 {
+                // A failed flush cannot establish the next message boundary.
+                if self.no_context_takeover {
+                    self.compress.reset();
+                }
                 return Err(Error::Compression(
                     "compression took too many iterations".into(),
                 ));
@@ -237,11 +233,18 @@ impl DeflateEncoder {
             // We get the spare capacity, compress into it, then only set_len for bytes actually written.
             let out_start = output.len();
             let spare = output.spare_capacity_mut();
+            let spare_len = spare.len();
 
-            let status = self
-                .compress
-                .compress_uninit(input, spare, FlushCompress::Sync)
-                .map_err(|e| Error::Compression(format!("deflate error: {}", e)))?;
+            let status = match self.compress.compress_uninit(input, spare, flush) {
+                Ok(status) => status,
+                Err(error) => {
+                    // Restore independence before the caller can reuse this encoder.
+                    if self.no_context_takeover {
+                        self.compress.reset();
+                    }
+                    return Err(Error::Compression(format!("deflate error: {error}")));
+                }
+            };
 
             let consumed = (self.compress.total_in() - before_in) as usize;
             let produced = (self.compress.total_out() - before_out) as usize;
@@ -256,7 +259,9 @@ impl DeflateEncoder {
 
             match status {
                 Status::Ok | Status::BufError => {
-                    if total_in >= data.len() {
+                    // Consuming the input does not finish a flush when output is full.
+                    // Continue with the same flush mode until pending output is drained.
+                    if total_in == data.len() && produced < spare_len {
                         break;
                     }
                 }
@@ -269,7 +274,7 @@ impl DeflateEncoder {
             output.truncate(output.len() - 4);
         }
 
-        // Only skip where the encoder resets per message. Otherwise the caller
+        // Only skip where the encoder clears history per message. Otherwise the caller
         // sends these bytes raw, so they stay in our window without ever
         // entering the peer's, and every later back-reference resolves against
         // different history: corrupt messages, or a connection that dies.
@@ -286,24 +291,107 @@ impl DeflateEncoder {
     }
 }
 
+struct RawDeflateDecoder {
+    // Keep the stream at a stable address for the lifetime required by the C API.
+    stream: Box<z_stream>,
+}
+
+// SAFETY: calls require exclusive access, borrowed buffers are cleared after
+// each call, and the decoder owns the remaining zlib-rs state.
+unsafe impl Send for RawDeflateDecoder {}
+// SAFETY: shared access cannot call the mutable C API or expose its pointers.
+unsafe impl Sync for RawDeflateDecoder {}
+
+impl RawDeflateDecoder {
+    fn new(window_bits: u8) -> Self {
+        let mut stream = Box::new(z_stream::default());
+        // A negative window size selects raw DEFLATE, as required by RFC 7692.
+        // SAFETY: the default stream has valid allocator fields, remains at a
+        // stable address, and is not used until initialization succeeds.
+        let status = unsafe {
+            inflateInit2_(
+                &mut *stream,
+                -i32::from(window_bits),
+                zlibVersion(),
+                std::mem::size_of::<z_stream>() as i32,
+            )
+        };
+        assert_eq!(status, Z_OK, "failed to initialize DEFLATE decoder");
+        Self { stream }
+    }
+
+    fn inflate(
+        &mut self,
+        input: &[u8],
+        output: &mut [MaybeUninit<u8>],
+    ) -> Result<(Status, usize, usize)> {
+        let input = &input[..input.len().min(u32::MAX as usize)];
+        let output_len = output.len().min(u32::MAX as usize);
+        let output = &mut output[..output_len];
+        self.stream.next_in = input.as_ptr();
+        self.stream.avail_in = input.len() as u32;
+        self.stream.next_out = output.as_mut_ptr().cast();
+        self.stream.avail_out = output.len() as u32;
+
+        // SAFETY: the stream is initialized, and its input and output pointers
+        // refer to the slices above for the advertised lengths.
+        let status = unsafe { inflate(&mut *self.stream, Z_SYNC_FLUSH) };
+        let consumed = input.len() - self.stream.avail_in as usize;
+        let produced = output.len() - self.stream.avail_out as usize;
+        self.stream.next_in = std::ptr::null_mut();
+        self.stream.avail_in = 0;
+        self.stream.next_out = std::ptr::null_mut();
+        self.stream.avail_out = 0;
+
+        let status = match status {
+            Z_OK => Status::Ok,
+            Z_BUF_ERROR => Status::BufError,
+            Z_STREAM_END => Status::StreamEnd,
+            code => {
+                return Err(Error::Compression(format!(
+                    "inflate error: status code {code}"
+                )));
+            }
+        };
+        Ok((status, consumed, produced))
+    }
+
+    fn reset(&mut self, keep_window: bool) {
+        // SAFETY: the stream was initialized in new and is exclusively borrowed.
+        let status = unsafe {
+            if keep_window {
+                inflateResetKeep(&mut *self.stream)
+            } else {
+                inflateReset(&mut *self.stream)
+            }
+        };
+        assert_eq!(status, Z_OK, "failed to reset DEFLATE decoder");
+    }
+}
+
+impl Drop for RawDeflateDecoder {
+    fn drop(&mut self) {
+        // SAFETY: the stream was initialized in new and is ended exactly once.
+        let status = unsafe { inflateEnd(&mut *self.stream) };
+        debug_assert_eq!(status, Z_OK);
+    }
+}
+
 /// Deflate decompressor for incoming messages
 pub struct DeflateDecoder {
-    decompress: Decompress,
+    decompress: RawDeflateDecoder,
     no_context_takeover: bool,
-    #[allow(dead_code)]
-    window_bits: u8,
 }
 
 impl DeflateDecoder {
     /// Create a new decoder
-    pub fn new(window_bits: u8, no_context_takeover: bool) -> Self {
+    pub fn new(window_bits: DeflateWindowBits, no_context_takeover: bool) -> Self {
         // Use raw deflate (no zlib header) with the negotiated window_bits
-        let decompress = Decompress::new_with_window_bits(false, window_bits);
+        let decompress = RawDeflateDecoder::new(window_bits.into());
 
         Self {
             decompress,
             no_context_takeover,
-            window_bits,
         }
     }
 
@@ -319,8 +407,9 @@ impl DeflateDecoder {
         input.extend_from_slice(data);
         input.extend_from_slice(&DEFLATE_TRAILER);
 
-        // Start with reasonable output buffer (at least 1KB or 4x input)
-        let initial_cap = std::cmp::max(1024, data.len() * 4);
+        // Start with reasonable output buffer (at least 1KB or 4x input), but
+        // never expose writable output beyond the configured message limit.
+        let initial_cap = std::cmp::max(1024, data.len().saturating_mul(4)).min(max_size);
         let mut output = BytesMut::with_capacity(initial_cap);
         let mut total_in: usize = 0;
         let mut iterations = 0u32;
@@ -334,55 +423,80 @@ impl DeflateDecoder {
                 ));
             }
 
-            // Check size limit
-            if output.len() > max_size {
-                return Err(Error::MessageTooLarge);
-            }
+            let at_limit = output.len() == max_size;
+            let offered;
+            let status;
+            let consumed;
+            let produced;
 
-            // Ensure we have space in output buffer
-            let available = output.capacity() - output.len();
-            if available == 0 {
-                if output.capacity() >= max_size {
-                    return Err(Error::MessageTooLarge);
+            if at_limit {
+                // Let inflate consume a trailer or report stream completion.
+                // Any byte produced into this probe exceeds the logical limit.
+                let mut probe = [std::mem::MaybeUninit::uninit()];
+                offered = probe.len();
+                (status, consumed, produced) =
+                    self.decompress.inflate(&input[total_in..], &mut probe)?;
+            } else {
+                // Ensure we have space in the output buffer.
+                if output.len() == output.capacity() {
+                    // At least double or add 4KB, whichever is larger. The
+                    // allocator may reserve more, so the writable slice below
+                    // is still capped explicitly.
+                    let remaining = max_size - output.len();
+                    let additional = std::cmp::max(output.capacity(), 4096).min(remaining);
+                    output.reserve(additional);
                 }
-                // At least double or add 4KB, whichever is larger
-                let additional = std::cmp::max(output.capacity(), 4096);
-                output.reserve(additional);
+
+                // Get writable slice using spare_capacity_mut to avoid UB with uninitialized memory.
+                let out_start = output.len();
+                let remaining = max_size - out_start;
+                let spare = output.spare_capacity_mut();
+                let writable = spare.len().min(remaining);
+                // Keep `offered` equal to the u32-sized output range passed to inflate.
+                let spare = &mut spare[..writable.min(u32::MAX as usize)];
+                offered = spare.len();
+                (status, consumed, produced) =
+                    self.decompress.inflate(&input[total_in..], spare)?;
+
+                // SAFETY: inflate initialized exactly `produced` bytes in the spare capacity.
+                // We're only extending the length by the number of bytes that were initialized.
+                unsafe {
+                    output.set_len(out_start + produced);
+                }
             }
-
-            let before_out = self.decompress.total_out();
-            let before_in = self.decompress.total_in();
-
-            // Get writable slice using spare_capacity_mut to avoid UB with uninitialized memory.
-            let out_start = output.len();
-            let spare = output.spare_capacity_mut();
-
-            let status = self
-                .decompress
-                .decompress_uninit(&input[total_in..], spare, FlushDecompress::Sync)
-                .map_err(|e| Error::Compression(format!("inflate error: {}", e)))?;
-
-            let consumed = (self.decompress.total_in() - before_in) as usize;
-            let produced = (self.decompress.total_out() - before_out) as usize;
 
             total_in += consumed;
 
-            // SAFETY: decompress_uninit() wrote exactly `produced` bytes to the spare capacity.
-            // We're only extending the length by the number of bytes that were initialized.
-            unsafe {
-                output.set_len(out_start + produced);
+            if at_limit && produced != 0 {
+                return Err(Error::MessageTooLarge);
             }
 
-            match status {
-                Status::Ok => {
-                    if total_in >= input.len() {
-                        break;
-                    }
+            if status == Status::StreamEnd {
+                // RFC 7692 permits BFINAL blocks. Start the next raw stream
+                // while retaining the current message's LZ77 dictionary.
+                self.decompress.reset(true);
+                if total_in >= data.len() {
+                    // The final stream either ended at the payload boundary or
+                    // consumed the synthetic trailer appended for decompression.
+                    break;
                 }
-                Status::StreamEnd => break,
-                Status::BufError => {
-                    // Need more output space - will be handled at top of loop
+                continue;
+            }
+
+            if consumed == 0 && produced == 0 {
+                if total_in < input.len() {
+                    return Err(Error::Compression(
+                        "inflate made no progress with input remaining".into(),
+                    ));
                 }
+                break;
+            }
+
+            // A full output slice can hide pending output after all input was
+            // consumed. Continue once more with fresh capacity (or the limit
+            // probe) until inflate stops filling the offered slice.
+            if total_in >= input.len() && produced < offered {
+                break;
             }
         }
 
@@ -459,35 +573,27 @@ impl DeflateContext {
 
 /// Parse permessage-deflate extension parameters from header value
 pub fn parse_deflate_offer(value: &str) -> Option<Vec<(&str, Option<&str>)>> {
-    let value = value.trim();
-
-    // Check if this is a permessage-deflate offer
-    if !value.starts_with("permessage-deflate") {
-        return None;
-    }
-
-    let rest = value.strip_prefix("permessage-deflate")?.trim_start();
-
-    if rest.is_empty() {
-        return Some(Vec::new());
-    }
-
-    // Must start with semicolon if there are parameters
-    if !rest.starts_with(';') {
+    let mut parts = value.split(';');
+    // Check that this is exactly a permessage-deflate offer.
+    if trim_optional_whitespace(parts.next()?) != "permessage-deflate" {
         return None;
     }
 
     let mut params = Vec::new();
-
-    for part in rest[1..].split(';') {
-        let part = part.trim();
+    for part in parts {
+        let part = trim_optional_whitespace(part);
         if part.is_empty() {
-            continue;
+            return None;
         }
 
         if let Some((name, value)) = part.split_once('=') {
-            let name = name.trim();
-            let value = value.trim().trim_matches('"');
+            let name = trim_optional_whitespace(name);
+            let value = trim_optional_whitespace(value);
+            let value = match (value.strip_prefix('"'), value.strip_suffix('"')) {
+                (Some(value), Some(_)) => value.strip_suffix('"')?,
+                (None, None) if !value.contains('"') => value,
+                _ => return None,
+            };
             params.push((name, Some(value)));
         } else {
             params.push((part, None));
@@ -495,6 +601,178 @@ pub fn parse_deflate_offer(value: &str) -> Option<Vec<(&str, Option<&str>)>> {
     }
 
     Some(params)
+}
+
+#[derive(Default)]
+struct DeflateOffer {
+    server_no_context_takeover: bool,
+    client_no_context_takeover: bool,
+    server_max_window_bits: Option<u8>,
+    client_max_window_bits: Option<Option<u8>>,
+}
+
+/// Server-side result of negotiating a permessage-deflate offer.
+///
+/// The response parameters are kept separately from [`DeflateConfig`] because
+/// RFC 7692 distinguishes an omitted parameter from an explicitly negotiated
+/// value of 15, while both use the same backend codec configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeflateNegotiation {
+    /// Runtime codec configuration selected for the connection.
+    pub config: DeflateConfig,
+    response_server_max_window_bits: Option<u8>,
+    response_client_max_window_bits: Option<u8>,
+}
+
+impl DeflateNegotiation {
+    /// Generate the extension response header value for this negotiation.
+    pub fn to_response_header(&self) -> String {
+        response_header(
+            &self.config,
+            self.response_server_max_window_bits,
+            self.response_client_max_window_bits,
+        )
+    }
+}
+
+impl DeflateOffer {
+    fn from_params(params: &[(&str, Option<&str>)]) -> std::result::Result<Self, &'static str> {
+        let mut offer = Self::default();
+
+        for &(name, value) in params {
+            match name {
+                "server_no_context_takeover" => {
+                    if offer.server_no_context_takeover {
+                        return Err("duplicate server_no_context_takeover");
+                    }
+                    if value.is_some() {
+                        return Err("server_no_context_takeover must not have a value");
+                    }
+                    offer.server_no_context_takeover = true;
+                }
+                "client_no_context_takeover" => {
+                    if offer.client_no_context_takeover {
+                        return Err("duplicate client_no_context_takeover");
+                    }
+                    if value.is_some() {
+                        return Err("client_no_context_takeover must not have a value");
+                    }
+                    offer.client_no_context_takeover = true;
+                }
+                "server_max_window_bits" => {
+                    if offer.server_max_window_bits.is_some() {
+                        return Err("duplicate server_max_window_bits");
+                    }
+                    let value = value.ok_or("server_max_window_bits requires a value")?;
+                    let bits =
+                        parse_window_bits(value).ok_or("invalid server_max_window_bits value")?;
+                    offer.server_max_window_bits = Some(bits);
+                }
+                "client_max_window_bits" => {
+                    if offer.client_max_window_bits.is_some() {
+                        return Err("duplicate client_max_window_bits");
+                    }
+                    offer.client_max_window_bits = Some(match value {
+                        Some(value) => Some(
+                            parse_window_bits(value)
+                                .ok_or("invalid client_max_window_bits value")?,
+                        ),
+                        // If no value, client just indicates support.
+                        None => None,
+                    });
+                }
+                _ => return Err("unknown permessage-deflate parameter"),
+            }
+        }
+
+        Ok(offer)
+    }
+}
+
+fn parse_window_bits(value: &str) -> Option<u8> {
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return None;
+    }
+    let window_bits: u8 = value.parse().ok()?;
+    if (MIN_RFC_WINDOW_BITS..=MAX_RFC_WINDOW_BITS).contains(&window_bits) {
+        Some(window_bits)
+    } else {
+        None
+    }
+}
+
+/// Select the first client offer that satisfies the server policy and backend limits.
+pub fn negotiate_server_deflate(
+    offers: &str,
+    policy: &DeflateConfig,
+) -> Option<DeflateNegotiation> {
+    for offer in offers.split(',') {
+        let Some(params) = parse_deflate_offer(trim_optional_whitespace(offer)) else {
+            continue;
+        };
+        let Ok(offer) = DeflateOffer::from_params(&params) else {
+            continue;
+        };
+
+        let (server_max_window_bits, response_server_max_window_bits) =
+            match offer.server_max_window_bits {
+                Some(limit) => {
+                    let Ok(limit) = DeflateWindowBits::try_from(limit) else {
+                        continue;
+                    };
+                    let selected = policy.server_max_window_bits.min(limit);
+                    (selected, Some(selected.into()))
+                }
+                None => (
+                    policy.server_max_window_bits,
+                    (policy.server_max_window_bits < MAX_WINDOW_BITS)
+                        .then(|| policy.server_max_window_bits.into()),
+                ),
+            };
+        let (client_max_window_bits, response_client_max_window_bits) =
+            match offer.client_max_window_bits {
+                Some(Some(limit)) => {
+                    let selected = u8::from(policy.client_max_window_bits).min(limit);
+                    let backend = if selected == MIN_RFC_WINDOW_BITS {
+                        MIN_WINDOW_BITS
+                    } else {
+                        DeflateWindowBits::try_from(selected).ok()?
+                    };
+                    (
+                        backend,
+                        (selected < u8::from(MAX_WINDOW_BITS)).then_some(selected),
+                    )
+                }
+                Some(None) => (
+                    policy.client_max_window_bits,
+                    (policy.client_max_window_bits < MAX_WINDOW_BITS)
+                        .then(|| policy.client_max_window_bits.into()),
+                ),
+                None if policy.client_max_window_bits == MAX_WINDOW_BITS => (MAX_WINDOW_BITS, None),
+                None => continue,
+            };
+
+        let negotiated = DeflateConfig {
+            server_max_window_bits,
+            client_max_window_bits,
+            server_no_context_takeover: policy.server_no_context_takeover
+                || offer.server_no_context_takeover,
+            client_no_context_takeover: policy.client_no_context_takeover
+                || offer.client_no_context_takeover,
+            compression_level: policy.compression_level,
+            compression_threshold: policy.compression_threshold,
+        };
+        return Some(DeflateNegotiation {
+            config: negotiated,
+            response_server_max_window_bits,
+            response_client_max_window_bits,
+        });
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -648,6 +926,10 @@ mod tests {
         assert_eq!(params[0], ("server_no_context_takeover", None));
         assert_eq!(params[1], ("server_max_window_bits", Some("10")));
 
+        let params =
+            parse_deflate_offer("permessage-deflate; server_max_window_bits=\"10\"").unwrap();
+        assert_eq!(params, [("server_max_window_bits", Some("10"))]);
+
         // Not a deflate offer
         assert!(parse_deflate_offer("some-other-extension").is_none());
     }
@@ -662,15 +944,84 @@ mod tests {
         let config = DeflateConfig::from_params(&params).unwrap();
         assert!(config.server_no_context_takeover);
         assert!(!config.client_no_context_takeover);
-        assert_eq!(config.client_max_window_bits, 12);
+        assert_eq!(config.client_max_window_bits, DeflateWindowBits::Bits12);
         assert_eq!(config.server_max_window_bits, DEFAULT_WINDOW_BITS);
+    }
+
+    #[test]
+    fn config_from_params_keeps_context_takeover_directions_independent() {
+        let config = DeflateConfig::from_params(&[("client_no_context_takeover", None)]).unwrap();
+
+        assert!(!config.server_no_context_takeover);
+        assert!(config.client_no_context_takeover);
+    }
+
+    #[test]
+    fn config_from_params_rejects_duplicate_parameters() {
+        for params in [
+            vec![
+                ("server_no_context_takeover", None),
+                ("server_no_context_takeover", None),
+            ],
+            vec![
+                ("client_no_context_takeover", None),
+                ("client_no_context_takeover", None),
+            ],
+            vec![
+                ("server_max_window_bits", Some("12")),
+                ("server_max_window_bits", Some("11")),
+            ],
+            vec![
+                ("client_max_window_bits", Some("12")),
+                ("client_max_window_bits", Some("11")),
+            ],
+        ] {
+            assert!(DeflateConfig::from_params(&params).is_err());
+        }
+    }
+
+    #[test]
+    fn config_from_params_rejects_valueless_server_window_and_unsupported_window() {
+        assert!(DeflateConfig::from_params(&[("server_max_window_bits", None)]).is_err());
+        assert!(DeflateConfig::from_params(&[("server_max_window_bits", Some("8"))]).is_err());
+    }
+
+    #[test]
+    fn config_from_params_rejects_an_unsupported_client_encoder_window() {
+        assert!(DeflateConfig::from_params(&[("client_max_window_bits", Some("8"))]).is_err());
+    }
+
+    #[test]
+    fn deflate_window_values_reject_leading_zeroes() {
+        for parameter in ["server_max_window_bits", "client_max_window_bits"] {
+            assert!(DeflateConfig::from_params(&[(parameter, Some("08"))]).is_err());
+            assert!(
+                negotiate_server_deflate(
+                    &format!("permessage-deflate; {parameter}=08"),
+                    &DeflateConfig::default(),
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn deflate_offers_do_not_trim_non_ascii_whitespace() {
+        assert!(parse_deflate_offer("\u{a0}permessage-deflate").is_none());
+        assert!(
+            negotiate_server_deflate(
+                "permessage-deflate;\u{a0}server_no_context_takeover",
+                &DeflateConfig::default(),
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn test_response_header() {
         let config = DeflateConfig {
             server_no_context_takeover: true,
-            server_max_window_bits: 12,
+            server_max_window_bits: DeflateWindowBits::Bits12,
             ..Default::default()
         };
 
@@ -678,5 +1029,137 @@ mod tests {
         assert!(header.contains("permessage-deflate"));
         assert!(header.contains("server_no_context_takeover"));
         assert!(header.contains("server_max_window_bits=12"));
+    }
+
+    #[test]
+    fn server_negotiation_intersects_window_limits() {
+        let policy = DeflateConfig {
+            server_max_window_bits: DeflateWindowBits::Bits12,
+            client_max_window_bits: DeflateWindowBits::Bits11,
+            ..Default::default()
+        };
+        let negotiated = negotiate_server_deflate(
+            "permessage-deflate; server_max_window_bits=10; client_max_window_bits=12",
+            &policy,
+        )
+        .unwrap();
+
+        assert_eq!(
+            negotiated.config.server_max_window_bits,
+            DeflateWindowBits::Bits10
+        );
+        assert_eq!(
+            negotiated.config.client_max_window_bits,
+            DeflateWindowBits::Bits11
+        );
+        assert_eq!(
+            negotiated.to_response_header(),
+            "permessage-deflate; server_max_window_bits=10; client_max_window_bits=11"
+        );
+    }
+
+    #[test]
+    fn server_negotiation_requires_client_window_parameter_for_a_smaller_policy() {
+        let policy = DeflateConfig {
+            client_max_window_bits: DeflateWindowBits::Bits10,
+            ..Default::default()
+        };
+
+        assert!(negotiate_server_deflate("permessage-deflate", &policy).is_none());
+        let negotiated =
+            negotiate_server_deflate("permessage-deflate; client_max_window_bits", &policy)
+                .unwrap();
+        assert_eq!(
+            negotiated.config.client_max_window_bits,
+            DeflateWindowBits::Bits10
+        );
+    }
+
+    #[test]
+    fn server_negotiation_rejects_invalid_offers_and_selects_the_first_compatible_one() {
+        let offers = concat!(
+            "permessage-deflate; server_max_window_bits=8, ",
+            "permessage-deflate; server_max_window_bits=12; server_max_window_bits=11, ",
+            "other-extension, ",
+            "permessage-deflate; server_max_window_bits=10"
+        );
+        let negotiated = negotiate_server_deflate(offers, &DeflateConfig::default()).unwrap();
+
+        assert_eq!(
+            negotiated.config.server_max_window_bits,
+            DeflateWindowBits::Bits10
+        );
+    }
+
+    #[test]
+    fn server_negotiation_applies_context_takeover_constraints() {
+        let negotiated = negotiate_server_deflate(
+            "permessage-deflate; server_no_context_takeover; client_no_context_takeover",
+            &DeflateConfig::default(),
+        )
+        .unwrap();
+
+        assert!(negotiated.config.server_no_context_takeover);
+        assert!(negotiated.config.client_no_context_takeover);
+    }
+
+    #[test]
+    fn server_negotiation_does_not_emit_unoffered_client_window_parameter() {
+        let negotiated =
+            negotiate_server_deflate("permessage-deflate", &DeflateConfig::default()).unwrap();
+
+        assert_eq!(negotiated.config.client_max_window_bits, MAX_WINDOW_BITS);
+        assert!(
+            !negotiated
+                .to_response_header()
+                .contains("client_max_window_bits")
+        );
+    }
+
+    #[test]
+    fn server_negotiation_preserves_an_offered_server_window_of_fifteen() {
+        let negotiated = negotiate_server_deflate(
+            "permessage-deflate; server_max_window_bits=15",
+            &DeflateConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            negotiated.config.server_max_window_bits,
+            DeflateWindowBits::Bits15
+        );
+        assert_eq!(
+            negotiated.to_response_header(),
+            "permessage-deflate; server_max_window_bits=15"
+        );
+    }
+
+    #[test]
+    fn server_negotiation_uses_a_supported_decoder_for_a_client_window_of_eight() {
+        let negotiated = negotiate_server_deflate(
+            "permessage-deflate; client_max_window_bits=8",
+            &DeflateConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            negotiated.config.client_max_window_bits,
+            DeflateWindowBits::Bits9
+        );
+        assert_eq!(
+            negotiated.to_response_header(),
+            "permessage-deflate; client_max_window_bits=8"
+        );
+    }
+
+    #[test]
+    fn server_negotiation_rejects_an_unsupported_server_window_of_eight() {
+        assert!(
+            negotiate_server_deflate(
+                "permessage-deflate; server_max_window_bits=8",
+                &DeflateConfig::default(),
+            )
+            .is_none()
+        );
     }
 }
