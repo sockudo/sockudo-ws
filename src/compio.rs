@@ -562,7 +562,7 @@ where
 }
 
 #[cfg(any(feature = "http2", feature = "http3"))]
-fn copy_into_compio_buf<B>(dst: &mut B, src: &mut BytesMut) -> usize
+fn copy_into_compio_buf<B>(dst: &mut B, src: &mut Bytes) -> usize
 where
     B: IoBufMut,
 {
@@ -579,7 +579,12 @@ where
         std::ptr::copy_nonoverlapping(src.as_ptr(), dst.buf_mut_ptr().cast::<u8>(), len);
         dst.set_len(len);
     }
-    Buf::advance(src, len);
+    if len == src.len() {
+        // An exhausted Bytes cursor can otherwise keep the entire owner alive.
+        *src = Bytes::new();
+    } else {
+        Buf::advance(src, len);
+    }
     len
 }
 
@@ -672,7 +677,7 @@ fn compio_h3_cancelled_write_error() -> io::Error {
 pub struct CompioHttp2Stream {
     send: h2::SendStream<Bytes>,
     recv: h2::RecvStream,
-    recv_buf: BytesMut,
+    recv_buf: Bytes,
     recv_eof: bool,
     capacity_needed: usize,
 }
@@ -684,7 +689,7 @@ impl CompioHttp2Stream {
         Self {
             send,
             recv,
-            recv_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
+            recv_buf: Bytes::new(),
             recv_eof: false,
             capacity_needed: 0,
         }
@@ -732,17 +737,11 @@ impl AsyncRead for CompioHttp2Stream {
             return BufResult(Err(poll_read_cancelled()), buf);
         };
         match result {
-            Some(Ok(mut data)) => {
+            Some(Ok(data)) => {
                 let len = data.len();
                 let _ = self.recv.flow_control().release_capacity(len);
 
-                self.recv_buf.reserve(data.len());
-                while data.has_remaining() {
-                    let chunk = data.chunk();
-                    self.recv_buf.extend_from_slice(chunk);
-                    let len = chunk.len();
-                    data.advance(len);
-                }
+                self.recv_buf = data;
 
                 let len = copy_into_compio_buf(&mut buf, &mut self.recv_buf);
                 BufResult(Ok(len), buf)
@@ -1008,7 +1007,7 @@ where
 #[cfg(feature = "http3")]
 pub struct CompioHttp3ClientStream {
     stream: CompioH3ClientRequestStream,
-    recv_buf: BytesMut,
+    recv_buf: Bytes,
     write_cancelled: bool,
     _endpoint: Option<::compio::quic::Endpoint>,
     _send_request: Option<CompioH3SendRequest>,
@@ -1024,7 +1023,7 @@ impl CompioHttp3ClientStream {
     ) -> Self {
         Self {
             stream,
-            recv_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
+            recv_buf: Bytes::new(),
             write_cancelled: false,
             _endpoint: endpoint,
             _send_request: send_request,
@@ -1038,18 +1037,16 @@ impl AsyncRead for CompioHttp3ClientStream {
         if self.write_cancelled {
             return BufResult(Err(compio_h3_cancelled_write_error()), buf);
         }
+        if buf.buf_capacity() == 0 {
+            return BufResult(Ok(0), buf);
+        }
         if self.recv_buf.is_empty() {
             let Some(result) = poll_read_until_cancelled(self.stream.recv_data()).await else {
                 return BufResult(Err(poll_read_cancelled()), buf);
             };
             match result {
                 Ok(Some(mut data)) => {
-                    while data.has_remaining() {
-                        let chunk = data.chunk();
-                        self.recv_buf.extend_from_slice(chunk);
-                        let len = chunk.len();
-                        data.advance(len);
-                    }
+                    self.recv_buf = data.copy_to_bytes(data.remaining());
                 }
                 Ok(None) => return BufResult(Ok(0), buf),
                 Err(e) => return BufResult(Err(io::Error::other(e)), buf),
@@ -1104,7 +1101,7 @@ impl AsyncWrite for CompioHttp3ClientStream {
 #[cfg(feature = "http3")]
 pub struct CompioHttp3ServerStream {
     stream: CompioH3ServerRequestStream,
-    recv_buf: BytesMut,
+    recv_buf: Bytes,
     write_cancelled: bool,
 }
 
@@ -1114,7 +1111,7 @@ impl CompioHttp3ServerStream {
     pub fn new(stream: CompioH3ServerRequestStream) -> Self {
         Self {
             stream,
-            recv_buf: BytesMut::with_capacity(crate::RECV_BUFFER_SIZE),
+            recv_buf: Bytes::new(),
             write_cancelled: false,
         }
     }
@@ -1126,18 +1123,16 @@ impl AsyncRead for CompioHttp3ServerStream {
         if self.write_cancelled {
             return BufResult(Err(compio_h3_cancelled_write_error()), buf);
         }
+        if buf.buf_capacity() == 0 {
+            return BufResult(Ok(0), buf);
+        }
         if self.recv_buf.is_empty() {
             let Some(result) = poll_read_until_cancelled(self.stream.recv_data()).await else {
                 return BufResult(Err(poll_read_cancelled()), buf);
             };
             match result {
                 Ok(Some(mut data)) => {
-                    while data.has_remaining() {
-                        let chunk = data.chunk();
-                        self.recv_buf.extend_from_slice(chunk);
-                        let len = chunk.len();
-                        data.advance(len);
-                    }
+                    self.recv_buf = data.copy_to_bytes(data.remaining());
                 }
                 Ok(None) => return BufResult(Ok(0), buf),
                 Err(e) => return BufResult(Err(io::Error::other(e)), buf),
@@ -4239,5 +4234,40 @@ mod tests {
         ));
         client.close(1000, "").await.unwrap();
         server.await.unwrap();
+    }
+}
+
+#[cfg(all(test, any(feature = "http2", feature = "http3")))]
+mod receive_owner_tests {
+    use super::copy_into_compio_buf;
+    use bytes::Bytes;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[test]
+    fn final_copy_releases_source_owner() {
+        struct Owner(Arc<AtomicBool>);
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                b"owned bytes"
+            }
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut src = Bytes::from_owner(Owner(dropped.clone()));
+        let mut dst = Vec::with_capacity(5);
+        assert_eq!(copy_into_compio_buf(&mut dst, &mut src), 5);
+        assert_eq!(dst, b"owned");
+        assert!(!dropped.load(Ordering::SeqCst));
+        let mut dst = Vec::with_capacity(6);
+        assert_eq!(copy_into_compio_buf(&mut dst, &mut src), 6);
+        assert_eq!(dst, b" bytes");
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }
