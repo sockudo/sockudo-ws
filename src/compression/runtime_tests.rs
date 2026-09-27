@@ -2,6 +2,27 @@ use super::*;
 use crate::DeflateWindowBits;
 
 #[test]
+fn busy_first_slot_does_not_hide_an_idle_encoder() {
+    let pool = Arc::new(SharedEncoderPool::new(
+        &DeflateConfig::default(),
+        DeflateWindowBits::Bits15,
+    ));
+    let held = pool.encoders[0].lock();
+    let (sent, completed) = std::sync::mpsc::channel();
+    let worker_pool = Arc::clone(&pool);
+    let worker = std::thread::spawn(move || {
+        let encoded = worker_pool.compress(&b"available encoder ".repeat(64));
+        sent.send(encoded).unwrap();
+    });
+
+    let result = completed.recv_timeout(std::time::Duration::from_secs(5));
+    // Release before asserting so a regression cannot leave the worker blocked.
+    drop(held);
+    worker.join().unwrap();
+    assert!(result.unwrap().unwrap().is_some());
+}
+
+#[test]
 fn role_handles_keep_the_negotiated_pool_shared() {
     let config = DeflateConfig {
         server_max_window_bits: DeflateWindowBits::Bits15,

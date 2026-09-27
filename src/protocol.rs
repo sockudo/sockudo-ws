@@ -1246,7 +1246,7 @@ impl CompressedProtocol {
             fragment_compressed: self.fragment_compressed,
         };
 
-        // Create fresh writer protocol (encoder state)
+        // Transfer the encoder so split preserves dedicated history or the shared pool.
         let writer = CompressedWriterProtocol { role, encoder };
 
         (reader, writer)

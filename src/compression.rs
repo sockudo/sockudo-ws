@@ -169,7 +169,7 @@ impl CompressionEncoder {
 struct SharedEncoderPool {
     /// Pool of encoders
     encoders: Vec<Mutex<DeflateEncoder>>,
-    /// Current encoder index (simple round-robin)
+    /// First encoder to try (simple round-robin)
     next_encoder: std::sync::atomic::AtomicUsize,
 }
 
@@ -194,11 +194,19 @@ impl SharedEncoderPool {
     }
 
     fn compress(&self, data: &[u8]) -> Result<Option<Bytes>> {
-        // Round-robin selection
+        // Rotate the first slot so concurrent callers do not all prefer slot zero.
         let index = self
             .next_encoder
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             % SHARED_POOL_SIZE;
+        // A long compression in one slot must not hide an idle encoder.
+        // Scan once, then block rather than spinning when the pool is full.
+        for offset in 0..SHARED_POOL_SIZE {
+            if let Some(mut encoder) = self.encoders[(index + offset) % SHARED_POOL_SIZE].try_lock()
+            {
+                return encoder.compress(data);
+            }
+        }
         self.encoders[index].lock().compress(data)
     }
 }
@@ -214,7 +222,8 @@ struct SharedCompressorPoolInner {
 ///
 /// Contexts share four synchronous encoder instances per distinct role window,
 /// reducing encoder memory at the cost of possible contention. Compression runs
-/// on the caller thread and waits synchronously when the selected slot is busy.
+/// on the caller thread, tries each slot once, and waits synchronously on the
+/// initial slot if none is available.
 pub struct SharedCompressorPool {
     inner: Arc<SharedCompressorPoolInner>,
     is_server: bool,
@@ -276,7 +285,8 @@ impl SharedCompressorPool {
 ///
 /// This is initialized lazily and provides a singleton pool for
 /// all connections using `Compression::Shared`. Compression runs on the caller
-/// thread and waits synchronously when the selected encoder slot is busy.
+/// thread, tries each encoder slot once, and waits synchronously on the initial
+/// slot if none is available.
 static GLOBAL_POOL: std::sync::OnceLock<Arc<SharedCompressorPool>> = std::sync::OnceLock::new();
 
 /// Get the global shared compressor pool
