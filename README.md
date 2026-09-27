@@ -496,6 +496,8 @@ async fn ws_handler(req: Request) -> Response<Body> {
 
 HTTP/2 WebSocket uses the Extended CONNECT protocol for multiplexed WebSocket streams over a single TCP connection.
 
+`Config::builder().http2_max_frame_size(64 * 1024).build()` advertises a larger receive frame limit on both Tokio and Compio endpoints. The default is 16 KiB; the valid range is 16,384–16,777,215 bytes. This controls what the peer may send, separately from WebSocket frame/message limits. Larger frames may reduce framing overhead but increase receive memory and delay small messages on other streams; choose a value using your connection's latency and memory measurements.
+
 ```rust
 use sockudo_ws::{WebSocketServer, Http2, Config, Message};
 use futures_util::{SinkExt, StreamExt};

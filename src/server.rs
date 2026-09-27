@@ -398,6 +398,7 @@ impl WebSocketServer<Http2> {
         let mut h2_builder = server::Builder::new();
 
         h2_builder
+            .max_frame_size(config.http2.validated_max_frame_size()?)
             .initial_window_size(config.http2.initial_stream_window_size)
             .initial_connection_window_size(config.http2.initial_connection_window_size)
             .max_concurrent_streams(config.http2.max_concurrent_streams);
@@ -448,6 +449,7 @@ impl WebSocketServer<Http2> {
         let mut h2_builder = server::Builder::new();
 
         h2_builder
+            .max_frame_size(config.http2.validated_max_frame_size()?)
             .initial_window_size(config.http2.initial_stream_window_size)
             .initial_connection_window_size(config.http2.initial_connection_window_size)
             .max_concurrent_streams(config.http2.max_concurrent_streams);

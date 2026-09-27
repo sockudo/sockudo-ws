@@ -887,6 +887,7 @@ where
     let stream = Box::pin(::compio::io::compat::AsyncStream::new(stream)).compat();
     let mut builder = h2::client::Builder::new();
     builder
+        .max_frame_size(config.http2.validated_max_frame_size()?)
         .initial_window_size(config.http2.initial_stream_window_size)
         .initial_connection_window_size(config.http2.initial_connection_window_size);
 
@@ -922,6 +923,7 @@ where
     let stream = Box::pin(::compio::io::compat::AsyncStream::new(stream)).compat();
     let mut builder = h2::server::Builder::new();
     builder
+        .max_frame_size(config.http2.validated_max_frame_size()?)
         .initial_window_size(config.http2.initial_stream_window_size)
         .initial_connection_window_size(config.http2.initial_connection_window_size)
         .max_concurrent_streams(config.http2.max_concurrent_streams);
