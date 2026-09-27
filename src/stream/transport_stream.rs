@@ -30,7 +30,9 @@ use std::task::{Context, Poll};
 #[cfg(feature = "http2")]
 use bytes::Buf;
 #[cfg(any(feature = "http2", feature = "http3"))]
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
+#[cfg(feature = "http3")]
+use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::transport::{Http1, Transport};
@@ -190,7 +192,7 @@ impl fmt::Debug for Stream<Http1> {
 struct Http2StreamInner {
     send: h2::SendStream<Bytes>,
     recv: h2::RecvStream,
-    recv_buf: BytesMut,
+    recv_buf: Bytes,
     recv_eof: bool,
     capacity_needed: usize,
 }
@@ -214,7 +216,7 @@ impl Stream<Http2> {
             inner: StreamInner::Http2(Http2StreamInner {
                 send,
                 recv,
-                recv_buf: BytesMut::with_capacity(64 * 1024),
+                recv_buf: Bytes::new(),
                 recv_eof: false,
                 capacity_needed: 0,
             }),
@@ -258,7 +260,13 @@ impl AsyncRead for Stream<Http2> {
         // First, try to satisfy from the internal buffer
         if !inner.recv_buf.is_empty() {
             let to_copy = std::cmp::min(buf.remaining(), inner.recv_buf.len());
-            buf.put_slice(&inner.recv_buf.split_to(to_copy));
+            buf.put_slice(&inner.recv_buf[..to_copy]);
+            if to_copy == inner.recv_buf.len() {
+                // An empty Bytes cursor can still retain its entire allocation.
+                inner.recv_buf = Bytes::new();
+            } else {
+                inner.recv_buf.advance(to_copy);
+            }
             return Poll::Ready(Ok(()));
         }
 
@@ -279,11 +287,12 @@ impl AsyncRead for Stream<Http2> {
 
                     // Copy what we can to the output buffer
                     let to_copy = std::cmp::min(buf.remaining(), data.len());
-                    buf.put_slice(&data.split_to(to_copy));
-
-                    // Buffer any remainder
-                    if data.has_remaining() {
-                        inner.recv_buf.extend_from_slice(data.chunk());
+                    buf.put_slice(&data[..to_copy]);
+                    // Retain the owned h2 DATA remainder for the next read.
+                    // Fully consumed chunks are dropped immediately, including at EOF.
+                    if to_copy < data.len() {
+                        data.advance(to_copy);
+                        inner.recv_buf = data;
                     }
 
                     Poll::Ready(Ok(()))
@@ -642,4 +651,21 @@ mod tests {
         #[cfg(feature = "http3")]
         assert_send::<Stream<Http3>>();
     }
+}
+
+#[cfg(all(test, feature = "http2", feature = "tokio-runtime"))]
+use crate::http2::stream::receive_owner;
+
+#[cfg(all(test, feature = "http2", feature = "tokio-runtime"))]
+#[tokio::test]
+async fn consumed_h2_chunk_releases_its_owner() {
+    receive_owner::check_consumed_chunk_is_released(|send, recv, bytes| {
+        let mut stream = Stream::<Http2>::from_h2(send, recv);
+        let StreamInner::Http2(inner) = &mut stream.inner else {
+            unreachable!()
+        };
+        inner.recv_buf = bytes;
+        stream
+    })
+    .await;
 }
