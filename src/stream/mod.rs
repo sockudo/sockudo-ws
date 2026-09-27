@@ -30,6 +30,7 @@
 //! ```
 
 mod clock;
+mod split_transport;
 mod transport_stream;
 mod websocket;
 

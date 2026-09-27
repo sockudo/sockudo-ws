@@ -6,6 +6,29 @@ use std::time::Duration;
 use super::{HeartbeatTimer, Instant};
 
 #[tokio::test(start_paused = true)]
+async fn close_timeout_waits_for_its_logical_deadline() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let (clock, mock) = quanta::Clock::mock();
+    let deadline = quanta::with_clock(&clock, || Instant::now() + Duration::from_secs(1));
+    let future = super::timeout_at(deadline, std::future::pending::<()>());
+    tokio::pin!(future);
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(quanta::with_clock(&clock, || future.as_mut().poll(&mut cx)).is_pending());
+
+    tokio::time::advance(Duration::from_millis(1001)).await;
+    assert!(quanta::with_clock(&clock, || future.as_mut().poll(&mut cx)).is_pending());
+    mock.increment(Duration::from_secs(1));
+    tokio::time::advance(Duration::from_millis(1001)).await;
+
+    assert_eq!(
+        quanta::with_clock(&clock, || future.as_mut().poll(&mut cx)),
+        Poll::Ready(Err(()))
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn early_runtime_wakeup_rearms_and_registers_again() {
     let (clock, mock) = quanta::Clock::mock();
     // An unrelated epoch exposes accidental conversion of absolute timestamps.

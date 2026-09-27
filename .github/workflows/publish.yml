@@ -6,6 +6,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Keep cached CI artifacts portable across hosted runner CPUs.
+  RUSTFLAGS: ""
 
 jobs:
   autobahn:
@@ -22,22 +24,20 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
 
       - name: Verify build
-        run: cargo build --release --all-features
+        run: cargo build --locked --release --all-features
 
       - name: Run tests
-        run: cargo test --all-features
+        run: cargo nextest run --locked --all-features --profile ci
+
+      - name: Run doctests
+        run: cargo test --locked --doc --all-features
 
       - name: Publish to crates.io
         run: cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}

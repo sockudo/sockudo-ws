@@ -41,23 +41,35 @@ impl HeartbeatTimer {
         if deadline < self.deadline {
             self.reset(deadline);
         }
-        if self.sleep.as_mut().poll(cx).is_pending() {
-            return Poll::Pending;
-        }
-        if deadline <= Instant::now() {
-            return Poll::Ready(());
-        }
+        loop {
+            if self.sleep.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            if deadline <= Instant::now() {
+                return Poll::Ready(());
+            }
 
-        // Activity or clock-rate differences can leave time remaining after a
-        // wakeup. Rebase from now, then poll to register the waker again; reusing
-        // a historical cross-clock epoch could repeatedly arm a past deadline.
-        self.reset(deadline);
-        self.sleep.as_mut().poll(cx)
+            // Activity or clock-rate differences can leave time remaining after a
+            // wakeup. Rebase from now, then poll to register the waker again; reusing
+            // a historical cross-clock epoch could repeatedly arm a past deadline.
+            // Preemption during conversion can make even the new wakeup early.
+            self.reset(deadline);
+        }
     }
 
     fn reset(&mut self, deadline: Instant) {
         self.deadline = deadline;
         self.sleep.as_mut().reset(runtime_deadline(deadline));
+    }
+}
+
+/// Bound a close operation by its logical deadline, including early runtime wakeups.
+pub(super) async fn timeout_at<F: Future>(deadline: Instant, future: F) -> Result<F::Output, ()> {
+    let mut timer = HeartbeatTimer::new(deadline);
+    tokio::select! {
+        biased;
+        result = future => Ok(result),
+        () = std::future::poll_fn(|cx| timer.poll(deadline, cx)) => Err(()),
     }
 }
 
