@@ -246,6 +246,10 @@ impl AsyncRead for Stream<Http2> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
         let inner = match &mut self.inner {
             StreamInner::Http2(inner) => inner,
             _ => unreachable!(),
@@ -263,30 +267,34 @@ impl AsyncRead for Stream<Http2> {
             return Poll::Ready(Ok(()));
         }
 
-        // Poll the h2 RecvStream for more data
-        match Pin::new(&mut inner.recv).poll_data(cx) {
-            Poll::Ready(Some(Ok(mut data))) => {
-                // Release flow control capacity back to sender
-                let len = data.len();
-                let _ = inner.recv.flow_control().release_capacity(len);
+        loop {
+            // Poll the h2 RecvStream for more data
+            return match Pin::new(&mut inner.recv).poll_data(cx) {
+                // Empty DATA without END_STREAM must not appear as AsyncRead EOF.
+                Poll::Ready(Some(Ok(data))) if data.is_empty() => continue,
+                Poll::Ready(Some(Ok(mut data))) => {
+                    // Release flow control capacity back to sender
+                    let len = data.len();
+                    let _ = inner.recv.flow_control().release_capacity(len);
 
-                // Copy what we can to the output buffer
-                let to_copy = std::cmp::min(buf.remaining(), data.len());
-                buf.put_slice(&data.split_to(to_copy));
+                    // Copy what we can to the output buffer
+                    let to_copy = std::cmp::min(buf.remaining(), data.len());
+                    buf.put_slice(&data.split_to(to_copy));
 
-                // Buffer any remainder
-                if data.has_remaining() {
-                    inner.recv_buf.extend_from_slice(data.chunk());
+                    // Buffer any remainder
+                    if data.has_remaining() {
+                        inner.recv_buf.extend_from_slice(data.chunk());
+                    }
+
+                    Poll::Ready(Ok(()))
                 }
-
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(e))),
-            Poll::Ready(None) => {
-                inner.recv_eof = true;
-                Poll::Ready(Ok(()))
-            }
-            Poll::Pending => Poll::Pending,
+                Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(e))),
+                Poll::Ready(None) => {
+                    inner.recv_eof = true;
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Pending => Poll::Pending,
+            };
         }
     }
 }
