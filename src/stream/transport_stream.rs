@@ -27,8 +27,12 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+#[cfg(feature = "http2")]
+use bytes::Buf;
 #[cfg(any(feature = "http2", feature = "http3"))]
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::Bytes;
+#[cfg(feature = "http3")]
+use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::transport::{Http1, Transport};
@@ -125,6 +129,26 @@ impl AsyncRead for Stream<Http1> {
 }
 
 impl AsyncWrite for Stream<Http1> {
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match &mut self.inner {
+            StreamInner::Http1(stream) => Pin::new(stream.as_mut()).poll_write_vectored(cx, bufs),
+            #[cfg(any(feature = "http2", feature = "http3"))]
+            _ => unreachable!(),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match &self.inner {
+            StreamInner::Http1(stream) => stream.is_write_vectored(),
+            #[cfg(any(feature = "http2", feature = "http3"))]
+            _ => unreachable!(),
+        }
+    }
+
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -168,7 +192,7 @@ impl fmt::Debug for Stream<Http1> {
 struct Http2StreamInner {
     send: h2::SendStream<Bytes>,
     recv: h2::RecvStream,
-    recv_buf: BytesMut,
+    recv_buf: Bytes,
     recv_eof: bool,
     capacity_needed: usize,
 }
@@ -192,7 +216,7 @@ impl Stream<Http2> {
             inner: StreamInner::Http2(Http2StreamInner {
                 send,
                 recv,
-                recv_buf: BytesMut::with_capacity(64 * 1024),
+                recv_buf: Bytes::new(),
                 recv_eof: false,
                 capacity_needed: 0,
             }),
@@ -224,6 +248,10 @@ impl AsyncRead for Stream<Http2> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
         let inner = match &mut self.inner {
             StreamInner::Http2(inner) => inner,
             _ => unreachable!(),
@@ -232,7 +260,13 @@ impl AsyncRead for Stream<Http2> {
         // First, try to satisfy from the internal buffer
         if !inner.recv_buf.is_empty() {
             let to_copy = std::cmp::min(buf.remaining(), inner.recv_buf.len());
-            buf.put_slice(&inner.recv_buf.split_to(to_copy));
+            buf.put_slice(&inner.recv_buf[..to_copy]);
+            if to_copy == inner.recv_buf.len() {
+                // An empty Bytes cursor can still retain its entire allocation.
+                inner.recv_buf = Bytes::new();
+            } else {
+                inner.recv_buf.advance(to_copy);
+            }
             return Poll::Ready(Ok(()));
         }
 
@@ -241,30 +275,35 @@ impl AsyncRead for Stream<Http2> {
             return Poll::Ready(Ok(()));
         }
 
-        // Poll the h2 RecvStream for more data
-        match Pin::new(&mut inner.recv).poll_data(cx) {
-            Poll::Ready(Some(Ok(mut data))) => {
-                // Release flow control capacity back to sender
-                let len = data.len();
-                let _ = inner.recv.flow_control().release_capacity(len);
+        loop {
+            // Poll the h2 RecvStream for more data
+            return match Pin::new(&mut inner.recv).poll_data(cx) {
+                // Empty DATA without END_STREAM must not appear as AsyncRead EOF.
+                Poll::Ready(Some(Ok(data))) if data.is_empty() => continue,
+                Poll::Ready(Some(Ok(mut data))) => {
+                    // Release flow control capacity back to sender
+                    let len = data.len();
+                    let _ = inner.recv.flow_control().release_capacity(len);
 
-                // Copy what we can to the output buffer
-                let to_copy = std::cmp::min(buf.remaining(), data.len());
-                buf.put_slice(&data.split_to(to_copy));
+                    // Copy what we can to the output buffer
+                    let to_copy = std::cmp::min(buf.remaining(), data.len());
+                    buf.put_slice(&data[..to_copy]);
+                    // Retain the owned h2 DATA remainder for the next read.
+                    // Fully consumed chunks are dropped immediately, including at EOF.
+                    if to_copy < data.len() {
+                        data.advance(to_copy);
+                        inner.recv_buf = data;
+                    }
 
-                // Buffer any remainder
-                if data.has_remaining() {
-                    inner.recv_buf.extend_from_slice(data.chunk());
+                    Poll::Ready(Ok(()))
                 }
-
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(e))),
-            Poll::Ready(None) => {
-                inner.recv_eof = true;
-                Poll::Ready(Ok(()))
-            }
-            Poll::Pending => Poll::Pending,
+                Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(e))),
+                Poll::Ready(None) => {
+                    inner.recv_eof = true;
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Pending => Poll::Pending,
+            };
         }
     }
 }
@@ -465,8 +504,7 @@ impl AsyncRead for Stream<Http3> {
                 // First drain buffered data
                 if !recv_buf.is_empty() {
                     let to_copy = std::cmp::min(buf.remaining(), recv_buf.len());
-                    buf.put_slice(&recv_buf[..to_copy]);
-                    recv_buf.advance(to_copy);
+                    buf.put_slice(&recv_buf.split_to(to_copy));
                     return Poll::Ready(Ok(()));
                 }
 
@@ -613,4 +651,21 @@ mod tests {
         #[cfg(feature = "http3")]
         assert_send::<Stream<Http3>>();
     }
+}
+
+#[cfg(all(test, feature = "http2", feature = "tokio-runtime"))]
+use crate::http2::stream::receive_owner;
+
+#[cfg(all(test, feature = "http2", feature = "tokio-runtime"))]
+#[tokio::test]
+async fn consumed_h2_chunk_releases_its_owner() {
+    receive_owner::check_consumed_chunk_is_released(|send, recv, bytes| {
+        let mut stream = Stream::<Http2>::from_h2(send, recv);
+        let StreamInner::Http2(inner) = &mut stream.inner else {
+            unreachable!()
+        };
+        inner.recv_buf = bytes;
+        stream
+    })
+    .await;
 }

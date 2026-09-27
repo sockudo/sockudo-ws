@@ -284,11 +284,13 @@ pub struct Protocol {
     pub(crate) fragment_buf: BytesMut,
     /// Opcode of current fragmented message
     pub(crate) fragment_opcode: Option<OpCode>,
+    /// Bytes before this offset form complete, validated UTF-8 code points.
+    fragment_validated_len: usize,
     /// Maximum message size
     pub(crate) max_message_size: usize,
     /// Pending close reason (if we received a close frame)
     pending_close: Option<CloseReason>,
-    /// Incremental UTF-8 validator for the text message currently being received
+    /// Validator for the current text frame, including any preceding incomplete code point.
     pub(crate) utf8: Utf8Stream,
     /// Payload bytes of the frame currently being received that were already
     /// fed to `utf8` before the frame completed
@@ -306,11 +308,24 @@ impl Protocol {
             parser: FrameParser::new(max_frame_size, expect_masked),
             fragment_buf: BytesMut::new(),
             fragment_opcode: None,
+            fragment_validated_len: 0,
             max_message_size,
             pending_close: None,
             utf8: Utf8Stream::new(),
             partial_checked: 0,
         }
+    }
+
+    /// Keep receive progress in the reader and only copy control state to the writer.
+    /// The limits only initialize the fresh writer protocol; the reader retains
+    /// its existing limits, unlike the public compressed split operation.
+    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    pub(crate) fn split(self, max_frame_size: usize, max_message_size: usize) -> (Self, Self) {
+        let mut writer = Self::new(self.role, max_frame_size, max_message_size);
+        writer.state = self.state;
+        // A Close may already have been parsed into the stream's pending messages.
+        writer.pending_close = self.pending_close.clone();
+        (self, writer)
     }
 
     /// Validate the already-received prefix of an incomplete text frame.
@@ -336,8 +351,18 @@ impl Protocol {
             return Ok(());
         }
 
-        if self.partial_checked == 0 && pending.opcode == OpCode::Text {
-            self.utf8.reset();
+        if self.partial_checked == 0 {
+            // Raw calls can leave an unvalidated suffix, not just a split code point.
+            if pending.opcode == OpCode::Continuation {
+                if !self
+                    .utf8
+                    .resume(&self.fragment_buf[self.fragment_validated_len..])
+                {
+                    return Err(Error::InvalidUtf8);
+                }
+            } else {
+                self.utf8.reset();
+            }
         }
         let ready = pending.ready.min(buf.len());
         if !self.utf8.push(&buf[self.partial_checked..ready]) {
@@ -373,8 +398,23 @@ impl Protocol {
     /// Process incoming data into a reusable message buffer (zero-allocation hot path)
     ///
     /// This variant allows reusing a Vec<Message> across calls to avoid allocations.
+    /// If a later frame fails, messages accepted earlier in this call remain in wire order.
     #[inline]
     pub fn process_into(&mut self, buf: &mut BytesMut, messages: &mut Vec<Message>) -> Result<()> {
+        self.process_into_with_activity(buf, messages, &mut false)
+    }
+
+    /// Report only newly accepted non-final data frames, not reassembly state.
+    /// Preserve accepted messages and the fragment flag even if a later frame fails.
+    /// Readers terminating on that error may ignore the fragment activity flag.
+    #[inline]
+    pub(crate) fn process_into_with_activity(
+        &mut self,
+        buf: &mut BytesMut,
+        messages: &mut Vec<Message>,
+        accepted_fragment: &mut bool,
+    ) -> Result<()> {
+        *accepted_fragment = false;
         messages.clear();
 
         while !buf.is_empty() {
@@ -383,6 +423,8 @@ impl Protocol {
                     let prevalidated = std::mem::take(&mut self.partial_checked);
                     if let Some(msg) = self.handle_frame(frame, prevalidated)? {
                         messages.push(msg);
+                    } else {
+                        *accepted_fragment = true;
                     }
                 }
                 None => {
@@ -399,7 +441,10 @@ impl Protocol {
     ///
     /// Unlike [`Protocol::process`], this path does not validate text payloads
     /// as UTF-8. It is useful for low-level adapters that only need to proxy or
-    /// echo frames and want to avoid extra payload scans.
+    /// echo frames and want to avoid extra payload scans. If typed processing
+    /// resumes before a fragmented text message ends, it validates the bytes
+    /// accumulated by raw calls as well as the new typed input. A message
+    /// completed through the raw API remains unvalidated.
     #[inline]
     pub fn process_raw(&mut self, buf: &mut BytesMut) -> Result<Vec<RawMessage>> {
         let mut messages = Vec::new();
@@ -469,6 +514,7 @@ impl Protocol {
 
         if frame.header.fin {
             // Complete message in one frame (fast path: one SIMD pass)
+            ensure_message_size(frame.payload.len(), self.max_message_size)?;
             let valid = if prevalidated == 0 {
                 validate_utf8(&frame.payload)
             } else {
@@ -495,6 +541,7 @@ impl Protocol {
 
         if frame.header.fin {
             // Complete message in one frame (fast path)
+            ensure_message_size(frame.payload.len(), self.max_message_size)?;
             Ok(Some(Message::Binary(frame.payload)))
         } else {
             // Start of fragmented message
@@ -510,6 +557,7 @@ impl Protocol {
         }
 
         if frame.header.fin {
+            ensure_message_size(frame.payload.len(), self.max_message_size)?;
             Ok(Some(RawMessage::Text(frame.payload)))
         } else {
             self.start_raw_fragment(OpCode::Text, frame.payload)?;
@@ -524,6 +572,7 @@ impl Protocol {
         }
 
         if frame.header.fin {
+            ensure_message_size(frame.payload.len(), self.max_message_size)?;
             Ok(Some(RawMessage::Binary(frame.payload)))
         } else {
             self.start_raw_fragment(OpCode::Binary, frame.payload)?;
@@ -547,10 +596,17 @@ impl Protocol {
             return Err(Error::MessageTooLarge);
         }
 
-        // Text fragments are validated incrementally: only the bytes that were
-        // not already checked while the frame was incomplete are scanned, so a
-        // message costs one linear pass no matter how many fragments it has.
+        // Text fragments scan only new or previously unvalidated bytes, keeping
+        // validation linear in message size. Re-seed from the unvalidated suffix
+        // after raw processing or a code point split across frames.
         if opcode == OpCode::Text {
+            if prevalidated == 0
+                && !self
+                    .utf8
+                    .resume(&self.fragment_buf[self.fragment_validated_len..])
+            {
+                return Err(Error::InvalidUtf8);
+            }
             let prevalidated = prevalidated.min(frame.payload.len());
             if !self.utf8.push(&frame.payload[prevalidated..]) {
                 return Err(Error::InvalidUtf8);
@@ -563,6 +619,9 @@ impl Protocol {
             // Complete the fragmented message
             self.complete_fragment(opcode)
         } else {
+            if opcode == OpCode::Text {
+                self.fragment_validated_len = self.fragment_buf.len() - self.utf8.pending();
+            }
             Ok(None)
         }
     }
@@ -578,6 +637,7 @@ impl Protocol {
             return Err(Error::MessageTooLarge);
         }
 
+        // Leave the validated prefix unchanged for the next typed call.
         self.fragment_buf.extend_from_slice(&frame.payload);
 
         if frame.header.fin {
@@ -616,6 +676,12 @@ impl Protocol {
         self.fragment_buf.clear();
         self.fragment_buf.extend_from_slice(&payload);
 
+        self.fragment_validated_len = if opcode == OpCode::Text {
+            self.fragment_buf.len() - self.utf8.pending()
+        } else {
+            0
+        };
+
         Ok(())
     }
 
@@ -626,6 +692,7 @@ impl Protocol {
         }
 
         self.fragment_opcode = Some(opcode);
+        self.fragment_validated_len = 0;
         self.fragment_buf.clear();
         self.fragment_buf.extend_from_slice(&payload);
         Ok(())
@@ -858,8 +925,24 @@ impl CompressedProtocol {
     }
 
     /// Process incoming data into a reusable message buffer
+    ///
+    /// If a later frame fails, messages accepted earlier in this call remain in wire order.
     #[inline]
     pub fn process_into(&mut self, buf: &mut BytesMut, messages: &mut Vec<Message>) -> Result<()> {
+        self.process_into_with_activity(buf, messages, &mut false)
+    }
+
+    /// Report only newly accepted non-final data frames, not reassembly state.
+    /// Preserve accepted messages and the fragment flag even if a later frame fails.
+    /// Readers terminating on that error may ignore the fragment activity flag.
+    #[inline]
+    pub(crate) fn process_into_with_activity(
+        &mut self,
+        buf: &mut BytesMut,
+        messages: &mut Vec<Message>,
+        accepted_fragment: &mut bool,
+    ) -> Result<()> {
+        *accepted_fragment = false;
         const DEBUG: bool = false;
         messages.clear();
 
@@ -877,8 +960,11 @@ impl CompressedProtocol {
                         if DEBUG {
                             eprintln!("[PROTOCOL] Added message to output");
                         }
-                    } else if DEBUG {
-                        eprintln!("[PROTOCOL] No message from handle_frame (fragment or control)");
+                    } else {
+                        *accepted_fragment = true;
+                        if DEBUG {
+                            eprintln!("[PROTOCOL] No message from handle_frame (fragment)");
+                        }
                     }
                 }
                 None => {
@@ -932,6 +1018,7 @@ impl CompressedProtocol {
                 self.deflate
                     .decompress(&frame.payload, self.inner.max_message_size)?
             } else {
+                ensure_message_size(frame.payload.len(), self.inner.max_message_size)?;
                 frame.payload
             };
 
@@ -977,6 +1064,7 @@ impl CompressedProtocol {
                 self.deflate
                     .decompress(&frame.payload, self.inner.max_message_size)?
             } else {
+                ensure_message_size(frame.payload.len(), self.inner.max_message_size)?;
                 frame.payload
             };
             Ok(Some(Message::Binary(payload)))
@@ -1092,18 +1180,21 @@ impl CompressedProtocol {
     /// Split the compressed protocol into separate reader and writer halves
     ///
     /// This allows the encoder and decoder to be used independently for
-    /// concurrent read/write operations.
+    /// concurrent read/write operations. The reader retains parser state while
+    /// applying the supplied frame and message size limits. A lower frame limit
+    /// also applies to a partially received frame whose header was already parsed.
     pub fn split(
-        self,
+        mut self,
         max_frame_size: usize,
         max_message_size: usize,
     ) -> (CompressedReaderProtocol, CompressedWriterProtocol) {
         let role = self.inner.role;
+        self.inner.parser.set_max_frame_size(max_frame_size);
 
-        // Create fresh reader protocol (decoder state)
+        // Keep parser and fragment state already consumed by the unified stream.
         let reader = CompressedReaderProtocol {
             role,
-            parser: FrameParser::new(max_frame_size, role == Role::Server),
+            parser: self.inner.parser,
             fragment_buf: self.inner.fragment_buf,
             fragment_opcode: self.inner.fragment_opcode,
             max_message_size,
@@ -1184,7 +1275,23 @@ impl CompressedReaderProtocol {
     }
 
     /// Process incoming data into a reusable message buffer
+    ///
+    /// If a later frame fails, messages accepted earlier in this call remain in wire order.
     pub fn process_into(&mut self, buf: &mut BytesMut, messages: &mut Vec<Message>) -> Result<()> {
+        self.process_into_with_activity(buf, messages, &mut false)
+    }
+
+    /// Report only newly accepted non-final data frames, not reassembly state.
+    /// Preserve accepted messages and the fragment flag even if a later frame fails.
+    /// Readers terminating on that error may ignore the fragment activity flag.
+    #[inline]
+    pub(crate) fn process_into_with_activity(
+        &mut self,
+        buf: &mut BytesMut,
+        messages: &mut Vec<Message>,
+        accepted_fragment: &mut bool,
+    ) -> Result<()> {
+        *accepted_fragment = false;
         messages.clear();
 
         // Enable compression in parser
@@ -1195,6 +1302,8 @@ impl CompressedReaderProtocol {
                 Some(frame) => {
                     if let Some(msg) = self.handle_frame(frame)? {
                         messages.push(msg);
+                    } else {
+                        *accepted_fragment = true;
                     }
                 }
                 None => break,
@@ -1229,6 +1338,7 @@ impl CompressedReaderProtocol {
                 self.decoder
                     .decompress(&frame.payload, self.max_message_size)?
             } else {
+                ensure_message_size(frame.payload.len(), self.max_message_size)?;
                 frame.payload
             };
 
@@ -1254,6 +1364,7 @@ impl CompressedReaderProtocol {
                 self.decoder
                     .decompress(&frame.payload, self.max_message_size)?
             } else {
+                ensure_message_size(frame.payload.len(), self.max_message_size)?;
                 frame.payload
             };
             Ok(Some(Message::Binary(payload)))
@@ -1454,6 +1565,14 @@ impl CompressedWriterProtocol {
         };
         encode_frame(buf, OpCode::Close, &[], true, mask);
     }
+}
+
+#[inline]
+fn ensure_message_size(size: usize, max_message_size: usize) -> Result<()> {
+    if size > max_message_size {
+        return Err(Error::MessageTooLarge);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
