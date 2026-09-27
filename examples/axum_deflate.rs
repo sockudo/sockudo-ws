@@ -42,7 +42,7 @@ async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
     //   - Compression::Disabled - no compression
     //   - Compression::Dedicated - per-connection compressor (best ratio)
     //   - Compression::Shared - shared compressor pool (good for many connections)
-    //   - Compression::Window256B through Window32KB - various window sizes (RFC 7692)
+    //   - Compression::Window1KB through Window32KB - various window sizes (RFC 7692)
     let config = Config::builder()
         .max_payload_length(16 * 1024)
         .idle_timeout(60)

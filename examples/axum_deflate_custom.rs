@@ -4,7 +4,7 @@
 //! - Compression::Disabled - no compression
 //! - Compression::Dedicated - per-connection compressor (best compression ratio)
 //! - Compression::Shared - shared compressor pool (good for many connections)
-//! - Compression::Window256B to Window32KB - various window sizes per RFC 7692
+//! - Compression::Window1KB to Window32KB - various window sizes per RFC 7692
 //!
 //! Run with: cargo run --example axum_deflate_custom --features "axum-integration,permessage-deflate"
 
@@ -16,9 +16,10 @@ use futures_util::StreamExt;
 use sockudo_ws::axum_integration::WebSocketUpgrade;
 use sockudo_ws::{Compression, Config, Message};
 
-// DeflateConfig is available for fine-grained control (see comments in ws_handler)
+// DeflateConfig and DeflateWindowBits are available for fine-grained control
+// (see comments in ws_handler).
 #[allow(unused_imports)]
-use sockudo_ws::DeflateConfig;
+use sockudo_ws::{DeflateConfig, DeflateWindowBits};
 
 #[tokio::main]
 async fn main() {
@@ -33,7 +34,6 @@ Available compression modes:
   - Compression::Disabled    - No compression
   - Compression::Dedicated   - Per-connection compressor (32KB window, best ratio)
   - Compression::Shared      - Shared compressor pool (32KB window)
-  - Compression::Window256B  - 256B window (bits=8, minimal memory)
   - Compression::Window1KB   - 1KB window (bits=10)
   - Compression::Window2KB   - 2KB window (bits=11)
   - Compression::Window4KB   - 4KB window (bits=12)
@@ -84,8 +84,8 @@ async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
     // Uncomment below to use custom deflate settings instead:
     //
     // let deflate_config = DeflateConfig {
-    //     server_max_window_bits: 12,      // 4KB window
-    //     client_max_window_bits: 12,
+    //     server_max_window_bits: DeflateWindowBits::Bits12, // 4KB window
+    //     client_max_window_bits: DeflateWindowBits::Bits12,
     //     server_no_context_takeover: true, // Reset after each message
     //     client_no_context_takeover: true,
     //     compression_level: 6,             // 0-9, higher = better but slower
