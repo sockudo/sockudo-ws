@@ -414,28 +414,6 @@ impl Protocol {
         messages: &mut Vec<Message>,
         accepted_fragment: &mut bool,
     ) -> Result<()> {
-        self.process_frames::<false>(buf, messages, accepted_fragment)
-    }
-
-    /// Accept one message, leaving later frames for the next reader call.
-    /// Non-final fragments still report activity even without a complete message.
-    #[inline]
-    pub(crate) fn process_next_with_activity(
-        &mut self,
-        buf: &mut BytesMut,
-        messages: &mut Vec<Message>,
-        accepted_fragment: &mut bool,
-    ) -> Result<()> {
-        self.process_frames::<true>(buf, messages, accepted_fragment)
-    }
-
-    #[inline]
-    fn process_frames<const ONE_MESSAGE: bool>(
-        &mut self,
-        buf: &mut BytesMut,
-        messages: &mut Vec<Message>,
-        accepted_fragment: &mut bool,
-    ) -> Result<()> {
         *accepted_fragment = false;
         messages.clear();
 
@@ -445,9 +423,6 @@ impl Protocol {
                     let prevalidated = std::mem::take(&mut self.partial_checked);
                     if let Some(msg) = self.handle_frame(frame, prevalidated)? {
                         messages.push(msg);
-                        if ONE_MESSAGE {
-                            break;
-                        }
                     } else {
                         *accepted_fragment = true;
                     }
@@ -460,6 +435,33 @@ impl Protocol {
         }
 
         Ok(())
+    }
+
+    /// Accept one message, leaving later frames for the next reader call.
+    /// Non-final fragments still report activity even without a complete message.
+    #[inline]
+    pub(crate) fn process_next_with_activity(
+        &mut self,
+        buf: &mut BytesMut,
+        accepted_fragment: &mut bool,
+    ) -> Result<Option<Message>> {
+        *accepted_fragment = false;
+        while !buf.is_empty() {
+            match self.parser.parse(buf)? {
+                Some(frame) => {
+                    let prevalidated = std::mem::take(&mut self.partial_checked);
+                    if let Some(msg) = self.handle_frame(frame, prevalidated)? {
+                        return Ok(Some(msg));
+                    }
+                    *accepted_fragment = true;
+                }
+                None => {
+                    self.prevalidate_partial_text(buf)?;
+                    break;
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Process incoming data and return complete raw messages.

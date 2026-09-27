@@ -1558,34 +1558,34 @@ where
                 return result;
             }
 
-            if self.pending_messages.is_empty()
-                && self.pending_parse_error.is_none()
-                && self.has_unprocessed_read_data
-            {
+            let message = if let Some(msg) = self.pending_messages.pop() {
+                Some(msg)
+            } else if self.pending_parse_error.is_none() && self.has_unprocessed_read_data {
                 self.has_unprocessed_read_data = false;
-                debug_assert!(self.pending_messages.is_empty());
                 let mut accepted_fragment = false;
-                match self.protocol.process_next_with_activity(
-                    &mut self.read_buf,
-                    &mut self.pending_messages,
-                    &mut accepted_fragment,
-                ) {
-                    Ok(()) => {
+                match self
+                    .protocol
+                    .process_next_with_activity(&mut self.read_buf, &mut accepted_fragment)
+                {
+                    Ok(message) => {
                         if accepted_fragment {
                             self.shared.note_inbound();
                         }
-                        if !self.pending_messages.is_empty() {
-                            self.has_unprocessed_read_data = !self.read_buf.is_empty();
-                        }
+                        self.has_unprocessed_read_data =
+                            message.is_some() && !self.read_buf.is_empty();
+                        message
                     }
                     Err(error) => {
                         self.pending_parse_error = Some(error);
                         self.shared.begin_read_error();
+                        None
                     }
                 }
-            }
+            } else {
+                None
+            };
 
-            if let Some(msg) = self.pending_messages.pop() {
+            if let Some(msg) = message {
                 let request = match &msg {
                     Message::Ping(data) => {
                         ControlRequest::Ping(data.clone(), tokio::time::Instant::now())
