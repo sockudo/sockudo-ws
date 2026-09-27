@@ -9,12 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `init_clock()` allows applications to initialize the Tokio connection clock before constructing their runtime. The `test-util` feature selects Tokio virtual time for paused-time tests and is excluded from `full`.
 - **Breaking for exhaustive struct literals:** `Http2Config::max_frame_size` and `ConfigBuilder::http2_max_frame_size` configure the advertised HTTP/2 receive frame limit on Tokio and Compio endpoints. The default remains 16 KiB; values outside 16,384–16,777,215 return a handshake error. Larger settings trade framing overhead for receive memory and latency of other streams.
 - Compressed Tokio streams now accept post-handshake frame bytes through `client_with_leftover` and `server_with_leftover`, including when split before the first read; existing constructors continue to start with an empty receive buffer.
 - `WebSocketServer<Http1>::protocols` configures HTTP/1 subprotocol selection in server preference order while preserving the existing first-offered default when no list is configured.
 
 ### Changed
 
+- **Breaking for paused-time tests:** Tokio heartbeat and activity timestamps, including unified Close deadlines, use quanta with runtime wakeups rechecked against the logical deadline. The first clock read can block for calibration; preinitialize with `init_clock()` to move that cost out of latency-sensitive work. Paused Tokio time now requires this crate's `test-util` feature, not just `tokio/test-util`. Compio clocks are unchanged.
 - Unified Tokio plain and compressed streams write contiguous cork buffers directly, avoiding vectored-write setup when there are no separately owned segments. Segmented output retains vectored writes on capable transports and preserves partial-write ordering otherwise.
 - Ordinary Tokio split readers poll transport reads before terminal notifications, avoiding notification waiter registration for immediately ready reads. A terminal cause published during the read is rechecked before handling its data, EOF or I/O error.
 - Ordinary Tokio split readers deliver each newly parsed message without first parsing the rest of a buffered burst. Later malformed frames are discovered by a subsequent `next()` call, so writes remain allowed until that discovery and a terminal heartbeat or idle timeout can take precedence over the unparsed tail. Messages and errors parsed before splitting preserve their order. Unified, compressed and Compio readers retain batch parsing.

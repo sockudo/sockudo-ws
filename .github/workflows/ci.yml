@@ -29,6 +29,9 @@ jobs:
           - name: arm64
             runner: ubuntu-24.04-arm
             args: ""
+          - name: full
+            runner: ubuntu-latest
+            args: --features full
           - name: all-features
             runner: ubuntu-latest
             args: --all-features
@@ -60,7 +63,7 @@ jobs:
         run: cargo test --locked --doc --all-features
 
       - name: Clippy
-        if: matrix.name == 'all-features' || matrix.name == 'default' || matrix.name == 'arm64'
+        if: matrix.name == 'all-features' || matrix.name == 'default' || matrix.name == 'arm64' || matrix.name == 'full'
         run: cargo clippy --locked ${{ matrix.args }} --all-targets -- -D warnings
 
   fmt:

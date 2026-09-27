@@ -6,6 +6,7 @@ use futures_util::{StreamExt, poll};
 use sockudo_ws::{Config, Error, WebSocketStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn fragments_postpone_automatic_ping_without_idle_timeout() {
     let (io, mut peer) = tokio::io::duplex(1024);
@@ -27,6 +28,7 @@ async fn fragments_postpone_automatic_ping_without_idle_timeout() {
     assert_eq!(&ping[..2], &[0x89, 0x88]);
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn incomplete_frame_bytes_do_not_refresh_idle_timeout() {
     let (io, mut peer) = tokio::io::duplex(1024);
@@ -58,6 +60,7 @@ fn fragments(compressed: bool) -> [&'static [u8]; 4] {
 
 macro_rules! fragment_activity_case {
     ($name:ident, $socket:expr, $split:expr, $compressed:expr) => {
+        #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
         #[tokio::test(start_paused = true)]
         async fn $name() {
             let (io, mut peer) = tokio::io::duplex(1024);
@@ -122,6 +125,7 @@ fragment_activity_case!(
 
 macro_rules! partial_continuation_case {
     ($name:ident, $socket:expr, $split:expr, $compressed:expr) => {
+        #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
         #[tokio::test(start_paused = true)]
         async fn $name() {
             let (io, mut peer) = tokio::io::duplex(1024);
@@ -188,6 +192,7 @@ partial_continuation_case!(
 
 macro_rules! pong_deadline_case {
     ($name:ident, $socket:expr, $split:expr, $compressed:expr) => {
+        #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
         #[tokio::test(start_paused = true)]
         async fn $name() {
             let (io, mut peer) = tokio::io::duplex(1024);
@@ -255,6 +260,7 @@ pong_deadline_case!(
 );
 
 #[cfg(feature = "permessage-deflate")]
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn compressed_split_leftover_fragment_refreshes_activity_when_accepted() {
     let (io, mut peer) = tokio::io::duplex(1024);
@@ -277,6 +283,7 @@ async fn compressed_split_leftover_fragment_refreshes_activity_when_accepted() {
     assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), b"abc");
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn split_leftover_fragment_refreshes_activity_when_accepted() {
     let (io, mut peer) = tokio::io::duplex(1024);

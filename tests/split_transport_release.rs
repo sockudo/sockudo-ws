@@ -103,6 +103,7 @@ fn decode_client_frame(bytes: &[u8]) -> (u8, Vec<u8>) {
     (bytes[0] & 0x0f, payload)
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn idle_timeout_releases_transport_before_reporting_terminal_error() {
     let (io, _peer, gate) = connection(3);
@@ -133,6 +134,7 @@ async fn idle_timeout_releases_transport_before_reporting_terminal_error() {
     ));
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn idle_timeout_closes_an_idle_sink_before_waking_a_queued_sender() {
     let (io, _peer, gate) = connection(usize::MAX);
@@ -166,6 +168,7 @@ async fn idle_timeout_closes_an_idle_sink_before_waking_a_queued_sender() {
     assert_eq!(&payload[2..], b"Connection idle timeout");
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn peer_eof_during_timeout_shutdown_does_not_replace_the_timeout_cause() {
     let (io, peer, gate) = connection(usize::MAX);
@@ -212,6 +215,7 @@ async fn local_close_deadline_releases_transport_with_live_handles() {
 }
 
 #[cfg(feature = "permessage-deflate")]
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn compressed_idle_timeout_releases_transport_with_live_handles() {
     let (io, _peer, gate) = connection(3);

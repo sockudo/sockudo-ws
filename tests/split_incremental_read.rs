@@ -29,6 +29,7 @@ async fn cancelled_next_retains_fragments_and_interleaved_controls() {
     assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), b"d");
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn idle_timeout_precedes_an_unparsed_invalid_tail() {
     let (io, _peer) = tokio::io::duplex(128);

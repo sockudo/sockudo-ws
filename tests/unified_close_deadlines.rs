@@ -98,6 +98,7 @@ macro_rules! close_cases {
         mod $module {
             use super::*;
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn post_expiry_read_is_not_renewed_after_pre_expiry_input() {
                 let (io, mut peer) = connection(false, false);
@@ -116,6 +117,7 @@ macro_rules! close_cases {
                 assert!(ws.next().await.is_none());
             }
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn pong_write_timeout_terminates_without_draining_data() {
                 let (mut io, mut peer) = connection(false, false);
@@ -130,6 +132,7 @@ macro_rules! close_cases {
                 assert!(ws.next().await.is_none());
             }
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn accepted_close_before_parse_error_suppresses_all_pongs() {
                 let (io, mut peer) = connection(false, false);
@@ -145,6 +148,7 @@ macro_rules! close_cases {
                 assert!(ws.next().await.is_none());
             }
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn expired_nonzero_budget_reads_ready_close_once() {
                 let (io, mut peer) = connection(true, false);
@@ -156,6 +160,7 @@ macro_rules! close_cases {
                 assert!(ws.next().await.is_none());
             }
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn zero_budget_pending_read_terminates_on_first_poll() {
                 let (io, _peer) = connection(false, false);
@@ -170,6 +175,7 @@ macro_rules! close_cases {
                 assert!(ws.next().await.is_none());
             }
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn zero_budget_queued_close_cannot_stall_before_read() {
                 let (mut io, _peer) = connection(false, false);
@@ -188,6 +194,7 @@ macro_rules! close_cases {
                 assert_eq!(writes.get(), 2);
             }
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn accepted_batch_survives_close_deadline() {
                 let (io, mut peer) = connection(true, false);
@@ -203,6 +210,7 @@ macro_rules! close_cases {
                 assert!(ws.next().await.is_none());
             }
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn zero_budget_local_close_reads_one_ready_batch() {
                 let (io, mut peer) = connection(true, false);
@@ -216,6 +224,7 @@ macro_rules! close_cases {
                 assert!(ws.next().await.is_none());
             }
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn zero_budget_read_attempt_is_not_renewed() {
                 let (io, mut peer) = connection(false, false);
@@ -233,6 +242,7 @@ macro_rules! close_cases {
                 assert!(ws.next().await.is_none());
             }
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn accepted_close_does_not_wait_for_preceding_pong() {
                 let (mut io, mut peer) = connection(true, false);
@@ -251,6 +261,7 @@ macro_rules! close_cases {
                 assert!(ws.next().await.is_none());
             }
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn shutdown_failure_preserves_peer_close_once() {
                 let (io, mut peer) = connection(false, false);
@@ -261,6 +272,7 @@ macro_rules! close_cases {
                 assert!(ws.next().await.is_none());
             }
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn pending_shutdown_cannot_hold_peer_close_forever() {
                 let (io, mut peer) = connection(true, false);
@@ -275,6 +287,7 @@ macro_rules! close_cases {
                 assert!(ws.next().await.is_none());
             }
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn local_close_bounds_silent_peer_wait() {
                 let (io, _peer) = connection(true, false);
@@ -289,6 +302,7 @@ macro_rules! close_cases {
                 assert!(ws.next().await.is_none());
             }
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn direct_close_and_crossing_pings_share_one_budget() {
                 let (io, mut peer) = connection(false, false);
@@ -307,6 +321,7 @@ macro_rules! close_cases {
                 assert!(ws.next().await.is_none());
             }
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn cleanup_flush_error_preserves_idle_timeout_once() {
                 let (io, _peer) = connection(false, true);
@@ -322,6 +337,7 @@ macro_rules! close_cases {
                 assert!(ws.next().await.is_none());
             }
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn zero_budget_reports_a_received_close_despite_pending_shutdown() {
                 let (io, mut peer) = connection(true, false);
@@ -347,6 +363,7 @@ macro_rules! close_cases {
                 assert_eq!(shutdowns.get(), 1);
             }
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn peer_close_shutdown_uses_the_remaining_local_budget() {
                 let (io, mut peer) = connection(true, false);
@@ -360,6 +377,7 @@ macro_rules! close_cases {
                 assert!(ws.next().await.is_none());
             }
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn closing_budget_replaces_an_already_armed_heartbeat() {
                 let (io, _peer) = connection(false, false);
@@ -383,6 +401,7 @@ macro_rules! close_cases {
                 assert!(ws.next().await.is_none());
             }
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn pending_shutdown_preserves_pong_timeout() {
                 let (io, _peer) = connection(true, false);
@@ -404,6 +423,7 @@ macro_rules! close_cases {
                 assert!(ws.next().await.is_none());
             }
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn ordinary_pong_flush_error_is_reported_once() {
                 let (io, mut peer) = connection(false, true);
@@ -413,6 +433,7 @@ macro_rules! close_cases {
                 assert!(ws.next().await.is_none());
             }
 
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn expired_close_write_is_not_restarted() {
                 let (mut io, _peer) = connection(false, false);

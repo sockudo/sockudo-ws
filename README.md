@@ -927,7 +927,17 @@ Transport features are runtime-neutral. Pair `http2` or `http3` with either `tok
 | Feature | Description |
 |---------|-------------|
 | `axum-integration` | Axum web framework support |
-| `full` | All features enabled |
+| `full` | Production feature bundle; excludes `test-util` |
+
+### Connection Clock
+
+Tokio streams use quanta for heartbeat, inbound activity and unified Close deadlines by default. Tokio still schedules wakeups; each registration converts the remaining logical duration and an early wakeup rechecks the logical deadline. Compio and split transport shutdown timers keep their existing clocks.
+
+The first clock read performs quanta's one-time calibration, which can block for up to 200 ms. Call `sockudo_ws::init_clock()` before constructing a latency-sensitive Tokio runtime to move this cost out of runtime scheduling. Code inside a `#[tokio::main]` function runs after the runtime is constructed, so use a synchronous outer entry point when the initialization point matters. Measure startup separately from steady-state processing.
+
+Enable this crate's `test-util` feature when using Tokio's `pause`, `advance`, or `start_paused`. It selects Tokio's clock for connection timestamps as well as timers, including when sockudo-ws is an integration-test dependency. Enabling only `tokio/test-util` does not switch sockudo-ws's clock.
+
+`test-util` is not included in `full`. `--all-features` enables it, so use default features or `full` without `test-util` when measuring quanta performance. Cargo unifies features across dependencies; a dev-dependency enabling `test-util` also selects the Tokio clock for benchmarks in that build.
 
 ## SIMD Architecture Support
 

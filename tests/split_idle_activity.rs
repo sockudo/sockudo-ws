@@ -5,6 +5,7 @@ use std::time::Duration;
 use sockudo_ws::{Config, WebSocketStream};
 use tokio::io::AsyncWriteExt;
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn data_received_while_idle_timer_sleeps_postpones_expiry() {
     let (io, mut peer) = tokio::io::duplex(128);

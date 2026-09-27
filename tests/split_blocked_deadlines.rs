@@ -8,6 +8,7 @@ use sockudo_ws::protocol::Protocol;
 use sockudo_ws::{Config, Error, Message, Role, WebSocketStream};
 use tokio::io::AsyncWriteExt;
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn idle_timeout_interrupts_an_application_holding_the_sink() {
     let (io, _peer) = tokio::io::duplex(8);
@@ -28,6 +29,7 @@ async fn idle_timeout_interrupts_an_application_holding_the_sink() {
     ));
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn automatic_ping_waiting_for_sink_does_not_hide_idle_timeout() {
     let (io, _peer) = tokio::io::duplex(8);
@@ -50,6 +52,7 @@ async fn automatic_ping_waiting_for_sink_does_not_hide_idle_timeout() {
     ));
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn peer_ping_waiting_for_sink_does_not_hide_idle_timeout() {
     let (io, mut peer) = tokio::io::duplex(8);
@@ -70,6 +73,7 @@ async fn peer_ping_waiting_for_sink_does_not_hide_idle_timeout() {
     assert!(matches!(terminal, Ok(Some(Err(Error::IdleTimeout)))));
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn partially_written_automatic_ping_observes_idle_timeout() {
     let (io, _peer) = tokio::io::duplex(8);
@@ -83,6 +87,7 @@ async fn partially_written_automatic_ping_observes_idle_timeout() {
     assert!(matches!(terminal, Ok(Some(Err(Error::IdleTimeout)))));
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn inbound_data_postpones_idle_expiry_during_blocked_send() {
     let (io, mut peer) = tokio::io::duplex(8);
@@ -110,6 +115,7 @@ async fn inbound_data_postpones_idle_expiry_during_blocked_send() {
 }
 
 #[cfg(feature = "permessage-deflate")]
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn compressed_writer_observes_idle_timeout_while_holding_sink() {
     use sockudo_ws::{CompressedWebSocketStream, deflate::DeflateConfig};
@@ -134,6 +140,7 @@ async fn compressed_writer_observes_idle_timeout_while_holding_sink() {
     ));
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn blocked_send_reports_the_pong_timeout_cause() {
     use tokio::io::AsyncReadExt;
@@ -211,6 +218,7 @@ impl tokio::io::AsyncWrite for FlushGate {
     }
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn blocked_flush_reports_the_idle_timeout_cause() {
     let (io, _peer) = tokio::io::duplex(128);
@@ -232,6 +240,7 @@ async fn blocked_flush_reports_the_idle_timeout_cause() {
     assert!(matches!(flush.await, Err(Error::IdleTimeout)));
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn timeout_error_waits_for_the_close_write() {
     use tokio::io::AsyncReadExt;
@@ -294,6 +303,7 @@ async fn close_deadline_attempts_shutdown_when_the_sink_is_idle() {
     assert_eq!(shutdowns.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn pong_received_before_ping_flush_completes_is_preserved() {
     use tokio::io::AsyncReadExt;

@@ -86,8 +86,6 @@ pin_project! {
         pending_messages: Vec<Message>,
         // Deliver successfully parsed messages before a later parse failure.
         pending_parse_error: Option<Error>,
-        // Deadline (ms since clock_epoch) the heartbeat timer is currently armed for
-        heartbeat_armed_ms: u64,
         // A control message is only returned after its automatic response is flushed.
         pending_control_message: Option<Message>,
         pending_terminal_error: Option<Error>,
@@ -95,9 +93,9 @@ pin_project! {
         close_after_flush: bool,
         ping_flush_pending: bool,
         ready_flush_pending: bool,
-        clock_epoch: tokio::time::Instant,
+        clock_epoch: super::clock::Instant,
         heartbeat: Heartbeat,
-        heartbeat_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+        heartbeat_sleep: Option<super::clock::HeartbeatTimer>,
         // Backpressure thresholds
         high_water_mark: usize,
         low_water_mark: usize,
@@ -140,7 +138,7 @@ where
             read_buf.extend_from_slice(&leftover);
         }
         let has_unprocessed_read_data = !read_buf.is_empty();
-        let clock_epoch = tokio::time::Instant::now();
+        let clock_epoch = super::clock::Instant::now();
         let heartbeat = Heartbeat::new(&config, 0);
 
         Self {
@@ -159,7 +157,6 @@ where
             config,
             pending_messages: Vec::new(),
             pending_parse_error: None,
-            heartbeat_armed_ms: 0,
             pending_control_message: None,
             pending_terminal_error: None,
             flush_on_read: false,
@@ -317,7 +314,7 @@ where
 
         // Flush the close frame
         let deadline = self.clock_epoch + Duration::from_millis(closing_at);
-        let result = tokio::time::timeout_at(deadline, async {
+        let result = super::clock::timeout_at(deadline, async {
             self.flush_write_buf().await?;
             if self.immediate_write_shutdown {
                 // Finish the send half so multiplexed transports retain queued frames.
@@ -475,26 +472,10 @@ where
     /// untouched on every message and re-armed lazily when it fires. It is reset
     /// eagerly only when the deadline moves earlier (e.g. a Pong deadline starts).
     fn poll_heartbeat_timer(&mut self, cx: &mut Context<'_>, deadline_ms: u64) -> Poll<()> {
-        let target = self.clock_epoch + Duration::from_millis(deadline_ms);
-        match self.heartbeat_sleep.as_mut() {
-            Some(sleep) => {
-                if deadline_ms < self.heartbeat_armed_ms
-                    || (deadline_ms != self.heartbeat_armed_ms && sleep.is_elapsed())
-                {
-                    sleep.as_mut().reset(target);
-                    self.heartbeat_armed_ms = deadline_ms;
-                }
-            }
-            None => {
-                self.heartbeat_sleep = Some(Box::pin(tokio::time::sleep_until(target)));
-                self.heartbeat_armed_ms = deadline_ms;
-            }
-        }
+        let deadline = self.clock_epoch + Duration::from_millis(deadline_ms);
         self.heartbeat_sleep
-            .as_mut()
-            .expect("heartbeat timer armed above")
-            .as_mut()
-            .poll(cx)
+            .get_or_insert_with(|| super::clock::HeartbeatTimer::new(deadline))
+            .poll(deadline, cx)
     }
 
     // Keep the transport write/flush machinery out of the readiness fast path.
@@ -1118,8 +1099,8 @@ impl TerminalCause {
 
 #[derive(Debug)]
 enum ControlRequest {
-    Ping(Bytes, tokio::time::Instant),
-    Pong(Bytes, tokio::time::Instant),
+    Ping(Bytes, super::clock::Instant),
+    Pong(Bytes, super::clock::Instant),
     PeerClose,
     /// Start one closing budget before the application writes its Close frame.
     LocalCloseStarted(tokio::time::Instant),
@@ -1135,7 +1116,7 @@ struct SplitShared {
     terminal_tx: watch::Sender<()>,
     cancel: CancellationToken,
     /// Clock epoch shared by the reader and the writer driver
-    epoch: tokio::time::Instant,
+    epoch: super::clock::Instant,
     /// Milliseconds since `epoch` of the last inbound data frame (reader -> driver)
     last_inbound_ms: AtomicU64,
     /// Snapshot of the unified heartbeat's activity tracking state at split time.
@@ -1149,7 +1130,7 @@ impl SplitShared {
             status: AtomicU8::new(if closed { SPLIT_CLOSED } else { SPLIT_OPEN }),
             terminal_tx,
             cancel: CancellationToken::new(),
-            epoch: tokio::time::Instant::now(),
+            epoch: super::clock::Instant::now(),
             last_inbound_ms: AtomicU64::new(0),
             tracks_inbound_activity,
         })
@@ -1611,10 +1592,10 @@ where
             if let Some(msg) = message {
                 let request = match &msg {
                     Message::Ping(data) => {
-                        ControlRequest::Ping(data.clone(), tokio::time::Instant::now())
+                        ControlRequest::Ping(data.clone(), super::clock::Instant::now())
                     }
                     Message::Pong(data) => {
-                        ControlRequest::Pong(data.clone(), tokio::time::Instant::now())
+                        ControlRequest::Pong(data.clone(), super::clock::Instant::now())
                     }
                     Message::Close(_) => {
                         self.shared.begin_peer_closing();
@@ -1836,8 +1817,7 @@ async fn split_writer_driver<S, E>(
 
     // One timer for the whole connection: re-armed lazily when it fires or when
     // the deadline moves earlier, never per message.
-    let mut heartbeat_sleep = Box::pin(tokio::time::sleep_until(epoch + Duration::from_secs(3600)));
-    let mut heartbeat_armed_ms: Option<u64> = None;
+    let mut heartbeat_sleep = super::clock::HeartbeatTimer::new(epoch + Duration::from_secs(3600));
     let mut last_synced_inbound_ms = 0u64;
 
     loop {
@@ -1898,19 +1878,6 @@ async fn split_writer_driver<S, E>(
         } else {
             heartbeat.next_deadline()
         };
-        if let Some(deadline) = heartbeat_deadline {
-            let at = deadline.at();
-            let rearm = match heartbeat_armed_ms {
-                None => true,
-                Some(armed) => at < armed || (at != armed && heartbeat_sleep.is_elapsed()),
-            };
-            if rearm {
-                heartbeat_sleep
-                    .as_mut()
-                    .reset(epoch + Duration::from_millis(at));
-                heartbeat_armed_ms = Some(at);
-            }
-        }
         let close_delay = closing_deadline
             .map(|deadline: tokio::time::Instant| {
                 deadline.saturating_duration_since(tokio::time::Instant::now())
@@ -2012,7 +1979,10 @@ async fn split_writer_driver<S, E>(
                 shared.cancel.cancel();
                 break;
             }
-            _ = &mut heartbeat_sleep, if heartbeat_deadline.is_some() && shared.is_open() => {
+            _ = std::future::poll_fn(|cx| match heartbeat_deadline {
+                Some(deadline) => heartbeat_sleep.poll(epoch + Duration::from_millis(deadline.at()), cx),
+                None => Poll::Pending,
+            }), if heartbeat_deadline.is_some() && shared.is_open() => {
                 // Activity may have arrived while the driver waited on this timer.
                 // Refresh it before deciding whether the old deadline expired.
                 let observed_inbound = shared.last_inbound_ms.load(Ordering::Relaxed);
@@ -2193,17 +2163,15 @@ pin_project! {
         pending_messages: Vec<Message>,
         // Deliver successfully parsed messages before a later parse failure.
         pending_parse_error: Option<Error>,
-        // Deadline (ms since clock_epoch) the heartbeat timer is currently armed for
-        heartbeat_armed_ms: u64,
         pending_control_message: Option<Message>,
         pending_terminal_error: Option<Error>,
         flush_on_read: bool,
         close_after_flush: bool,
         ping_flush_pending: bool,
         ready_flush_pending: bool,
-        clock_epoch: tokio::time::Instant,
+        clock_epoch: super::clock::Instant,
         heartbeat: Heartbeat,
-        heartbeat_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+        heartbeat_sleep: Option<super::clock::HeartbeatTimer>,
         high_water_mark: usize,
         low_water_mark: usize,
     }
@@ -2237,7 +2205,7 @@ where
             read_buf.extend_from_slice(&leftover);
         }
         let has_unprocessed_read_data = !read_buf.is_empty();
-        let clock_epoch = tokio::time::Instant::now();
+        let clock_epoch = super::clock::Instant::now();
         let heartbeat = Heartbeat::new(&config, 0);
         Self {
             inner,
@@ -2255,7 +2223,6 @@ where
             config,
             pending_messages: Vec::new(),
             pending_parse_error: None,
-            heartbeat_armed_ms: 0,
             pending_control_message: None,
             pending_terminal_error: None,
             flush_on_read: false,
@@ -2293,7 +2260,7 @@ where
             read_buf.extend_from_slice(&leftover);
         }
         let has_unprocessed_read_data = !read_buf.is_empty();
-        let clock_epoch = tokio::time::Instant::now();
+        let clock_epoch = super::clock::Instant::now();
         let heartbeat = Heartbeat::new(&config, 0);
         Self {
             inner,
@@ -2311,7 +2278,6 @@ where
             config,
             pending_messages: Vec::new(),
             pending_parse_error: None,
-            heartbeat_armed_ms: 0,
             pending_control_message: None,
             pending_terminal_error: None,
             flush_on_read: false,
@@ -2376,7 +2342,7 @@ where
         let closing_at = self.begin_closing();
 
         let deadline = self.clock_epoch + Duration::from_millis(closing_at);
-        let result = tokio::time::timeout_at(deadline, async {
+        let result = super::clock::timeout_at(deadline, async {
             self.flush_write_buf().await?;
             if self.immediate_write_shutdown {
                 // Finish the send half so multiplexed transports retain queued frames.
@@ -2528,26 +2494,10 @@ where
 
     /// See [`WebSocketStream::poll_heartbeat_timer`].
     fn poll_heartbeat_timer(&mut self, cx: &mut Context<'_>, deadline_ms: u64) -> Poll<()> {
-        let target = self.clock_epoch + Duration::from_millis(deadline_ms);
-        match self.heartbeat_sleep.as_mut() {
-            Some(sleep) => {
-                if deadline_ms < self.heartbeat_armed_ms
-                    || (deadline_ms != self.heartbeat_armed_ms && sleep.is_elapsed())
-                {
-                    sleep.as_mut().reset(target);
-                    self.heartbeat_armed_ms = deadline_ms;
-                }
-            }
-            None => {
-                self.heartbeat_sleep = Some(Box::pin(tokio::time::sleep_until(target)));
-                self.heartbeat_armed_ms = deadline_ms;
-            }
-        }
+        let deadline = self.clock_epoch + Duration::from_millis(deadline_ms);
         self.heartbeat_sleep
-            .as_mut()
-            .expect("heartbeat timer armed above")
-            .as_mut()
-            .poll(cx)
+            .get_or_insert_with(|| super::clock::HeartbeatTimer::new(deadline))
+            .poll(deadline, cx)
     }
 
     // Keep the transport write/flush machinery out of the readiness fast path.
@@ -3181,10 +3131,10 @@ where
             if let Some(msg) = self.pending_messages.pop() {
                 let request = match &msg {
                     Message::Ping(data) => {
-                        ControlRequest::Ping(data.clone(), tokio::time::Instant::now())
+                        ControlRequest::Ping(data.clone(), super::clock::Instant::now())
                     }
                     Message::Pong(data) => {
-                        ControlRequest::Pong(data.clone(), tokio::time::Instant::now())
+                        ControlRequest::Pong(data.clone(), super::clock::Instant::now())
                     }
                     Message::Close(_) => {
                         self.shared.begin_peer_closing();
@@ -3481,6 +3431,7 @@ mod tests {
         assert!(ws.is_closed());
     }
 
+    #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
     #[tokio::test(start_paused = true)]
     async fn auto_ping_uses_configured_interval_on_read_path() {
         let (client_io, mut server_io) = tokio::io::duplex(1024);
@@ -3498,6 +3449,7 @@ mod tests {
         read_task.abort();
     }
 
+    #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
     #[tokio::test(start_paused = true)]
     async fn split_driver_pings_without_application_writes_and_correlates_pong() {
         let (client_io, mut server_io) = tokio::io::duplex(1024);
@@ -3527,6 +3479,7 @@ mod tests {
         assert_ne!(first_ping, second_ping);
     }
 
+    #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
     #[tokio::test(start_paused = true)]
     async fn split_driver_times_out_with_configured_close_and_typed_cause() {
         let (client_io, mut server_io) = tokio::io::duplex(1024);
@@ -3597,6 +3550,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
     #[tokio::test(start_paused = true)]
     async fn split_hard_idle_timeout_is_typed_and_closes_once() {
         let (client_io, mut server_io) = tokio::io::duplex(1024);
@@ -3758,6 +3712,7 @@ mod tests {
     }
 
     #[cfg(feature = "permessage-deflate")]
+    #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
     #[tokio::test(start_paused = true)]
     async fn compressed_split_driver_sends_uncompressed_native_ping() {
         let (client_io, mut server_io) = tokio::io::duplex(1024);

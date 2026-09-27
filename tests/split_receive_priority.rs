@@ -3,6 +3,7 @@
 use sockudo_ws::{Config, Error, WebSocketStream};
 use tokio::io::AsyncWriteExt;
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn elapsed_idle_timeout_precedes_ready_transport_data() {
     let (io, mut peer) = tokio::io::duplex(128);

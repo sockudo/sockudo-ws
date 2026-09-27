@@ -66,6 +66,7 @@ async fn compressed_close_waits_for_peer_close_and_answers_crossing_ping() {
     .unwrap();
 }
 
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
 async fn close_stops_local_heartbeat_while_waiting_for_peer_close() {
     let (io, mut peer) = tokio::io::duplex(128);
