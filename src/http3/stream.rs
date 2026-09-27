@@ -380,7 +380,7 @@ type H3ServerRecvStream = h3::server::RequestStream<h3_quinn::RecvStream, Bytes>
 pub struct Http3ServerStream {
     writer: H3Writer<H3ServerSendStream>,
     recv: H3ServerRecvStream,
-    read_buf: BytesMut,
+    read_buf: Bytes,
 }
 
 impl Http3ServerStream {
@@ -390,7 +390,7 @@ impl Http3ServerStream {
         Self {
             writer: H3Writer::new(send),
             recv,
-            read_buf: BytesMut::with_capacity(64 * 1024),
+            read_buf: Bytes::new(),
         }
     }
 
@@ -406,11 +406,20 @@ impl AsyncRead for Http3ServerStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
 
         // First drain any buffered data
         if !this.read_buf.is_empty() {
             let to_copy = std::cmp::min(buf.remaining(), this.read_buf.len());
-            buf.put_slice(&this.read_buf.split_to(to_copy));
+            buf.put_slice(&this.read_buf[..to_copy]);
+            if to_copy == this.read_buf.len() {
+                // An empty Bytes cursor can still retain its entire allocation.
+                this.read_buf = Bytes::new();
+            } else {
+                this.read_buf.advance(to_copy);
+            }
             return Poll::Ready(Ok(()));
         }
 
@@ -425,13 +434,10 @@ impl AsyncRead for Http3ServerStream {
                 let chunk = data.copy_to_bytes(to_copy);
                 buf.put_slice(&chunk);
 
-                // Buffer any remaining data
+                // Retain any remaining data. h3-quinn supplies owned Bytes, so
+                // copy_to_bytes shares the chunk rather than copying its payload.
                 if data.has_remaining() {
-                    while data.has_remaining() {
-                        this.read_buf.extend_from_slice(data.chunk());
-                        let len = data.chunk().len();
-                        data.advance(len);
-                    }
+                    this.read_buf = data.copy_to_bytes(data.remaining());
                 }
                 Poll::Ready(Ok(()))
             }
@@ -482,7 +488,7 @@ type H3ClientRecvStream = h3::client::RequestStream<h3_quinn::RecvStream, Bytes>
 pub struct Http3ClientStream {
     writer: H3Writer<H3ClientSendStream>,
     recv: H3ClientRecvStream,
-    read_buf: BytesMut,
+    read_buf: Bytes,
 }
 
 impl Http3ClientStream {
@@ -492,7 +498,7 @@ impl Http3ClientStream {
         Self {
             writer: H3Writer::new(send),
             recv,
-            read_buf: BytesMut::with_capacity(64 * 1024),
+            read_buf: Bytes::new(),
         }
     }
 
@@ -508,11 +514,20 @@ impl AsyncRead for Http3ClientStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
 
         // First drain any buffered data
         if !this.read_buf.is_empty() {
             let to_copy = std::cmp::min(buf.remaining(), this.read_buf.len());
-            buf.put_slice(&this.read_buf.split_to(to_copy));
+            buf.put_slice(&this.read_buf[..to_copy]);
+            if to_copy == this.read_buf.len() {
+                // An empty Bytes cursor can still retain its entire allocation.
+                this.read_buf = Bytes::new();
+            } else {
+                this.read_buf.advance(to_copy);
+            }
             return Poll::Ready(Ok(()));
         }
 
@@ -527,13 +542,10 @@ impl AsyncRead for Http3ClientStream {
                 let chunk = data.copy_to_bytes(to_copy);
                 buf.put_slice(&chunk);
 
-                // Buffer any remaining data
+                // Retain any remaining data. h3-quinn supplies owned Bytes, so
+                // copy_to_bytes shares the chunk rather than copying its payload.
                 if data.has_remaining() {
-                    while data.has_remaining() {
-                        this.read_buf.extend_from_slice(data.chunk());
-                        let len = data.chunk().len();
-                        data.advance(len);
-                    }
+                    this.read_buf = data.copy_to_bytes(data.remaining());
                 }
                 Poll::Ready(Ok(()))
             }
@@ -681,3 +693,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "stream/read_tests.rs"]
+mod read_tests;
