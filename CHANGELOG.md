@@ -48,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Tokio and Compio HTTP/2 adapters skip empty DATA frames without reporting premature EOF; zero-capacity read buffers complete immediately without consuming DATA. END_STREAM still terminates reads after queued bytes, and pending Compio reads remain cancellable.
 - Accepted non-final data frames, including empty continuations and compressed fragments, refresh inbound activity for Tokio and Compio streams and split readers. Partial frame bytes and repeated polls do not extend inactivity deadlines, and fragment activity does not postpone an outstanding Pong or Close deadline.
 - HTTP/1 `Stream` forwards vectored writes and reports the underlying transport's vectored-write capability; Axum `UpgradedStream` now reports that capability as well. Partial writes, pending operations and transport errors retain their underlying semantics.
 - HTTP/1 handshake nonces now use the selected RNG backend (`getrandom`, then `rand_rng`, then `fastrand`) instead of a timestamp-seeded byte loop. The default fastrand nonce generator forks the thread RNG once, then keeps separate state from frame masking; no-RNG builds also keep separate fallback states. Native fastrand seeds from a clock and thread ID, not OS entropy. These non-cryptographic backends do not provide a cryptographic isolation guarantee; use `getrandom` or `rand_rng` when cryptographically secure output is required.
