@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Breaking for exhaustive struct literals:** `Http2Config::max_frame_size` and `ConfigBuilder::http2_max_frame_size` configure the advertised HTTP/2 receive frame limit on Tokio and Compio endpoints. The default remains 16 KiB; values outside 16,384–16,777,215 return a handshake error. Larger settings trade framing overhead for receive memory and latency of other streams.
 - Compressed Tokio streams now accept post-handshake frame bytes through `client_with_leftover` and `server_with_leftover`, including when split before the first read; existing constructors continue to start with an empty receive buffer.
 - `WebSocketServer<Http1>::protocols` configures HTTP/1 subprotocol selection in server preference order while preserving the existing first-offered default when no list is configured.
 
