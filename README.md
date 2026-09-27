@@ -496,8 +496,6 @@ async fn ws_handler(req: Request) -> Response<Body> {
 
 HTTP/2 WebSocket uses the Extended CONNECT protocol for multiplexed WebSocket streams over a single TCP connection.
 
-Built-in Tokio HTTP/2 WebSocket entry points receive owned h2 DATA chunks directly. Complete unmasked frames avoid copying through `ReadBuf`; frames spanning chunks and masked frames use writable storage. The mode survives `split()`. When constructing `WebSocketStream` or `CompressedWebSocketStream` directly over `Http2Stream` or `Stream<Http2>`, call `.with_http2_receive_chunks()` to enable it. Retaining an application message may retain the larger h2 connection allocation behind its payload; copying a small long-lived payload can release that owner earlier.
-
 ```rust
 use sockudo_ws::{WebSocketServer, Http2, Config, Message};
 use futures_util::{SinkExt, StreamExt};

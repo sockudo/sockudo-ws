@@ -8,7 +8,6 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use super::receive_buffer::{ChunkReader, ReceiveBuffer};
 use bytes::{Bytes, BytesMut};
 use futures_core::Stream;
 use futures_sink::Sink;
@@ -69,8 +68,7 @@ pin_project! {
         #[pin]
         inner: S,
         protocol: Protocol,
-        read_buf: ReceiveBuffer,
-        chunk_reader: ChunkReader<S>,
+        read_buf: BytesMut,
         // Reclaim once after buffered input reaches half a receive window.
         reclaim_read_window: bool,
         // Leftover handshake bytes must be processed once before the first read.
@@ -124,21 +122,6 @@ impl<S> WebSocketStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    /// Receive owned HTTP/2 DATA chunks directly instead of copying through ReadBuf.
-    /// Complete unmasked frames share the DATA allocation; frames spanning chunks
-    /// and masked frames use contiguous writable storage. Holding a message can
-    /// retain the connection buffer behind its DATA chunk. Split readers inherit
-    /// this mode, and pending reads remain cancellation-safe.
-    #[cfg(feature = "http2")]
-    pub fn with_http2_receive_chunks(mut self) -> Self
-    where
-        S: crate::http2::stream::Http2Receive,
-    {
-        self.chunk_reader.read = Some(S::poll_recv_chunk);
-        self.read_buf.release_empty_window();
-        self
-    }
-
     /// Create a new WebSocket stream from an already-upgraded connection
     pub fn from_raw(inner: S, role: Role, config: Config) -> Self {
         Self::from_raw_with_leftover(inner, role, config, None)
@@ -152,7 +135,7 @@ where
         leftover: Option<Bytes>,
     ) -> Self {
         let protocol = Protocol::new(role, config.max_frame_size, config.max_message_size);
-        let mut read_buf = ReceiveBuffer::with_capacity(crate::RECV_BUFFER_SIZE);
+        let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);
         if let Some(leftover) = leftover {
             read_buf.extend_from_slice(&leftover);
         }
@@ -164,7 +147,6 @@ where
             inner,
             protocol,
             read_buf,
-            chunk_reader: ChunkReader::default(),
             reclaim_read_window: false,
             has_unprocessed_read_data,
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
@@ -377,11 +359,6 @@ where
     /// Read more data from the underlying stream
     fn poll_read_more(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         let this = self.project();
-        #[cfg(feature = "http2")]
-        if let Some(read_chunk) = this.chunk_reader.read {
-            let chunk = std::task::ready!(read_chunk(this.inner, cx))?;
-            return Poll::Ready(Ok(this.read_buf.receive_chunk(chunk)));
-        }
 
         // Ensure we have space in the buffer
         // Reuse an empty receive window when no delivered payload still owns it.
@@ -396,14 +373,14 @@ where
 
         // Get a slice of uninitialized memory
         let buf_len = this.read_buf.len();
-        let mut read_buf = ReadBuf::uninit(this.read_buf.writable().spare_capacity_mut());
+        let mut read_buf = ReadBuf::uninit(this.read_buf.spare_capacity_mut());
 
         match this.inner.poll_read(cx, &mut read_buf) {
             Poll::Ready(Ok(())) => {
                 let n = read_buf.filled().len();
                 // SAFETY: ReadBuf guarantees that its filled bytes are initialized.
                 unsafe {
-                    this.read_buf.writable().set_len(buf_len + n);
+                    this.read_buf.set_len(buf_len + n);
                 }
                 // Keep the hint across partial frames until the receive window is empty.
                 if this.read_buf.len() >= crate::RECV_BUFFER_SIZE / 2 {
@@ -1463,8 +1440,7 @@ impl SplitEncoder for Protocol {
 pub struct SplitReader<S> {
     reader: SplitTransport<S>,
     protocol: Protocol,
-    read_buf: ReceiveBuffer,
-    chunk_reader: ChunkReader<S>,
+    read_buf: BytesMut,
     // Reclaim once after buffered input reaches half a receive window.
     reclaim_read_window: bool,
     has_unprocessed_read_data: bool,
@@ -1535,7 +1511,6 @@ where
                 reader,
                 protocol: reader_protocol,
                 read_buf: self.read_buf,
-                chunk_reader: self.chunk_reader,
                 reclaim_read_window: self.reclaim_read_window,
                 has_unprocessed_read_data: self.has_unprocessed_read_data,
                 pending_messages: self.pending_messages,
@@ -1638,21 +1613,16 @@ where
                 }
             }
 
-            #[cfg(feature = "http2")]
-            let owns_chunks = self.chunk_reader.read.is_some();
-            #[cfg(not(feature = "http2"))]
-            let owns_chunks = false;
-            if !owns_chunks {
-                // Reuse an empty receive window when no delivered payload still owns it.
-                if self.reclaim_read_window && self.read_buf.is_empty() {
-                    self.reclaim_read_window = false;
-                    let _ = self.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE);
-                }
-
-                if self.read_buf.capacity() - self.read_buf.len() < 4096 {
-                    self.read_buf.reserve(crate::RECV_BUFFER_SIZE);
-                }
+            // Reuse an empty receive window when no delivered payload still owns it.
+            if self.reclaim_read_window && self.read_buf.is_empty() {
+                self.reclaim_read_window = false;
+                let _ = self.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE);
             }
+
+            if self.read_buf.capacity() - self.read_buf.len() < 4096 {
+                self.read_buf.reserve(crate::RECV_BUFFER_SIZE);
+            }
+
             let mut accepted_fragment = false;
             tokio::select! {
                 biased;
@@ -1661,14 +1631,7 @@ where
                         self.shared.terminate(TerminalCause::ConnectionClosed);
                     }
                 }
-                result = async {
-                    #[cfg(feature = "http2")]
-                    if let Some(read_chunk) = self.chunk_reader.read {
-                        let chunk = std::future::poll_fn(|cx| self.reader.poll_recv_chunk(cx, read_chunk)).await?;
-                        return Ok(self.read_buf.receive_chunk(chunk));
-                    }
-                    self.reader.read_buf(self.read_buf.writable()).await
-                } => {
+                result = self.reader.read_buf(&mut self.read_buf) => {
                     match result {
                         Ok(0) => {
                             let _ = self.control_tx.send(ControlRequest::Eof).await;
@@ -2195,8 +2158,7 @@ pin_project! {
         #[pin]
         inner: S,
         protocol: crate::protocol::CompressedProtocol,
-        read_buf: ReceiveBuffer,
-        chunk_reader: ChunkReader<S>,
+        read_buf: BytesMut,
         // Reclaim once after buffered input reaches half a receive window.
         reclaim_read_window: bool,
         // Leftover handshake bytes must be processed once before the first read.
@@ -2234,21 +2196,6 @@ impl<S> CompressedWebSocketStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    /// Receive owned HTTP/2 DATA chunks directly instead of copying through ReadBuf.
-    /// Complete unmasked frames share the DATA allocation; frames spanning chunks
-    /// and masked frames use contiguous writable storage. Holding a message can
-    /// retain the connection buffer behind its DATA chunk. Split readers inherit
-    /// this mode, and pending reads remain cancellation-safe.
-    #[cfg(feature = "http2")]
-    pub fn with_http2_receive_chunks(mut self) -> Self
-    where
-        S: crate::http2::stream::Http2Receive,
-    {
-        self.chunk_reader.read = Some(S::poll_recv_chunk);
-        self.read_buf.release_empty_window();
-        self
-    }
-
     /// Create a new compressed WebSocket stream for server role
     pub fn server(inner: S, config: Config, deflate_config: crate::deflate::DeflateConfig) -> Self {
         Self::server_with_leftover(inner, config, deflate_config, None)
@@ -2267,7 +2214,7 @@ where
             deflate_config,
         );
 
-        let mut read_buf = ReceiveBuffer::with_capacity(crate::RECV_BUFFER_SIZE);
+        let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);
         if let Some(leftover) = leftover {
             read_buf.extend_from_slice(&leftover);
         }
@@ -2278,7 +2225,6 @@ where
             inner,
             protocol,
             read_buf,
-            chunk_reader: ChunkReader::default(),
             reclaim_read_window: false,
             has_unprocessed_read_data,
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
@@ -2324,7 +2270,7 @@ where
             deflate_config,
         );
 
-        let mut read_buf = ReceiveBuffer::with_capacity(crate::RECV_BUFFER_SIZE);
+        let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);
         if let Some(leftover) = leftover {
             read_buf.extend_from_slice(&leftover);
         }
@@ -2335,7 +2281,6 @@ where
             inner,
             protocol,
             read_buf,
-            chunk_reader: ChunkReader::default(),
             reclaim_read_window: false,
             has_unprocessed_read_data,
             write_buf: CorkBuffer::with_capacity(config.write_buffer_size),
@@ -2455,11 +2400,6 @@ where
     /// Read more data from the underlying stream
     fn poll_read_more(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         let this = self.project();
-        #[cfg(feature = "http2")]
-        if let Some(read_chunk) = this.chunk_reader.read {
-            let chunk = std::task::ready!(read_chunk(this.inner, cx))?;
-            return Poll::Ready(Ok(this.read_buf.receive_chunk(chunk)));
-        }
 
         // Reuse an empty receive window when no delivered payload still owns it.
         if *this.reclaim_read_window && this.read_buf.is_empty() {
@@ -2472,14 +2412,14 @@ where
         }
 
         let buf_len = this.read_buf.len();
-        let mut read_buf = ReadBuf::uninit(this.read_buf.writable().spare_capacity_mut());
+        let mut read_buf = ReadBuf::uninit(this.read_buf.spare_capacity_mut());
 
         match this.inner.poll_read(cx, &mut read_buf) {
             Poll::Ready(Ok(())) => {
                 let n = read_buf.filled().len();
                 // SAFETY: ReadBuf guarantees that its filled bytes are initialized.
                 unsafe {
-                    this.read_buf.writable().set_len(buf_len + n);
+                    this.read_buf.set_len(buf_len + n);
                 }
                 // Keep the hint across partial frames until the receive window is empty.
                 if this.read_buf.len() >= crate::RECV_BUFFER_SIZE / 2 {
@@ -3061,8 +3001,7 @@ pub struct CompressedSplitReader<S> {
     /// Protocol for decoding with decompression
     protocol: crate::protocol::CompressedReaderProtocol,
     /// Read buffer
-    read_buf: ReceiveBuffer,
-    chunk_reader: ChunkReader<S>,
+    read_buf: BytesMut,
     // Reclaim once after buffered input reaches half a receive window.
     reclaim_read_window: bool,
     has_unprocessed_read_data: bool,
@@ -3179,7 +3118,6 @@ where
                 reader,
                 protocol: reader_protocol,
                 read_buf: self.read_buf,
-                chunk_reader: self.chunk_reader,
                 reclaim_read_window: self.reclaim_read_window,
                 has_unprocessed_read_data: self.has_unprocessed_read_data,
                 pending_messages: self.pending_messages,
@@ -3283,21 +3221,16 @@ where
                 }
             }
 
-            #[cfg(feature = "http2")]
-            let owns_chunks = self.chunk_reader.read.is_some();
-            #[cfg(not(feature = "http2"))]
-            let owns_chunks = false;
-            if !owns_chunks {
-                // Reuse an empty receive window when no delivered payload still owns it.
-                if self.reclaim_read_window && self.read_buf.is_empty() {
-                    self.reclaim_read_window = false;
-                    let _ = self.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE);
-                }
-
-                if self.read_buf.capacity() - self.read_buf.len() < 4096 {
-                    self.read_buf.reserve(crate::RECV_BUFFER_SIZE);
-                }
+            // Reuse an empty receive window when no delivered payload still owns it.
+            if self.reclaim_read_window && self.read_buf.is_empty() {
+                self.reclaim_read_window = false;
+                let _ = self.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE);
             }
+
+            if self.read_buf.capacity() - self.read_buf.len() < 4096 {
+                self.read_buf.reserve(crate::RECV_BUFFER_SIZE);
+            }
+
             let mut accepted_fragment = false;
             tokio::select! {
                 biased;
@@ -3306,14 +3239,7 @@ where
                         self.shared.terminate(TerminalCause::ConnectionClosed);
                     }
                 }
-                result = async {
-                    #[cfg(feature = "http2")]
-                    if let Some(read_chunk) = self.chunk_reader.read {
-                        let chunk = std::future::poll_fn(|cx| self.reader.poll_recv_chunk(cx, read_chunk)).await?;
-                        return Ok(self.read_buf.receive_chunk(chunk));
-                    }
-                    self.reader.read_buf(self.read_buf.writable()).await
-                } => {
+                result = self.reader.read_buf(&mut self.read_buf) => {
                     match result {
                         Ok(0) => {
                             let _ = self.control_tx.send(ControlRequest::Eof).await;

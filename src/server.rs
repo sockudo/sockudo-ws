@@ -529,7 +529,6 @@ where
 
         // Create WebSocketStream over Stream<Http2>
         let ws = WebSocketStream::from_raw(h2_stream, Role::Server, config)
-            .with_http2_receive_chunks()
             .with_immediate_write_shutdown();
 
         // Call user handler
@@ -584,7 +583,6 @@ where
         let recv_stream = request.into_body();
         let h2_stream = Stream::<Http2>::from_h2(send_stream, recv_stream);
         let ws = WebSocketStream::from_raw(h2_stream, Role::Server, config)
-            .with_http2_receive_chunks()
             .with_immediate_write_shutdown();
 
         handler(ws, ws_req).await;

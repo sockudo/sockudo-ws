@@ -532,7 +532,6 @@ impl WebSocketClient<Http2> {
 
         // Create and return WebSocketStream
         Ok(WebSocketStream::from_raw(h2_stream, Role::Client, config)
-            .with_http2_receive_chunks()
             .with_immediate_write_shutdown())
     }
 

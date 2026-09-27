@@ -334,7 +334,7 @@ impl Protocol {
     /// soon as it arrives (RFC 6455 fail-fast, Autobahn 6.4.x strict) and keeps
     /// text validation to a single linear pass however the message is chopped.
     #[inline]
-    fn prevalidate_partial_text(&mut self, buf: &[u8]) -> Result<()> {
+    fn prevalidate_partial_text(&mut self, buf: &BytesMut) -> Result<()> {
         let Some(pending) = self.parser.pending_payload() else {
             return Ok(());
         };
@@ -408,9 +408,9 @@ impl Protocol {
     /// Preserve accepted messages and the fragment flag even if a later frame fails.
     /// Readers terminating on that error may ignore the fragment activity flag.
     #[inline]
-    pub(crate) fn process_into_with_activity<B: crate::frame::FrameInput>(
+    pub(crate) fn process_into_with_activity(
         &mut self,
-        buf: &mut B,
+        buf: &mut BytesMut,
         messages: &mut Vec<Message>,
         accepted_fragment: &mut bool,
     ) -> Result<()> {
@@ -418,7 +418,7 @@ impl Protocol {
         messages.clear();
 
         while !buf.is_empty() {
-            match buf.parse_frame(&mut self.parser)? {
+            match self.parser.parse(buf)? {
                 Some(frame) => {
                     let prevalidated = std::mem::take(&mut self.partial_checked);
                     if let Some(msg) = self.handle_frame(frame, prevalidated)? {
@@ -936,9 +936,9 @@ impl CompressedProtocol {
     /// Preserve accepted messages and the fragment flag even if a later frame fails.
     /// Readers terminating on that error may ignore the fragment activity flag.
     #[inline]
-    pub(crate) fn process_into_with_activity<B: crate::frame::FrameInput>(
+    pub(crate) fn process_into_with_activity(
         &mut self,
-        buf: &mut B,
+        buf: &mut BytesMut,
         messages: &mut Vec<Message>,
         accepted_fragment: &mut bool,
     ) -> Result<()> {
@@ -950,7 +950,7 @@ impl CompressedProtocol {
             if DEBUG {
                 eprintln!("[PROTOCOL] process_into loop: buf has {} bytes", buf.len());
             }
-            match buf.parse_frame(&mut self.inner.parser)? {
+            match self.inner.parser.parse(buf)? {
                 Some(frame) => {
                     if DEBUG {
                         eprintln!("[PROTOCOL] Parsed frame, handling...");
@@ -1285,9 +1285,9 @@ impl CompressedReaderProtocol {
     /// Preserve accepted messages and the fragment flag even if a later frame fails.
     /// Readers terminating on that error may ignore the fragment activity flag.
     #[inline]
-    pub(crate) fn process_into_with_activity<B: crate::frame::FrameInput>(
+    pub(crate) fn process_into_with_activity(
         &mut self,
-        buf: &mut B,
+        buf: &mut BytesMut,
         messages: &mut Vec<Message>,
         accepted_fragment: &mut bool,
     ) -> Result<()> {
@@ -1298,7 +1298,7 @@ impl CompressedReaderProtocol {
         self.parser.set_compression(true);
 
         while !buf.is_empty() {
-            match buf.parse_frame(&mut self.parser)? {
+            match self.parser.parse(buf)? {
                 Some(frame) => {
                     if let Some(msg) = self.handle_frame(frame)? {
                         messages.push(msg);

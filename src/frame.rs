@@ -11,36 +11,9 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::mem::MaybeUninit;
 
 use crate::error::{CloseReason, Error, Result};
-#[cfg(test)]
-use crate::simd::apply_mask;
-use crate::simd::apply_mask_offset;
+use crate::simd::{apply_mask, apply_mask_offset};
 use crate::utf8::validate_utf8;
 use crate::{MEDIUM_MESSAGE_THRESHOLD, SMALL_MESSAGE_THRESHOLD};
-
-/// Shared parser operations for mutable read windows and owned transport chunks.
-/// Header validation stays in one state machine regardless of input ownership.
-pub(crate) trait FrameInput: Buf + std::ops::Deref<Target = [u8]> {
-    fn parse_frame(&mut self, parser: &mut FrameParser) -> Result<Option<Frame>>;
-    fn unmask(&mut self, start: usize, end: usize, mask: [u8; 4]);
-    fn take_payload(&mut self, len: usize) -> Bytes;
-}
-
-impl FrameInput for BytesMut {
-    #[inline]
-    fn parse_frame(&mut self, parser: &mut FrameParser) -> Result<Option<Frame>> {
-        parser.parse(self)
-    }
-
-    #[inline]
-    fn unmask(&mut self, start: usize, end: usize, mask: [u8; 4]) {
-        apply_mask_offset(&mut self[start..end], mask, start);
-    }
-
-    #[inline]
-    fn take_payload(&mut self, len: usize) -> Bytes {
-        self.split_to(len).freeze()
-    }
-}
 
 /// WebSocket opcode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -420,11 +393,6 @@ impl FrameParser {
     /// - Err(e) if parsing failed
     #[inline]
     pub fn parse(&mut self, buf: &mut BytesMut) -> Result<Option<Frame>> {
-        self.parse_input(buf)
-    }
-
-    #[inline]
-    pub(crate) fn parse_input<B: FrameInput>(&mut self, buf: &mut B) -> Result<Option<Frame>> {
         // Ultra-fast path for small unmasked frames (server->client)
         // This handles the common case without any state machine overhead
         if self.state == ParseState::Header && !self.expect_masked && buf.len() >= 2 {
@@ -464,7 +432,7 @@ impl FrameParser {
 
                         // Extract payload
                         buf.advance(2);
-                        let payload = buf.take_payload(payload_len);
+                        let payload = buf.split_to(payload_len).freeze();
 
                         return Ok(Some(Frame {
                             header: FrameHeader {
@@ -526,8 +494,8 @@ impl FrameParser {
 
                         // Extract and unmask payload
                         buf.advance(6);
-                        buf.unmask(0, payload_len, mask);
-                        let payload = buf.take_payload(payload_len);
+                        let mut payload = buf.split_to(payload_len);
+                        apply_mask(&mut payload, mask);
 
                         return Ok(Some(Frame {
                             header: FrameHeader {
@@ -540,7 +508,7 @@ impl FrameParser {
                                 payload_len: payload_len as u64,
                                 mask: Some(mask),
                             },
-                            payload,
+                            payload: payload.freeze(),
                         }));
                     }
                 }
@@ -551,7 +519,7 @@ impl FrameParser {
     }
 
     /// Slow path for frame parsing - handles all edge cases
-    pub(crate) fn parse_slow<B: FrameInput>(&mut self, buf: &mut B) -> Result<Option<Frame>> {
+    fn parse_slow(&mut self, buf: &mut BytesMut) -> Result<Option<Frame>> {
         const DEBUG: bool = false;
         loop {
             if DEBUG && !buf.is_empty() {
@@ -884,7 +852,7 @@ impl FrameParser {
                         let ready = self.payload_ready;
                         if available > ready {
                             if let Some(mask) = header.mask {
-                                buf.unmask(ready, available, mask);
+                                apply_mask_offset(&mut buf[ready..available], mask, ready);
                             }
                             self.payload_ready = available;
                         }
@@ -903,16 +871,17 @@ impl FrameParser {
                     // already unmasked while streaming.
                     let mask = header.mask;
                     let ready = self.payload_ready;
+                    let mut payload = buf.split_to(payload_len);
 
                     if let Some(mask) = mask
                         && ready < payload_len
                     {
-                        buf.unmask(ready, payload_len, mask);
+                        apply_mask_offset(&mut payload[ready..], mask, ready);
                     }
 
                     let frame = Frame {
                         header: self.header.take().unwrap(),
-                        payload: buf.take_payload(payload_len),
+                        payload: payload.freeze(),
                     };
 
                     if DEBUG {

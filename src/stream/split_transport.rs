@@ -42,22 +42,6 @@ impl<S> SplitTransport<S> {
         (reader, writer)
     }
 
-    #[cfg(feature = "http2")]
-    pub(super) fn poll_recv_chunk(
-        &mut self,
-        cx: &mut Context<'_>,
-        read_chunk: crate::http2::stream::ChunkReader<S>,
-    ) -> Poll<io::Result<bytes::Bytes>>
-    where
-        S: Unpin,
-    {
-        match &mut *self.shared.state.lock().unwrap() {
-            TransportState::Open(stream) => read_chunk(Pin::new(stream), cx),
-            TransportState::Closing => Poll::Pending,
-            TransportState::Closed => Poll::Ready(Ok(bytes::Bytes::new())),
-        }
-    }
-
     /// Take exclusive ownership while an orderly terminal shutdown is pending.
     ///
     /// Polls through the public halves remain pending until `finish_close`

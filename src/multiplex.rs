@@ -169,7 +169,6 @@ impl MultiplexedConnection<Http2> {
 
         Ok(
             WebSocketStream::from_raw(h2_stream, Role::Client, self.config.clone())
-                .with_http2_receive_chunks()
                 .with_immediate_write_shutdown(),
         )
     }
