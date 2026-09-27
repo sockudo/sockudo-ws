@@ -579,7 +579,12 @@ where
         std::ptr::copy_nonoverlapping(src.as_ptr(), dst.buf_mut_ptr().cast::<u8>(), len);
         dst.set_len(len);
     }
-    Buf::advance(src, len);
+    if len == src.len() {
+        // An exhausted Bytes cursor can otherwise keep the entire owner alive.
+        *src = Bytes::new();
+    } else {
+        Buf::advance(src, len);
+    }
     len
 }
 
@@ -1032,6 +1037,9 @@ impl AsyncRead for CompioHttp3ClientStream {
         if self.write_cancelled {
             return BufResult(Err(compio_h3_cancelled_write_error()), buf);
         }
+        if buf.buf_capacity() == 0 {
+            return BufResult(Ok(0), buf);
+        }
         if self.recv_buf.is_empty() {
             let Some(result) = poll_read_until_cancelled(self.stream.recv_data()).await else {
                 return BufResult(Err(poll_read_cancelled()), buf);
@@ -1114,6 +1122,9 @@ impl AsyncRead for CompioHttp3ServerStream {
     async fn read<B: IoBufMut>(&mut self, mut buf: B) -> BufResult<usize, B> {
         if self.write_cancelled {
             return BufResult(Err(compio_h3_cancelled_write_error()), buf);
+        }
+        if buf.buf_capacity() == 0 {
+            return BufResult(Ok(0), buf);
         }
         if self.recv_buf.is_empty() {
             let Some(result) = poll_read_until_cancelled(self.stream.recv_data()).await else {
@@ -4223,5 +4234,40 @@ mod tests {
         ));
         client.close(1000, "").await.unwrap();
         server.await.unwrap();
+    }
+}
+
+#[cfg(all(test, any(feature = "http2", feature = "http3")))]
+mod receive_owner_tests {
+    use super::copy_into_compio_buf;
+    use bytes::Bytes;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[test]
+    fn final_copy_releases_source_owner() {
+        struct Owner(Arc<AtomicBool>);
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                b"owned bytes"
+            }
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut src = Bytes::from_owner(Owner(dropped.clone()));
+        let mut dst = Vec::with_capacity(5);
+        assert_eq!(copy_into_compio_buf(&mut dst, &mut src), 5);
+        assert_eq!(dst, b"owned");
+        assert!(!dropped.load(Ordering::SeqCst));
+        let mut dst = Vec::with_capacity(6);
+        assert_eq!(copy_into_compio_buf(&mut dst, &mut src), 6);
+        assert_eq!(dst, b" bytes");
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }

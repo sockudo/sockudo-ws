@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Compio HTTP/2 and HTTP/3 adapters retain owned DATA chunks instead of staging every byte in a preallocated 64 KiB buffer. The last read releases the retained owner; reads still copy into the caller buffer.
+
 - Tokio HTTP/3 client and server adapters retain unread DATA chunks instead of copying them into a preallocated 64 KiB buffer, and release fully consumed chunks immediately. Raw QUIC wrappers also stop allocating an unused 64 KiB receive buffer.
 - Tokio HTTP/2 adapters retain unread DATA chunks instead of copying their remainder into a preallocated 64 KiB buffer. Fully consumed chunks are released immediately; flow-control capacity is returned at the same point as before.
 - Tokio unified and split readers try reclaiming an empty receive window once buffered input has reached half the window, avoiding later movement of partially received frames when the storage can be reused. Small buffered inputs avoid repeated shared-buffer ownership checks; retained payloads can prevent reclamation, and continuously nonempty receive buffers cannot use this reclaim point. Compio readers are unchanged.
@@ -49,6 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared cell instead of a channel message per data frame.
 
 ### Fixed
+
+- Compio HTTP/3 adapters complete zero-capacity reads without waiting for incoming DATA.
 
 - Tokio HTTP/3 request adapters complete zero-capacity reads immediately without waiting for or consuming data.
 - Tokio and Compio HTTP/2 adapters skip empty DATA frames without reporting premature EOF; zero-capacity read buffers complete immediately without consuming DATA. END_STREAM still terminates reads after queued bytes, and pending Compio reads remain cancellable.
