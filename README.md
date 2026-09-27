@@ -927,7 +927,7 @@ Transport features are runtime-neutral. Pair `http2` or `http3` with either `tok
 | Feature | Description |
 |---------|-------------|
 | `axum-integration` | Axum web framework support |
-| `full` | All features enabled |
+| `full` | Production feature bundle; excludes `test-util` |
 
 ### Connection Clock
 
