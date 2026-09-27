@@ -1,6 +1,6 @@
 #![cfg(feature = "compio-runtime")]
 
-use compio::io::{AsyncReadExt, AsyncWriteExt};
+use compio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use compio::net::{TcpListener, TcpStream};
 use sockudo_ws::{CompioWebSocketStream, Config, Error};
 
@@ -63,7 +63,15 @@ macro_rules! receive_cases {
                     .0
                     .unwrap();
                 assert!(stream.next().await.unwrap().unwrap().is_close());
+                assert!(stream.is_closed());
                 assert!(stream.next().await.is_none());
+                drop(stream);
+                compio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    read_masked_control_payload(&mut peer, 0x08),
+                )
+                .await
+                .expect("the Close response must be written before the reader terminates");
             }
 
             #[compio::test]
@@ -116,6 +124,79 @@ receive_cases!(compressed_split, |io| {
         sockudo_ws::DeflateConfig::default(),
     )
     .split()
+});
+
+macro_rules! unified_close_cases {
+    ($module:ident, $make:expr) => {
+        mod $module {
+            use super::*;
+
+            #[compio::test]
+            async fn parse_error_after_peer_close_does_not_repeat_a_local_close() {
+                let (io, mut peer) = connection().await;
+                let mut stream = ($make)(io);
+                stream.close(1000, "").await.unwrap();
+                assert_eq!(
+                    read_masked_control_payload(&mut peer, 0x08).await,
+                    b"\x03\xe8"
+                );
+
+                peer.write_all(b"\x88\x02\x03\xe8\x83\x00".to_vec())
+                    .await
+                    .0
+                    .unwrap();
+                assert!(stream.next().await.unwrap().unwrap().is_close());
+                assert!(stream.next().await.is_none());
+
+                let result =
+                    compio::time::timeout(std::time::Duration::from_secs(1), peer.read(vec![0; 1]))
+                        .await
+                        .expect("explicit Close must end the write half");
+                assert_eq!(
+                    result.0.unwrap(),
+                    0,
+                    "the peer Close must not trigger a second local Close"
+                );
+            }
+
+            #[compio::test]
+            async fn local_close_answers_crossing_ping_before_peer_close() {
+                let (io, mut peer) = connection().await;
+                let mut stream = ($make)(io);
+                stream.close(1000, "").await.unwrap();
+                assert_eq!(
+                    read_masked_control_payload(&mut peer, 0x08).await,
+                    b"\x03\xe8"
+                );
+
+                // Keep Close separate: Pong is required only until Close has
+                // actually been received (RFC 6455 §5.5.2).
+                peer.write_all(b"\x89\x01p".to_vec()).await.0.unwrap();
+                assert!(stream.next().await.unwrap().unwrap().is_ping());
+                assert_eq!(read_masked_control_payload(&mut peer, 0x0a).await, b"p");
+                peer.write_all(b"\x88\x02\x03\xe8".to_vec())
+                    .await
+                    .0
+                    .unwrap();
+                assert!(stream.next().await.unwrap().unwrap().is_close());
+                let result = peer.read(vec![0; 1]).await;
+                assert_eq!(result.0.unwrap(), 0);
+            }
+        }
+    };
+}
+
+unified_close_cases!(unified_local_close, |io| CompioWebSocketStream::client(
+    io,
+    config()
+));
+#[cfg(feature = "permessage-deflate")]
+unified_close_cases!(compressed_local_close, |io| {
+    sockudo_ws::compio::CompioCompressedWebSocketStream::client(
+        io,
+        config(),
+        sockudo_ws::DeflateConfig::default(),
+    )
 });
 
 #[compio::test]
