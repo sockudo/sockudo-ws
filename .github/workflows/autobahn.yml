@@ -4,6 +4,10 @@ on:
   workflow_call:
   workflow_dispatch:
 
+env:
+  # Keep cached CI artifacts portable across hosted runner CPUs.
+  RUSTFLAGS: ""
+
 jobs:
   autobahn:
     name: WebSocket conformance
@@ -15,14 +19,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-autobahn-${{ hashFiles('**/Cargo.lock') }}
+          workspaces: |
+            . -> target
+            autobahn-testsuite-rs -> target
 
       - name: Run full Autobahn suite
         run: make -C autobahn test
