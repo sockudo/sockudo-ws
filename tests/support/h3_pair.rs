@@ -20,7 +20,7 @@ impl Drop for Connection {
     }
 }
 
-pub async fn pair() -> (Client, Server, Connection) {
+pub async fn quic_pair() -> ([quinn::Endpoint; 2], [quinn::Connection; 2]) {
     static CRYPTO: Once = Once::new();
     CRYPTO.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -51,13 +51,26 @@ pub async fn pair() -> (Client, Server, Connection) {
     client.set_default_client_config(quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap(),
     )));
-    let accepting = server.clone();
+    let (client_connection, server_connection) = tokio::join!(
+        async {
+            client
+                .connect(server.local_addr().unwrap(), "localhost")
+                .unwrap()
+                .await
+                .unwrap()
+        },
+        async { server.accept().await.unwrap().await.unwrap() },
+    );
+    ([client, server], [client_connection, server_connection])
+}
+
+pub async fn pair() -> (Client, Server, Connection) {
+    let (endpoints, [connection, server_connection]) = quic_pair().await;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let server_driver = tokio::spawn(async move {
-        let connection = accepting.accept().await.unwrap().await.unwrap();
         let mut connection = h3::server::builder()
             .enable_extended_connect(true)
-            .build(h3_quinn::Connection::new(connection))
+            .build(h3_quinn::Connection::new(server_connection))
             .await
             .unwrap();
         let (request, mut stream) = connection
@@ -73,11 +86,6 @@ pub async fn pair() -> (Client, Server, Connection) {
         tx.send(stream).ok().unwrap();
         let _ = connection.accept().await;
     });
-    let connection = client
-        .connect(server.local_addr().unwrap(), "localhost")
-        .unwrap()
-        .await
-        .unwrap();
     let (mut connection, mut sender) = h3::client::new(h3_quinn::Connection::new(connection))
         .await
         .unwrap();
@@ -104,7 +112,7 @@ pub async fn pair() -> (Client, Server, Connection) {
         stream,
         rx.await.unwrap(),
         Connection {
-            endpoints: [client, server],
+            endpoints,
             drivers: [client_driver, server_driver],
         },
     )

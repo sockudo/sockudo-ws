@@ -115,3 +115,36 @@ async fn consumed_chunk_releases_owner(#[case] server: bool) {
     assert_eq!(rest, [42; 58]);
     assert!(dropped.load(Ordering::SeqCst));
 }
+
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
+#[tokio::test]
+async fn raw_quic_wrappers_read_partial_data_through_fin(#[case] generic: bool) {
+    let (_endpoints, [client, server]) = h3_pair::quic_pair().await;
+    let payload: Vec<_> = (0..131_073).map(|i| (i % 251) as u8).collect();
+    let expected = payload.clone();
+    let writer = tokio::spawn(async move {
+        let (mut send, _recv) = client.open_bi().await.unwrap();
+        send.write_all(&payload).await.unwrap();
+        send.finish().unwrap();
+        send.stopped().await.unwrap();
+    });
+    let (send, recv) = server.accept_bi().await.unwrap();
+    let mut reader: Box<dyn AsyncRead + Unpin> = if generic {
+        Box::new(crate::Stream::<crate::Http3>::from_quic(send, recv))
+    } else {
+        Box::new(super::Http3Stream::new(send, recv))
+    };
+    let mut output = Vec::new();
+    let mut buf = [0; 7];
+    loop {
+        let count = reader.read(&mut buf).await.unwrap();
+        if count == 0 {
+            break;
+        }
+        output.extend_from_slice(&buf[..count]);
+    }
+    assert_eq!(output, expected);
+    writer.await.unwrap();
+}

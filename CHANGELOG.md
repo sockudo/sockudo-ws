@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Tokio HTTP/3 client and server adapters retain unread DATA chunks instead of copying them into a preallocated 64 KiB buffer, and release fully consumed chunks immediately.
+- Tokio HTTP/3 client and server adapters retain unread DATA chunks instead of copying them into a preallocated 64 KiB buffer, and release fully consumed chunks immediately. Raw QUIC wrappers also stop allocating an unused 64 KiB receive buffer.
 - Tokio HTTP/2 adapters retain unread DATA chunks instead of copying their remainder into a preallocated 64 KiB buffer. Fully consumed chunks are released immediately; flow-control capacity is returned at the same point as before.
 - Tokio unified and split readers try reclaiming an empty receive window once buffered input has reached half the window, avoiding later movement of partially received frames when the storage can be reused. Small buffered inputs avoid repeated shared-buffer ownership checks; retained payloads can prevent reclamation, and continuously nonempty receive buffers cannot use this reclaim point. Compio readers are unchanged.
 - Reduce compression overhead for outgoing messages with `no_context_takeover` by clearing DEFLATE history at completed message boundaries. This includes the no-takeover settings selected by `Compression::Shared`, `Compression::Window1KB`, `Compression::Window2KB`, and `DeflateConfig::low_memory()`. Context-takeover compression is unchanged; this does not accelerate receiving existing compressed traffic. Measured improvements use a 32 KiB window and do not establish the same gain for smaller windows.
