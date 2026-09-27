@@ -1538,6 +1538,13 @@ where
 {
     /// Receive the next message.
     ///
+    /// Newly read frames are parsed only until one message is accepted. Later
+    /// frames, including malformed ones, remain undiscovered until another
+    /// call. Writes remain allowed until a read error is discovered; a terminal
+    /// heartbeat or idle timeout takes precedence over an unparsed tail.
+    /// Messages and errors already parsed before splitting keep their order.
+    /// Cancelling a pending call retains parser and fragment state.
+    ///
     /// Ping and Pong frames remain visible after their automatic state-machine
     /// processing. A terminal heartbeat/idle cause is yielded once as an error.
     pub async fn next(&mut self) -> Option<Result<Message>> {
@@ -1551,7 +1558,34 @@ where
                 return result;
             }
 
-            if let Some(msg) = self.pending_messages.pop() {
+            let message = if let Some(msg) = self.pending_messages.pop() {
+                Some(msg)
+            } else if self.pending_parse_error.is_none() && self.has_unprocessed_read_data {
+                self.has_unprocessed_read_data = false;
+                let mut accepted_fragment = false;
+                match self
+                    .protocol
+                    .process_next_with_activity(&mut self.read_buf, &mut accepted_fragment)
+                {
+                    Ok(message) => {
+                        if accepted_fragment {
+                            self.shared.note_inbound();
+                        }
+                        self.has_unprocessed_read_data =
+                            message.is_some() && !self.read_buf.is_empty();
+                        message
+                    }
+                    Err(error) => {
+                        self.pending_parse_error = Some(error);
+                        self.shared.begin_read_error();
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            if let Some(msg) = message {
                 let request = match &msg {
                     Message::Ping(data) => {
                         ControlRequest::Ping(data.clone(), tokio::time::Instant::now())
@@ -1586,33 +1620,6 @@ where
                 return Some(Err(error));
             }
 
-            if self.has_unprocessed_read_data {
-                self.has_unprocessed_read_data = false;
-                debug_assert!(self.pending_messages.is_empty());
-                let mut accepted_fragment = false;
-                match self.protocol.process_into_with_activity(
-                    &mut self.read_buf,
-                    &mut self.pending_messages,
-                    &mut accepted_fragment,
-                ) {
-                    Ok(()) => {
-                        if accepted_fragment {
-                            self.shared.note_inbound();
-                        }
-                        self.pending_messages.reverse();
-                        if !self.pending_messages.is_empty() {
-                            continue;
-                        }
-                    }
-                    Err(error) => {
-                        self.pending_messages.reverse();
-                        self.pending_parse_error = Some(error);
-                        self.shared.begin_read_error();
-                        continue;
-                    }
-                }
-            }
-
             // Reuse an empty receive window when no delivered payload still owns it.
             if self.reclaim_read_window && self.read_buf.is_empty() {
                 self.reclaim_read_window = false;
@@ -1623,7 +1630,6 @@ where
                 self.read_buf.reserve(crate::RECV_BUFFER_SIZE);
             }
 
-            let mut accepted_fragment = false;
             tokio::select! {
                 biased;
                 changed = self.terminal_rx.changed() => {
@@ -1641,22 +1647,7 @@ where
                             if self.read_buf.len() >= crate::RECV_BUFFER_SIZE / 2 {
                                 self.reclaim_read_window = true;
                             }
-                            match self
-                                .protocol
-                                .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages, &mut accepted_fragment)
-                            {
-                                Ok(()) => {
-                                    if accepted_fragment {
-                                        self.shared.note_inbound();
-                                    }
-                                    self.pending_messages.reverse();
-                                },
-                                Err(error) => {
-                                    self.pending_messages.reverse();
-                                    self.pending_parse_error = Some(error);
-                                    self.shared.begin_read_error();
-                                }
-                            }
+                            self.has_unprocessed_read_data = true;
                         },
                         Err(error) => {
                             self.shared.terminate(TerminalCause::ConnectionClosed);

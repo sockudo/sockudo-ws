@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Ordinary Tokio split readers deliver each newly parsed message without first parsing the rest of a buffered burst. Later malformed frames are discovered by a subsequent `next()` call, so writes remain allowed until that discovery and a terminal heartbeat or idle timeout can take precedence over the unparsed tail. Messages and errors parsed before splitting preserve their order. Unified, compressed and Compio readers retain batch parsing.
 - Compio HTTP/2 and HTTP/3 adapters retain owned DATA chunks instead of staging every byte in a preallocated 64 KiB buffer. The last read releases the retained owner; reads still copy into the caller buffer.
 - Tokio HTTP/3 client and server adapters retain unread DATA chunks instead of copying them into a preallocated 64 KiB buffer, and release fully consumed chunks immediately. Raw QUIC wrappers also stop allocating an unused 64 KiB receive buffer.
 - Tokio HTTP/2 adapters retain unread DATA chunks instead of copying their remainder into a preallocated 64 KiB buffer. Fully consumed chunks are released immediately; flow-control capacity is returned at the same point as before.
