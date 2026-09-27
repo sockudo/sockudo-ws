@@ -57,7 +57,7 @@ compio-runtime = [
 axum-integration = ["axum", "hyper", "hyper-util", "tokio-runtime"]
 
 # Compression (permessage-deflate, RFC 7692)
-permessage-deflate = ["flate2"]
+permessage-deflate = ["flate2", "dep:libz-rs-sys"]
 
 # TLS support via native-tls
 native-tls = ["dep:native-tls", "dep:tokio-native-tls", "tokio-runtime"]
@@ -91,7 +91,6 @@ rand_rng = ["dep:rand"]
 # HTTP/2 WebSocket support (RFC 8441)
 http2 = [
     "dep:h2",
-    "dep:http",
     "dep:tokio",
     "tokio/io-util",
     "dep:tokio-util",
@@ -104,7 +103,6 @@ http3 = [
     "dep:quinn",
     "dep:h3",
     "dep:h3-quinn",
-    "dep:http",
     "dep:rustls",
     "compio?/h3",
     "compio?/rustls",
@@ -112,7 +110,7 @@ http3 = [
 ]
 
 # io_uring support (Linux only)
-io-uring = ["dep:tokio-uring"]
+io-uring = ["tokio-runtime", "dep:tokio-uring"]
 
 # All transport features
 all-transports = ["http2", "http3", "io-uring"]
@@ -129,13 +127,10 @@ tokio = { version = "^1.48", default-features = false, optional = true }
 tokio-util = { version = "^0.7", default-features = false, optional = true }
 
 # Compio completion-based async runtime
-compio = { version = "^0.18", default-features = false, features = ["net", "macros", "bytes", "sync", "time"], optional = true }
+compio = { version = "^0.19", default-features = false, features = ["net", "macros", "bytes", "sync", "time"], optional = true }
 
 # Fast synchronization primitives for pub/sub
 parking_lot = "^0.12"
-
-# High-performance concurrent hash maps for pub/sub
-dashmap = "^6.1"
 
 # Axum integration
 axum = { version = "^0.8", optional = true }
@@ -173,7 +168,8 @@ futures-channel = { version = "^0.3", features = ["sink"], optional = true }
 futures-util = { version = "^0.3", default-features = false, features = ["async-await", "sink"], optional = true }
 
 # Compression (permessage-deflate, RFC 7692)
-flate2 = { version = "^1.1.3", default-features = false, features = ["zlib-rs"], optional = true }
+flate2 = { version = "^1.1.10", default-features = false, features = ["zlib-rs"], optional = true }
+libz-rs-sys = { version = "^0.6.8", optional = true }
 
 # Socket options (SO_REUSEPORT, TCP_NODELAY)
 socket2 = { version = "^0.5", features = ["all"] }
@@ -198,7 +194,9 @@ rustls-platform-verifier = { version = "^0.6", optional = true }
 
 # HTTP/2 support (RFC 8441)
 h2 = { version = "^0.4", optional = true }
-http = { version = "^1.0", optional = true }
+
+# URI parsing for HTTP/1 handshakes and shared HTTP types
+http = { version = "^1.0" }
 
 # HTTP/3 support (RFC 9220)
 quinn = { version = "^0.11", optional = true }
@@ -216,6 +214,7 @@ tokio-uring = { version = "^0.5", optional = true }
 [dev-dependencies]
 criterion = "^0.5"
 rand = "^0.9"
+rstest = { version = "0.27.0", default-features = false }
 tokio = { version = "^1.48", features = ["full", "test-util"] }
 tokio-tungstenite = "^0.26"
 tokio-websockets = { version = "^0.10", features = ["client", "server", "sha1_smol", "fastrand"] }
@@ -297,6 +296,25 @@ name = "comparison_bench"
 harness = false
 required-features = ["tokio-runtime"]
 
+[[bench]]
+name = "sink_backpressure"
+harness = false
+required-features = ["tokio-runtime", "permessage-deflate"]
+
+[[bench]]
+name = "fragment_validation"
+harness = false
+
+[[bench]]
+name = "receive_limits"
+harness = false
+required-features = ["permessage-deflate"]
+
+[[bench]]
+name = "split_receive"
+harness = false
+required-features = ["tokio-runtime", "compio-runtime", "permessage-deflate"]
+
 [profile.release]
 opt-level = 3
 lto = "fat"
@@ -309,3 +327,52 @@ strip = true
 opt-level = 3
 lto = "thin"
 debug = true
+
+[[bench]]
+name = "protocol_bench"
+harness = false
+required-features = ["tokio-runtime"]
+
+[[bench]]
+name = "masking_bench"
+harness = false
+required-features = ["tokio-runtime"]
+
+[[bench]]
+name = "client_mask_bench"
+harness = false
+required-features = ["tokio-runtime"]
+
+[[bench]]
+name = "deflate_input_bench"
+harness = false
+required-features = ["tokio-runtime", "permessage-deflate"]
+
+[[bench]]
+name = "deflate_capacity_bench"
+harness = false
+required-features = ["tokio-runtime", "permessage-deflate"]
+
+[[bench]]
+name = "services_bench"
+harness = false
+required-features = ["tokio-runtime", "permessage-deflate"]
+
+[[bench]]
+name = "stream_bench"
+harness = false
+required-features = ["tokio-runtime"]
+
+[[bench]]
+name = "receive_state_bench"
+harness = false
+required-features = ["tokio-runtime"]
+
+[[example]]
+name = "send_latency_diagnostic"
+required-features = ["tokio-runtime"]
+
+[[bench]]
+name = "delivery_diagnostic_bench"
+harness = false
+required-features = ["tokio-runtime"]
