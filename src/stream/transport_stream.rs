@@ -31,8 +31,6 @@ use std::task::{Context, Poll};
 use bytes::Buf;
 #[cfg(any(feature = "http2", feature = "http3"))]
 use bytes::Bytes;
-#[cfg(feature = "http3")]
-use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::transport::{Http1, Transport};
@@ -400,7 +398,6 @@ enum Http3StreamInner {
     Raw {
         send: quinn::SendStream,
         recv: quinn::RecvStream,
-        recv_buf: BytesMut,
         recv_finished: bool,
     },
     /// Server-side h3 request stream
@@ -423,7 +420,6 @@ impl Stream<Http3> {
             inner: StreamInner::Http3(Http3StreamInner::Raw {
                 send,
                 recv,
-                recv_buf: BytesMut::with_capacity(64 * 1024),
                 recv_finished: false,
             }),
             _marker: PhantomData,
@@ -497,17 +493,9 @@ impl AsyncRead for Stream<Http3> {
         match &mut self.inner {
             StreamInner::Http3(Http3StreamInner::Raw {
                 recv,
-                recv_buf,
                 recv_finished,
                 ..
             }) => {
-                // First drain buffered data
-                if !recv_buf.is_empty() {
-                    let to_copy = std::cmp::min(buf.remaining(), recv_buf.len());
-                    buf.put_slice(&recv_buf.split_to(to_copy));
-                    return Poll::Ready(Ok(()));
-                }
-
                 if *recv_finished {
                     return Poll::Ready(Ok(()));
                 }
@@ -598,14 +586,9 @@ impl AsyncWrite for Stream<Http3> {
 impl fmt::Debug for Stream<Http3> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.inner {
-            StreamInner::Http3(Http3StreamInner::Raw {
-                recv_buf,
-                recv_finished,
-                ..
-            }) => f
+            StreamInner::Http3(Http3StreamInner::Raw { recv_finished, .. }) => f
                 .debug_struct("Stream<Http3>")
                 .field("variant", &"Raw")
-                .field("recv_buf_len", &recv_buf.len())
                 .field("recv_finished", recv_finished)
                 .finish(),
             StreamInner::Http3(Http3StreamInner::Server { stream }) => f
