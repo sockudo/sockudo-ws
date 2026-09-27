@@ -4,10 +4,16 @@
 //! which compresses message payloads using the DEFLATE algorithm.
 
 use bytes::{Bytes, BytesMut};
-use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
+use flate2::{Compress, Compression, FlushCompress, Status};
+use libz_rs_sys::{
+    Z_BUF_ERROR, Z_OK, Z_STREAM_END, Z_SYNC_FLUSH, inflate, inflateEnd, inflateInit2_,
+    inflateReset, inflateResetKeep, z_stream, zlibVersion,
+};
+use std::mem::MaybeUninit;
 
 pub use crate::DeflateWindowBits;
 use crate::error::{Error, Result};
+use crate::handshake::trim_optional_whitespace;
 
 /// Trailer bytes that must be removed after compression and added before decompression
 const DEFLATE_TRAILER: [u8; 4] = [0x00, 0x00, 0xff, 0xff];
@@ -82,6 +88,9 @@ impl DeflateConfig {
     ///
     /// This reduces encoder and retained takeover-history windows. The
     /// configured zlib-rs decoder may still retain its internal 32 KiB window.
+    /// When used as a server negotiation policy, clients must offer
+    /// `client_max_window_bits`; a bare `permessage-deflate` offer is declined
+    /// rather than exceeding the configured client window limit.
     pub fn low_memory() -> Self {
         Self {
             server_max_window_bits: DeflateWindowBits::Bits10, // 1KB window
@@ -182,10 +191,13 @@ impl DeflateEncoder {
             return Ok(None);
         }
 
-        // Reset context if required
-        if self.no_context_takeover {
-            self.compress.reset();
-        }
+        // Forget history at the preceding message boundary so each no-takeover
+        // message remains independently decodable without a pre-message reset.
+        let flush = if self.no_context_takeover {
+            FlushCompress::Full
+        } else {
+            FlushCompress::Sync
+        };
 
         // Estimate output size (compressed data is often smaller, but we need headroom)
         let max_output = data.len() + 64;
@@ -198,6 +210,10 @@ impl DeflateEncoder {
         loop {
             iterations += 1;
             if iterations > 100_000 {
+                // A failed flush cannot establish the next message boundary.
+                if self.no_context_takeover {
+                    self.compress.reset();
+                }
                 return Err(Error::Compression(
                     "compression took too many iterations".into(),
                 ));
@@ -219,10 +235,16 @@ impl DeflateEncoder {
             let spare = output.spare_capacity_mut();
             let spare_len = spare.len();
 
-            let status = self
-                .compress
-                .compress_uninit(input, spare, FlushCompress::Sync)
-                .map_err(|e| Error::Compression(format!("deflate error: {}", e)))?;
+            let status = match self.compress.compress_uninit(input, spare, flush) {
+                Ok(status) => status,
+                Err(error) => {
+                    // Restore independence before the caller can reuse this encoder.
+                    if self.no_context_takeover {
+                        self.compress.reset();
+                    }
+                    return Err(Error::Compression(format!("deflate error: {error}")));
+                }
+            };
 
             let consumed = (self.compress.total_in() - before_in) as usize;
             let produced = (self.compress.total_out() - before_out) as usize;
@@ -252,7 +274,7 @@ impl DeflateEncoder {
             output.truncate(output.len() - 4);
         }
 
-        // Only skip where the encoder resets per message. Otherwise the caller
+        // Only skip where the encoder clears history per message. Otherwise the caller
         // sends these bytes raw, so they stay in our window without ever
         // entering the peer's, and every later back-reference resolves against
         // different history: corrupt messages, or a connection that dies.
@@ -269,24 +291,107 @@ impl DeflateEncoder {
     }
 }
 
+struct RawDeflateDecoder {
+    // Keep the stream at a stable address for the lifetime required by the C API.
+    stream: Box<z_stream>,
+}
+
+// SAFETY: calls require exclusive access, borrowed buffers are cleared after
+// each call, and the decoder owns the remaining zlib-rs state.
+unsafe impl Send for RawDeflateDecoder {}
+// SAFETY: shared access cannot call the mutable C API or expose its pointers.
+unsafe impl Sync for RawDeflateDecoder {}
+
+impl RawDeflateDecoder {
+    fn new(window_bits: u8) -> Self {
+        let mut stream = Box::new(z_stream::default());
+        // A negative window size selects raw DEFLATE, as required by RFC 7692.
+        // SAFETY: the default stream has valid allocator fields, remains at a
+        // stable address, and is not used until initialization succeeds.
+        let status = unsafe {
+            inflateInit2_(
+                &mut *stream,
+                -i32::from(window_bits),
+                zlibVersion(),
+                std::mem::size_of::<z_stream>() as i32,
+            )
+        };
+        assert_eq!(status, Z_OK, "failed to initialize DEFLATE decoder");
+        Self { stream }
+    }
+
+    fn inflate(
+        &mut self,
+        input: &[u8],
+        output: &mut [MaybeUninit<u8>],
+    ) -> Result<(Status, usize, usize)> {
+        let input = &input[..input.len().min(u32::MAX as usize)];
+        let output_len = output.len().min(u32::MAX as usize);
+        let output = &mut output[..output_len];
+        self.stream.next_in = input.as_ptr();
+        self.stream.avail_in = input.len() as u32;
+        self.stream.next_out = output.as_mut_ptr().cast();
+        self.stream.avail_out = output.len() as u32;
+
+        // SAFETY: the stream is initialized, and its input and output pointers
+        // refer to the slices above for the advertised lengths.
+        let status = unsafe { inflate(&mut *self.stream, Z_SYNC_FLUSH) };
+        let consumed = input.len() - self.stream.avail_in as usize;
+        let produced = output.len() - self.stream.avail_out as usize;
+        self.stream.next_in = std::ptr::null_mut();
+        self.stream.avail_in = 0;
+        self.stream.next_out = std::ptr::null_mut();
+        self.stream.avail_out = 0;
+
+        let status = match status {
+            Z_OK => Status::Ok,
+            Z_BUF_ERROR => Status::BufError,
+            Z_STREAM_END => Status::StreamEnd,
+            code => {
+                return Err(Error::Compression(format!(
+                    "inflate error: status code {code}"
+                )));
+            }
+        };
+        Ok((status, consumed, produced))
+    }
+
+    fn reset(&mut self, keep_window: bool) {
+        // SAFETY: the stream was initialized in new and is exclusively borrowed.
+        let status = unsafe {
+            if keep_window {
+                inflateResetKeep(&mut *self.stream)
+            } else {
+                inflateReset(&mut *self.stream)
+            }
+        };
+        assert_eq!(status, Z_OK, "failed to reset DEFLATE decoder");
+    }
+}
+
+impl Drop for RawDeflateDecoder {
+    fn drop(&mut self) {
+        // SAFETY: the stream was initialized in new and is ended exactly once.
+        let status = unsafe { inflateEnd(&mut *self.stream) };
+        debug_assert_eq!(status, Z_OK);
+    }
+}
+
 /// Deflate decompressor for incoming messages
 pub struct DeflateDecoder {
-    decompress: Decompress,
+    decompress: RawDeflateDecoder,
     no_context_takeover: bool,
-    #[allow(dead_code)]
-    window_bits: DeflateWindowBits,
 }
 
 impl DeflateDecoder {
     /// Create a new decoder
     pub fn new(window_bits: DeflateWindowBits, no_context_takeover: bool) -> Self {
         // Use raw deflate (no zlib header) with the negotiated window_bits
-        let decompress = Decompress::new_with_window_bits(false, window_bits.into());
+        let decompress = RawDeflateDecoder::new(window_bits.into());
 
         Self {
             decompress,
             no_context_takeover,
-            window_bits,
         }
     }
 
@@ -302,8 +407,9 @@ impl DeflateDecoder {
         input.extend_from_slice(data);
         input.extend_from_slice(&DEFLATE_TRAILER);
 
-        // Start with reasonable output buffer (at least 1KB or 4x input)
-        let initial_cap = std::cmp::max(1024, data.len() * 4);
+        // Start with reasonable output buffer (at least 1KB or 4x input), but
+        // never expose writable output beyond the configured message limit.
+        let initial_cap = std::cmp::max(1024, data.len().saturating_mul(4)).min(max_size);
         let mut output = BytesMut::with_capacity(initial_cap);
         let mut total_in: usize = 0;
         let mut iterations = 0u32;
@@ -317,55 +423,80 @@ impl DeflateDecoder {
                 ));
             }
 
-            // Check size limit
-            if output.len() > max_size {
-                return Err(Error::MessageTooLarge);
-            }
+            let at_limit = output.len() == max_size;
+            let offered;
+            let status;
+            let consumed;
+            let produced;
 
-            // Ensure we have space in output buffer
-            let available = output.capacity() - output.len();
-            if available == 0 {
-                if output.capacity() >= max_size {
-                    return Err(Error::MessageTooLarge);
+            if at_limit {
+                // Let inflate consume a trailer or report stream completion.
+                // Any byte produced into this probe exceeds the logical limit.
+                let mut probe = [std::mem::MaybeUninit::uninit()];
+                offered = probe.len();
+                (status, consumed, produced) =
+                    self.decompress.inflate(&input[total_in..], &mut probe)?;
+            } else {
+                // Ensure we have space in the output buffer.
+                if output.len() == output.capacity() {
+                    // At least double or add 4KB, whichever is larger. The
+                    // allocator may reserve more, so the writable slice below
+                    // is still capped explicitly.
+                    let remaining = max_size - output.len();
+                    let additional = std::cmp::max(output.capacity(), 4096).min(remaining);
+                    output.reserve(additional);
                 }
-                // At least double or add 4KB, whichever is larger
-                let additional = std::cmp::max(output.capacity(), 4096);
-                output.reserve(additional);
+
+                // Get writable slice using spare_capacity_mut to avoid UB with uninitialized memory.
+                let out_start = output.len();
+                let remaining = max_size - out_start;
+                let spare = output.spare_capacity_mut();
+                let writable = spare.len().min(remaining);
+                // Keep `offered` equal to the u32-sized output range passed to inflate.
+                let spare = &mut spare[..writable.min(u32::MAX as usize)];
+                offered = spare.len();
+                (status, consumed, produced) =
+                    self.decompress.inflate(&input[total_in..], spare)?;
+
+                // SAFETY: inflate initialized exactly `produced` bytes in the spare capacity.
+                // We're only extending the length by the number of bytes that were initialized.
+                unsafe {
+                    output.set_len(out_start + produced);
+                }
             }
-
-            let before_out = self.decompress.total_out();
-            let before_in = self.decompress.total_in();
-
-            // Get writable slice using spare_capacity_mut to avoid UB with uninitialized memory.
-            let out_start = output.len();
-            let spare = output.spare_capacity_mut();
-
-            let status = self
-                .decompress
-                .decompress_uninit(&input[total_in..], spare, FlushDecompress::Sync)
-                .map_err(|e| Error::Compression(format!("inflate error: {}", e)))?;
-
-            let consumed = (self.decompress.total_in() - before_in) as usize;
-            let produced = (self.decompress.total_out() - before_out) as usize;
 
             total_in += consumed;
 
-            // SAFETY: decompress_uninit() wrote exactly `produced` bytes to the spare capacity.
-            // We're only extending the length by the number of bytes that were initialized.
-            unsafe {
-                output.set_len(out_start + produced);
+            if at_limit && produced != 0 {
+                return Err(Error::MessageTooLarge);
             }
 
-            match status {
-                Status::Ok => {
-                    if total_in >= input.len() {
-                        break;
-                    }
+            if status == Status::StreamEnd {
+                // RFC 7692 permits BFINAL blocks. Start the next raw stream
+                // while retaining the current message's LZ77 dictionary.
+                self.decompress.reset(true);
+                if total_in >= data.len() {
+                    // The final stream either ended at the payload boundary or
+                    // consumed the synthetic trailer appended for decompression.
+                    break;
                 }
-                Status::StreamEnd => break,
-                Status::BufError => {
-                    // Need more output space - will be handled at top of loop
+                continue;
+            }
+
+            if consumed == 0 && produced == 0 {
+                if total_in < input.len() {
+                    return Err(Error::Compression(
+                        "inflate made no progress with input remaining".into(),
+                    ));
                 }
+                break;
+            }
+
+            // A full output slice can hide pending output after all input was
+            // consumed. Continue once more with fresh capacity (or the limit
+            // probe) until inflate stops filling the offered slice.
+            if total_in >= input.len() && produced < offered {
+                break;
             }
         }
 
@@ -444,20 +575,20 @@ impl DeflateContext {
 pub fn parse_deflate_offer(value: &str) -> Option<Vec<(&str, Option<&str>)>> {
     let mut parts = value.split(';');
     // Check that this is exactly a permessage-deflate offer.
-    if parts.next()?.trim() != "permessage-deflate" {
+    if trim_optional_whitespace(parts.next()?) != "permessage-deflate" {
         return None;
     }
 
     let mut params = Vec::new();
     for part in parts {
-        let part = part.trim();
+        let part = trim_optional_whitespace(part);
         if part.is_empty() {
             return None;
         }
 
         if let Some((name, value)) = part.split_once('=') {
-            let name = name.trim();
-            let value = value.trim();
+            let name = trim_optional_whitespace(name);
+            let value = trim_optional_whitespace(value);
             let value = match (value.strip_prefix('"'), value.strip_suffix('"')) {
                 (Some(value), Some(_)) => value.strip_suffix('"')?,
                 (None, None) if !value.contains('"') => value,
@@ -579,7 +710,7 @@ pub fn negotiate_server_deflate(
     policy: &DeflateConfig,
 ) -> Option<DeflateNegotiation> {
     for offer in offers.split(',') {
-        let Some(params) = parse_deflate_offer(offer.trim()) else {
+        let Some(params) = parse_deflate_offer(trim_optional_whitespace(offer)) else {
             continue;
         };
         let Ok(offer) = DeflateOffer::from_params(&params) else {
@@ -795,6 +926,10 @@ mod tests {
         assert_eq!(params[0], ("server_no_context_takeover", None));
         assert_eq!(params[1], ("server_max_window_bits", Some("10")));
 
+        let params =
+            parse_deflate_offer("permessage-deflate; server_max_window_bits=\"10\"").unwrap();
+        assert_eq!(params, [("server_max_window_bits", Some("10"))]);
+
         // Not a deflate offer
         assert!(parse_deflate_offer("some-other-extension").is_none());
     }
@@ -868,6 +1003,18 @@ mod tests {
                 .is_none()
             );
         }
+    }
+
+    #[test]
+    fn deflate_offers_do_not_trim_non_ascii_whitespace() {
+        assert!(parse_deflate_offer("\u{a0}permessage-deflate").is_none());
+        assert!(
+            negotiate_server_deflate(
+                "permessage-deflate;\u{a0}server_no_context_takeover",
+                &DeflateConfig::default(),
+            )
+            .is_none()
+        );
     }
 
     #[test]

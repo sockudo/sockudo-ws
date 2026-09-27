@@ -111,7 +111,7 @@ pub use protocol::{Message, RawMessage, Role};
 #[cfg(feature = "tokio-runtime")]
 pub use pubsub::{PubSub, PubSubState, PublishResult, SubscriberId};
 #[cfg(feature = "tokio-runtime")]
-pub use stream::{SplitReader, SplitWriter, Stream, WebSocketStream};
+pub use stream::{SplitReader, SplitWriter, Stream, WebSocketStream, init_clock};
 
 #[cfg(all(feature = "permessage-deflate", feature = "tokio-runtime"))]
 pub use stream::CompressedWebSocketStream;
@@ -183,6 +183,12 @@ pub const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 #[cfg(feature = "http2")]
 #[derive(Debug, Clone)]
 pub struct Http2Config {
+    /// Maximum HTTP/2 frame payload accepted from the peer (default: 16 KiB).
+    /// Must be in 16,384..=16,777,215. This advertises SETTINGS_MAX_FRAME_SIZE;
+    /// it does not set the WebSocket message limit or the peer's receive limit.
+    /// Larger values can reduce DATA framing overhead but retain larger connection
+    /// buffers and delay other streams sharing the connection.
+    pub max_frame_size: u32,
     /// Initial stream-level flow control window size (default: 1MB)
     pub initial_stream_window_size: u32,
     /// Initial connection-level flow control window size (default: 2MB)
@@ -194,10 +200,23 @@ pub struct Http2Config {
 }
 
 #[cfg(feature = "http2")]
+impl Http2Config {
+    pub(crate) fn validated_max_frame_size(&self) -> Result<u32> {
+        if !(16_384..=16_777_215).contains(&self.max_frame_size) {
+            return Err(Error::HandshakeFailed(
+                "HTTP/2 max_frame_size must be in 16384..=16777215",
+            ));
+        }
+        Ok(self.max_frame_size)
+    }
+}
+
+#[cfg(feature = "http2")]
 impl Default for Http2Config {
     fn default() -> Self {
         Self {
-            initial_stream_window_size: 1024 * 1024,         // 1MB
+            max_frame_size: 16_384,
+            initial_stream_window_size: 1024 * 1024, // 1MB
             initial_connection_window_size: 2 * 1024 * 1024, // 2MB
             max_concurrent_streams: 100,
             enable_connect_protocol: true,
@@ -209,15 +228,24 @@ impl Default for Http2Config {
 #[cfg(feature = "http3")]
 #[derive(Debug, Clone)]
 pub struct Http3Config {
-    /// Maximum idle timeout for QUIC connection in milliseconds (default: 30000)
+    /// Maximum idle timeout for QUIC connection in milliseconds (default: 30000).
+    /// Zero disables the local timeout; the peer can still impose its own limit.
     pub max_idle_timeout_ms: u64,
-    /// Initial stream-level flow control window size (default: 1MB)
+    /// Initial per-stream receive window size (default: 1,250,000 bytes, as in Quinn).
+    /// Must be nonzero: zero also blocks HTTP/3 control streams and request headers.
     pub initial_stream_window_size: u64,
-    /// Enable 0-RTT for faster reconnection (default: false)
+    /// Request 0-RTT support (default: false)
+    ///
+    /// The built-in HTTP/3 client and server reject `true` because their H3 layer
+    /// cannot safely restore peer settings after resumption.
     pub enable_0rtt: bool,
     /// Enable Extended CONNECT protocol for WebSocket (default: true)
     pub enable_connect_protocol: bool,
-    /// Maximum UDP payload size (default: 1350)
+    /// Maximum accepted UDP payload size (1200–65527 bytes; default: 1472, as in Quinn).
+    /// This advertised receive limit is not a fixed outgoing packet size.
+    /// Increasing it linearly increases endpoint datagram receive-buffer memory;
+    /// the multiplier depends on the runtime and platform. Each built-in Tokio
+    /// client connection creates its own endpoint.
     pub max_udp_payload_size: u16,
 }
 
@@ -226,10 +254,10 @@ impl Default for Http3Config {
     fn default() -> Self {
         Self {
             max_idle_timeout_ms: 30_000,
-            initial_stream_window_size: 1024 * 1024, // 1MB
+            initial_stream_window_size: 1_250_000, // Quinn's default stream receive window
             enable_0rtt: false,
             enable_connect_protocol: true,
-            max_udp_payload_size: 1350,
+            max_udp_payload_size: 1472,
         }
     }
 }
@@ -317,6 +345,11 @@ impl From<DeflateWindowBits> for u8 {
 /// configured compression backend supports 9-15, so valid configurations start
 /// at a 512-byte window. Larger windows provide better compression but use more
 /// memory per connection.
+///
+/// Window-specific modes constrain both endpoint directions. During server
+/// negotiation, modes below 32KB require the client to offer
+/// `client_max_window_bits`; clients that send only `permessage-deflate` remain
+/// uncompressed rather than exceeding the configured client window limit.
 ///
 /// # Memory Usage per Connection
 ///
@@ -479,8 +512,18 @@ pub struct Config {
     /// Every valid inbound frame resets this independent deadline. When it
     /// ties a Pong deadline, the more specific Pong timeout wins.
     pub idle_timeout: u32,
-    /// Maximum backpressure in bytes before dropping connection (default: 1MB)
-    /// If write buffer exceeds this, connection is closed
+    /// Queued-write backpressure threshold in bytes (default: 1 MiB).
+    /// The Tokio Sink drains pending encoded bytes before accepting another
+    /// message when this threshold is reached. One message may exceed it;
+    /// this is not an outbound message size limit or a peak memory bound.
+    /// Zero drains any pending output before accepting another message.
+    /// Split and Compio sends already drain each message before returning.
+    ///
+    /// Tokio `feed`, `send_all`, and `forward` may wait here. A blocked unified
+    /// write does not drive reads or inbound deadlines; applications must choose
+    /// their slow-consumer policy. With [`Config::write_coalescing`] enabled,
+    /// readiness drains at the smaller of this threshold and the high-water
+    /// mark (default: 64 KiB); disabling batching drains any pending output.
     pub max_backpressure: usize,
     /// Send native Pings after inbound inactivity (default: true).
     ///
@@ -497,19 +540,32 @@ pub struct Config {
     /// Close reason used when a native Pong deadline expires.
     pub pong_timeout_close_reason: String,
     /// Maximum time spent flushing a timeout/handshake Close and shutting down
-    /// the transport (default: 5 seconds, 0 = immediate best effort).
+    /// the transport (default: 5 seconds). A Tokio split `close()` starts this
+    /// budget when local closing begins, including time waiting for the shared
+    /// sink. Zero makes that path try the sink and write once without waiting.
+    /// Unified streams start one absolute budget when a local Close is queued
+    /// or a peer Close is received. It covers Close/control writes, waiting for
+    /// the peer Close, and transport shutdown; incoming traffic never resets it.
+    /// After expiry, every budget permits at most one nonwaiting transport read
+    /// across subsequent unified `next()` calls. A cancelled owned read is never
+    /// restarted. Zero also limits closing writes and shutdown to a single poll.
+    /// Deadline expiry alone preserves parsed messages in wire order. A control
+    /// write failure or timeout instead terminates immediately and may discard
+    /// undelivered Ping/data messages; accepted Close remains protected.
+    /// A poll does not guarantee completion: Compio drivers may need a runtime
+    /// turn even to write Close or shut down an otherwise writable socket.
+    /// No minimum grace period is added. Cleanup cannot
+    /// replace an accepted peer Close or an existing idle/Pong timeout error.
     pub close_timeout: u32,
-    /// Coalesce outbound frames while inbound messages are still queued
-    /// (default: true).
+    /// Enable batching across Tokio `SinkExt::feed` calls (default: true).
     ///
-    /// When the stream has already parsed more inbound messages than the
-    /// application has consumed, `poll_flush` keeps the encoded frames in the
-    /// write buffer instead of issuing a write per `send()`. Everything is
-    /// written in one vectored write before the stream next waits for the
-    /// transport, or as soon as the buffer reaches the high water mark. This
-    /// turns a read batch of N messages answered with N `send()` calls into
-    /// one syscall instead of N. Disable for strict "returned means written"
-    /// semantics on every `send()`.
+    /// Readiness drains at the smaller of the high-water mark and
+    /// [`Config::max_backpressure`] before accepting another message. Disabling
+    /// batching drains any pending output before accepting another message.
+    /// `SinkExt::send` and `SinkExt::flush` always flush regardless of this
+    /// setting. Use `feed` followed by `flush` at batch boundaries, before
+    /// waiting for replies or pausing reads. The read path also flushes before
+    /// waiting for more transport input. One message may exceed either threshold.
     pub write_coalescing: bool,
     /// Per-message deflate configuration (requires `permessage-deflate` feature)
     #[cfg(feature = "permessage-deflate")]
@@ -686,8 +742,7 @@ impl ConfigBuilder {
         self
     }
 
-    /// Enable or disable coalescing of outbound frames across `send()` calls
-    /// while inbound messages are still queued (see
+    /// Enable or disable batching across Tokio `SinkExt::feed` calls (see
     /// [`Config::write_coalescing`]).
     pub fn write_coalescing(mut self, enabled: bool) -> Self {
         self.config.write_coalescing = enabled;
@@ -730,6 +785,16 @@ impl ConfigBuilder {
         self
     }
 
+    /// Advertise the largest HTTP/2 frame payload accepted from the peer.
+    /// The valid range is 16,384..=16,777,215; invalid values fail the handshake.
+    /// Defaults to 16 KiB. Larger frames trade framing overhead for memory and
+    /// latency of other streams on the same connection.
+    #[cfg(feature = "http2")]
+    pub fn http2_max_frame_size(mut self, size: u32) -> Self {
+        self.config.http2.max_frame_size = size;
+        self
+    }
+
     /// Set HTTP/2 maximum concurrent streams
     #[cfg(feature = "http2")]
     pub fn http2_max_streams(mut self, count: u32) -> Self {
@@ -748,21 +813,27 @@ impl ConfigBuilder {
     // HTTP/3 Configuration Methods
     // ========================================================================
 
-    /// Set HTTP/3 maximum idle timeout in milliseconds
+    /// Set HTTP/3 maximum idle timeout in milliseconds.
+    /// Values exceeding the QUIC variable-integer range are rejected when
+    /// creating a built-in endpoint; zero disables the local timeout.
     #[cfg(feature = "http3")]
     pub fn http3_idle_timeout(mut self, ms: u64) -> Self {
         self.config.http3.max_idle_timeout_ms = ms;
         self
     }
 
-    /// Set HTTP/3 initial stream window size
+    /// Set HTTP/3 initial stream window size.
+    /// Zero and values exceeding the QUIC variable-integer range are rejected
+    /// when creating a built-in endpoint.
     #[cfg(feature = "http3")]
     pub fn http3_stream_window_size(mut self, size: u64) -> Self {
         self.config.http3.initial_stream_window_size = size;
         self
     }
 
-    /// Enable or disable HTTP/3 0-RTT
+    /// Request HTTP/3 0-RTT support.
+    /// The built-in client and server reject `true`; their H3 layer cannot
+    /// safely restore peer settings after resumption.
     #[cfg(feature = "http3")]
     pub fn http3_enable_0rtt(mut self, enabled: bool) -> Self {
         self.config.http3.enable_0rtt = enabled;
@@ -776,7 +847,9 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set HTTP/3 maximum UDP payload size
+    /// Set HTTP/3 maximum accepted UDP payload size (1200–65527 bytes).
+    /// Values outside this range are rejected when creating a built-in endpoint.
+    /// Larger values linearly increase endpoint receive-buffer memory.
     #[cfg(feature = "http3")]
     pub fn http3_max_udp_payload_size(mut self, size: u16) -> Self {
         self.config.http3.max_udp_payload_size = size;

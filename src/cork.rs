@@ -100,6 +100,12 @@ impl CorkBuffer {
         !self.buffer.is_empty() || !self.segments.is_empty()
     }
 
+    /// Whether writing requires traversing separately owned segments.
+    #[inline]
+    pub(crate) fn has_segments(&self) -> bool {
+        !self.segments.is_empty()
+    }
+
     /// Get total pending bytes
     #[inline]
     pub fn pending_bytes(&self) -> usize {
@@ -352,6 +358,7 @@ mod tests {
         assert_eq!(slices.len(), 3);
         assert_eq!(&slices[0][..], b"header");
         assert_eq!(slices[1].len(), ZERO_COPY_MIN);
+        assert_eq!(slices[1].as_ptr(), big.as_ptr());
         assert_eq!(&slices[2][..], b"next frame");
         assert_eq!(cork.pending_bytes(), 6 + ZERO_COPY_MIN + 10);
 
