@@ -7,6 +7,14 @@ repository = "https://github.com/sockudo/sockudo-ws"
 description = "Ultra-low latency WebSocket library for HFT applications"
 license = "MIT"
 
+[lints.clippy]
+dbg_macro = "warn"
+redundant_clone = "warn"
+needless_collect = "warn"
+cloned_instead_of_copied = "warn"
+implicit_clone = "warn"
+large_futures = "warn"
+
 [lib]
 name = "sockudo_ws"
 path = "src/lib.rs"
@@ -305,6 +313,7 @@ strip = true
 opt-level = 3
 lto = "thin"
 debug = true
+strip = false
 
 [[example]]
 name = "send_latency_diagnostic"

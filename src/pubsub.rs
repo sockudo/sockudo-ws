@@ -1020,8 +1020,7 @@ mod tests {
 
         // Note: IDs might be the same if called in quick succession,
         // but they should have the format "number.number"
-        let parts: Vec<&str> = id1.split('.').collect();
-        assert_eq!(parts.len(), 2);
+        assert_eq!(id1.split('.').count(), 2);
     }
 
     #[test]
@@ -1049,6 +1048,10 @@ mod tests {
     fn concurrent_duplicate_socket_id_creates_exactly_one_subscriber() {
         let pubsub = Arc::new(PubSub::new());
         let barrier = Arc::new(Barrier::new(3));
+        #[expect(
+            clippy::needless_collect,
+            reason = "all threads must start before the parent waits on the barrier"
+        )]
         let handles: Vec<_> = (0..2)
             .map(|_| {
                 let pubsub = Arc::clone(&pubsub);
@@ -1077,6 +1080,10 @@ mod tests {
     fn concurrent_idempotent_socket_id_creation_returns_one_subscriber() {
         let pubsub = Arc::new(PubSub::new());
         let barrier = Arc::new(Barrier::new(3));
+        #[expect(
+            clippy::needless_collect,
+            reason = "all threads must start before the parent waits on the barrier"
+        )]
         let handles: Vec<_> = (0..2)
             .map(|_| {
                 let pubsub = Arc::clone(&pubsub);

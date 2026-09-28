@@ -1187,7 +1187,7 @@ impl SplitShared {
         // wins, even if another task terminates before watch notification.
         if self
             .status
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |status| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |status| {
                 (status < SPLIT_CLOSED).then_some(cause as u8)
             })
             .is_ok()
