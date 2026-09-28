@@ -51,6 +51,8 @@ mod tokio_http2_e2e {
                     let msg = ws.next().await.unwrap().unwrap();
                     assert!(matches!(&msg, Message::Text(text) if text == "tokio-h2"));
                     ws.send(msg).await.unwrap();
+                    // End the H2 send stream before dropping it, retaining queued DATA.
+                    ws.close(1000, "").await.unwrap();
                 })
                 .await
                 .unwrap();
@@ -71,6 +73,7 @@ mod tokio_http2_e2e {
         let echoed = ws.next().await.unwrap().unwrap();
         assert!(matches!(echoed, Message::Text(text) if text == "tokio-h2"));
 
+        assert!(matches!(ws.next().await, Some(Ok(Message::Close(_)))));
         drop(ws);
         server_task.await.unwrap();
     }
@@ -87,6 +90,8 @@ mod tokio_http2_e2e {
                     assert!(matches!(req.path.as_str(), "/one" | "/two"));
                     let msg = ws.next().await.unwrap().unwrap();
                     ws.send(msg).await.unwrap();
+                    // End the H2 send stream before dropping it, retaining queued DATA.
+                    ws.close(1000, "").await.unwrap();
                 })
                 .await
                 .unwrap();
@@ -113,6 +118,8 @@ mod tokio_http2_e2e {
         let echoed = two.next().await.unwrap().unwrap();
         assert!(matches!(echoed, Message::Text(text) if text == "two"));
 
+        assert!(matches!(one.next().await, Some(Ok(Message::Close(_)))));
+        assert!(matches!(two.next().await, Some(Ok(Message::Close(_)))));
         drop(one);
         drop(two);
         drop(mux);
@@ -273,6 +280,8 @@ mod compio_http2_e2e {
                 let msg = ws.next().await.unwrap().unwrap();
                 assert!(matches!(&msg, Message::Binary(data) if data.len() == LARGE_PAYLOAD_SIZE));
                 ws.send(msg).await.unwrap();
+                // End the H2 send stream before dropping it, retaining queued DATA.
+                ws.close(1000, "").await.unwrap();
             })
             .await
             .unwrap();
@@ -298,6 +307,7 @@ mod compio_http2_e2e {
         let echoed = ws.next().await.unwrap().unwrap();
         assert!(matches!(echoed, Message::Binary(data) if data.as_ref() == payload));
 
+        assert!(matches!(ws.next().await, Some(Ok(Message::Close(_)))));
         drop(ws);
         server_task.await.unwrap();
     }
@@ -313,6 +323,8 @@ mod compio_http2_e2e {
                 assert!(matches!(req.path.as_str(), "/one" | "/two"));
                 let msg = ws.next().await.unwrap().unwrap();
                 ws.send(msg).await.unwrap();
+                // End the H2 send stream before dropping it, retaining queued DATA.
+                ws.close(1000, "").await.unwrap();
             })
             .await
             .unwrap();
@@ -340,6 +352,8 @@ mod compio_http2_e2e {
         let echoed = two.next().await.unwrap().unwrap();
         assert!(matches!(echoed, Message::Text(text) if text == "two"));
 
+        assert!(matches!(one.next().await, Some(Ok(Message::Close(_)))));
+        assert!(matches!(two.next().await, Some(Ok(Message::Close(_)))));
         drop(one);
         drop(two);
         drop(mux);

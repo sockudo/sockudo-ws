@@ -111,6 +111,8 @@ pub fn tokio_http2(c: &mut Criterion) {
                                         let message = ws.next().await.unwrap().unwrap();
                                         ws.send(message).await.unwrap();
                                     }
+                                    // Preserve queued DATA when the handler finishes.
+                                    ws.close(1000, "").await.unwrap();
                                 })
                                 .await
                                 .unwrap();
@@ -124,6 +126,7 @@ pub fn tokio_http2(c: &mut Criterion) {
                             .await
                             .unwrap();
                             let elapsed = exchange!(ws, message, iterations);
+                            assert!(matches!(ws.next().await, Some(Ok(Message::Close(_)))));
                             drop(ws);
                             peer.await.unwrap();
                             elapsed
@@ -273,6 +276,8 @@ pub fn compio_http2(c: &mut Criterion) {
                                             let message = ws.next().await.unwrap().unwrap();
                                             ws.send(message).await.unwrap();
                                         }
+                                        // Preserve queued DATA when the handler finishes.
+                                        ws.close(1000, "").await.unwrap();
                                     },
                                 )
                                 .await
@@ -289,6 +294,7 @@ pub fn compio_http2(c: &mut Criterion) {
                             .await
                             .unwrap();
                             let elapsed = exchange!(ws, message, iterations);
+                            assert!(matches!(ws.next().await, Some(Ok(Message::Close(_)))));
                             drop(ws);
                             peer.await.unwrap();
                             elapsed

@@ -3975,6 +3975,8 @@ mod tests {
                 let msg = ws.next().await.unwrap().unwrap();
                 assert!(matches!(&msg, Message::Text(text) if text == "h2"));
                 ws.send(msg).await.unwrap();
+                // End the H2 send stream before dropping it, retaining queued DATA.
+                ws.close(1000, "").await.unwrap();
             })
             .await
             .unwrap();
@@ -3993,6 +3995,7 @@ mod tests {
         client.send_text("h2").await.unwrap();
         let echoed = client.next().await.unwrap().unwrap();
         assert!(matches!(echoed, Message::Text(text) if text == "h2"));
+        assert!(matches!(client.next().await, Some(Ok(Message::Close(_)))));
         drop(client);
 
         server.await.unwrap();
@@ -4010,6 +4013,8 @@ mod tests {
                 assert!(matches!(req.path.as_str(), "/one" | "/two"));
                 let msg = ws.next().await.unwrap().unwrap();
                 ws.send(msg).await.unwrap();
+                // End the H2 send stream before dropping it, retaining queued DATA.
+                ws.close(1000, "").await.unwrap();
             })
             .await
             .unwrap();
@@ -4037,6 +4042,8 @@ mod tests {
         let echoed = two.next().await.unwrap().unwrap();
         assert!(matches!(echoed, Message::Text(text) if text == "two"));
 
+        assert!(matches!(one.next().await, Some(Ok(Message::Close(_)))));
+        assert!(matches!(two.next().await, Some(Ok(Message::Close(_)))));
         drop(one);
         drop(two);
         drop(mux);

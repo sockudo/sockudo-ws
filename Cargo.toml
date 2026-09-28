@@ -140,7 +140,7 @@ parking_lot = "^0.12"
 
 # Axum integration
 axum = { version = "^0.8", optional = true }
-hyper = { version = "^1.0", optional = true }
+hyper = { version = "^1.11", optional = true }
 hyper-util = { version = "^0.1", features = ["tokio"], optional = true }
 
 # HTTP parsing
@@ -225,7 +225,7 @@ tokio = { version = "^1.53", features = ["full", "test-util"] }
 tokio-tungstenite = "^0.30"
 futures-util = "^0.3"
 axum = "^0.8"
-hyper = { version = "^1.0", features = ["full"] }
+hyper = { version = "^1.11", features = ["full"] }
 hyper-util = { version = "^0.1", features = ["tokio"] }
 rcgen = "^0.13"
 rustls = { version = "^0.23", default-features = false, features = ["ring", "std"] }
