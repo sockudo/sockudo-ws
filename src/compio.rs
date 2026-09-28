@@ -1552,7 +1552,8 @@ where
         let heartbeat = Heartbeat::new(&config, 0);
         Self {
             inner,
-            protocol: Protocol::new(role, config.max_frame_size, config.max_message_size),
+            protocol: Protocol::new(role, config.max_frame_size, config.max_message_size)
+                .with_text_utf8_validation(config.validate_text_utf8),
             read_buf,
             write_buf: BytesMut::with_capacity(config.write_buffer_size),
             state: CompioStreamState::Open,
@@ -2952,7 +2953,8 @@ where
                 config.max_frame_size,
                 config.max_message_size,
                 deflate_config,
-            ),
+            )
+            .with_text_utf8_validation(config.validate_text_utf8),
             read_buf,
             write_buf: BytesMut::with_capacity(config.write_buffer_size),
             state: CompioStreamState::Open,
@@ -2996,7 +2998,8 @@ where
                 config.max_frame_size,
                 config.max_message_size,
                 deflate_config,
-            ),
+            )
+            .with_text_utf8_validation(config.validate_text_utf8),
             read_buf,
             write_buf: BytesMut::with_capacity(config.write_buffer_size),
             state: CompioStreamState::Open,

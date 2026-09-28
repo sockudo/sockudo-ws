@@ -132,7 +132,8 @@ where
         config: Config,
         leftover: Option<Bytes>,
     ) -> Self {
-        let protocol = Protocol::new(role, config.max_frame_size, config.max_message_size);
+        let protocol = Protocol::new(role, config.max_frame_size, config.max_message_size)
+            .with_text_utf8_validation(config.validate_text_utf8);
         let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);
         if let Some(leftover) = leftover {
             read_buf.extend_from_slice(&leftover);
@@ -2198,7 +2199,8 @@ where
             config.max_frame_size,
             config.max_message_size,
             deflate_config,
-        );
+        )
+        .with_text_utf8_validation(config.validate_text_utf8);
 
         let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);
         if let Some(leftover) = leftover {
@@ -2253,7 +2255,8 @@ where
             config.max_frame_size,
             config.max_message_size,
             deflate_config,
-        );
+        )
+        .with_text_utf8_validation(config.validate_text_utf8);
 
         let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);
         if let Some(leftover) = leftover {

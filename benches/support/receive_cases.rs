@@ -24,6 +24,7 @@ pub struct Case {
     pub timers: bool,
     pub server: bool,
     pub text: bool,
+    pub validate_text_utf8: bool,
     pub window: bool,
     pub control: bool,
     pub cut: Option<Cut>,
@@ -44,6 +45,7 @@ pub fn cases(runtime: Runtime, kind: Kind) -> Vec<Case> {
         timers,
         server,
         text,
+        validate_text_utf8: true,
         window: false,
         control: false,
         cut: None,
@@ -76,6 +78,16 @@ pub fn cases(runtime: Runtime, kind: Kind) -> Vec<Case> {
         },
         make("extended/timers_off", 32, 1, true, false, false),
     ];
+    for (name, enabled) in [
+        ("extended/text_utf8_on", true),
+        ("extended/text_utf8_off", false),
+    ] {
+        for size in [256, 4096] {
+            let mut case = make(name, size, 16, false, true, false);
+            case.validate_text_utf8 = enabled;
+            cases.push(case);
+        }
+    }
     for (name, limit, pending, cut) in [
         ("extended/read1", 1, false, None),
         (
@@ -187,7 +199,7 @@ impl Case {
         }
     }
     pub fn config(&self) -> Config {
-        if self.timers {
+        let mut config = if self.timers {
             Config::builder()
                 .auto_ping(true)
                 .ping_interval(3600)
@@ -195,7 +207,9 @@ impl Case {
                 .build()
         } else {
             Config::builder().auto_ping(false).idle_timeout(0).build()
-        }
+        };
+        config.validate_text_utf8 = self.validate_text_utf8;
+        config
     }
     pub fn fixture(&self, compressed: bool) -> (Input, Vec<Bytes>) {
         let mut wire = BytesMut::new();

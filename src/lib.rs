@@ -498,6 +498,14 @@ impl Compression {
 /// ```
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Validate incoming Text payloads as UTF-8 (default: true).
+    ///
+    /// Disabling this relaxes RFC 6455 text validation: received `Message::Text`
+    /// payloads may contain invalid UTF-8. Consumers must validate bytes before
+    /// using unchecked string conversions. Close reasons remain validated, and
+    /// `Message::as_text` and `Message::into_text` still check their input.
+    /// This setting is fixed when the connection is constructed.
+    pub validate_text_utf8: bool,
     /// Maximum message size (default: 64MB)
     /// Equivalent to uWS maxPayloadLength
     pub max_message_size: usize,
@@ -586,6 +594,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            validate_text_utf8: true,
             max_message_size: 64 * 1024 * 1024,
             max_frame_size: 16 * 1024 * 1024,
             write_buffer_size: CORK_BUFFER_SIZE,
@@ -620,6 +629,7 @@ impl Config {
     /// Create config with uWebSockets-style defaults
     pub fn uws_defaults() -> Self {
         Self {
+            validate_text_utf8: true,
             max_message_size: 16 * 1024,
             max_frame_size: 16 * 1024,
             write_buffer_size: CORK_BUFFER_SIZE,
@@ -660,6 +670,12 @@ impl ConfigBuilder {
         Self {
             config: Config::default(),
         }
+    }
+
+    /// Configure incoming Text validation; see [`Config::validate_text_utf8`].
+    pub fn validate_text_utf8(mut self, enabled: bool) -> Self {
+        self.config.validate_text_utf8 = enabled;
+        self
     }
 
     /// Set compression mode
