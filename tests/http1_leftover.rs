@@ -171,3 +171,34 @@ async fn http1_server_replays_frame_after_large_valid_request_header() {
         Some(Ok(Message::Binary(payload))) if payload.len() == 4096 && payload.iter().all(|byte| *byte == b'x')
     ));
 }
+
+#[tokio::test]
+async fn http1_split_client_honors_disabled_validation_for_upgrade_leftover() {
+    let (client_io, mut server_io) = tokio::io::duplex(4096);
+    let server = tokio::spawn(async move {
+        let request = String::from_utf8(read_http_request(&mut server_io).await).unwrap();
+        let accept = generate_accept_key(extract_header(&request, "Sec-WebSocket-Key").unwrap());
+        let mut response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        ).into_bytes();
+        response.extend_from_slice(b"\x81\x01\xff");
+        server_io.write_all(&response).await.unwrap();
+        server_io
+    });
+    let client = WebSocketClient::<Http1>::new(
+        Config::builder()
+            .validate_text_utf8(false)
+            .auto_ping(false)
+            .build(),
+    );
+    let (websocket, handshake) = client
+        .connect(client_io, "example.com", "/ws", None)
+        .await
+        .unwrap();
+    assert_eq!(handshake.leftover.as_deref(), Some(&b"\x81\x01\xff"[..]));
+    let (mut reader, _writer) = websocket.split();
+    let message = reader.next().await.unwrap().unwrap();
+    assert!(message.is_text());
+    assert_eq!(message.as_bytes(), b"\xff");
+    let _server_io = server.await.unwrap();
+}

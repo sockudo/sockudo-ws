@@ -745,6 +745,20 @@ let config = Config::builder()
 let config = Config::uws_defaults();
 ```
 
+### Incoming text validation
+
+Text payloads are UTF-8 validated by default. To receive their original bytes without validation, configure the connection before construction:
+
+```rust
+let config = sockudo_ws::Config::builder()
+    .validate_text_utf8(false)
+    .build();
+```
+
+This applies to Tokio and Compio, unified and split readers, and compressed or uncompressed Text messages. `Message::Text(Bytes)` then identifies the wire opcode, not a UTF-8 guarantee. Disabling validation relaxes RFC 6455 §8.1 handling; validate bytes before any unchecked string conversion. In particular, a parser that previously relied on receive-time validation cannot safely retain that assumption. Relaying invalid Text bytes can cause strict peers to close their connections.
+
+Use `as_bytes()`, `text_bytes()`, or `into_bytes()` for byte processing. `as_text()` and `into_text()` still validate and return `None` for invalid UTF-8. Close reasons, frame and message limits, and other protocol checks remain enforced. Binary messages and outbound validation behavior are unaffected. `from_raw_with_leftover` means an already-upgraded transport, not disabled validation; it honors this configuration from the first leftover byte.
+
 ### HTTP/2 Configuration
 
 ```rust
@@ -767,6 +781,7 @@ let config = Config::builder()
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `validate_text_utf8` | true | Validate incoming Text, including fragmented and decompressed messages; Close reasons always validated |
 | `compression` | `Disabled` | Compression mode |
 | `max_message_size` | 64MB | Maximum message size |
 | `max_frame_size` | 16MB | Maximum single frame size |

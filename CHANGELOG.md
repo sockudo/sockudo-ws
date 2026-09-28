@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add connection-level `Config::validate_text_utf8` and builder method (default `true`). Disabling it delivers unvalidated Text bytes through normal Tokio/Compio unified and split readers, including compressed connections; Close reasons and checked text accessors remain validated. Consumers using unchecked string conversion must establish UTF-8 validity independently. **Breaking for exhaustive struct literals:** initialize the new field or use `..Config::default()`.
 - `init_clock()` allows applications to initialize the Tokio connection clock before constructing their runtime. The `test-util` feature selects Tokio virtual time for paused-time tests and is excluded from `full`.
 - **Breaking for exhaustive struct literals:** `Http2Config::max_frame_size` and `ConfigBuilder::http2_max_frame_size` configure the advertised HTTP/2 receive frame limit on Tokio and Compio endpoints. The default remains 16 KiB; values outside 16,384–16,777,215 return a handshake error. Larger settings trade framing overhead for receive memory and latency of other streams.
 - Compressed Tokio streams now accept post-handshake frame bytes through `client_with_leftover` and `server_with_leftover`, including when split before the first read; existing constructors continue to start with an empty receive buffer.

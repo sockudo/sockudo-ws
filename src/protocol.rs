@@ -28,10 +28,11 @@ pub enum Role {
 /// WebSocket message (complete, possibly assembled from fragments)
 ///
 /// Text messages use `Bytes` internally for zero-copy efficiency.
-/// Parsing validates UTF-8; text accessors also check publicly constructed payloads.
+/// Parsing validates UTF-8 unless [`crate::Config::validate_text_utf8`] is disabled.
+/// Text accessors also check received and publicly constructed payloads.
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// Text message (validated when parsed, stored as Bytes for zero-copy)
+    /// Text message (stored as Bytes; validation depends on the receive configuration)
     Text(Bytes),
     /// Binary message
     Binary(Bytes),
@@ -167,12 +168,14 @@ impl Message {
     /// Get message as text (returns None for non-text or invalid UTF-8 messages)
     ///
     /// This is zero-copy - it returns a reference to the underlying bytes.
-    /// Publicly constructed Text payloads are checked before returning a string.
+    /// Publicly constructed Text payloads and unvalidated received payloads are
+    /// checked before returning a string.
     #[inline]
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Message::Text(b) => {
-                // Public Text variants can bypass the parser's UTF-8 validation.
+                // Public Text variants can bypass the parser's UTF-8 validation,
+                // and connections can disable receive-time validation.
                 simdutf8::basic::from_utf8(b).ok()
             }
             _ => None,
@@ -197,7 +200,8 @@ impl Message {
     pub fn into_text(self) -> Option<String> {
         match self {
             Message::Text(b) => {
-                // Public Text variants can bypass the parser's UTF-8 validation.
+                // Public Text variants can bypass the parser's UTF-8 validation,
+                // and connections can disable receive-time validation.
                 simdutf8::basic::from_utf8(&b).ok().map(str::to_owned)
             }
             _ => None,
@@ -274,6 +278,8 @@ enum State {
 ///
 /// Handles frame parsing, message assembly, and control frame processing.
 pub struct Protocol {
+    /// Whether ordinary receive processing validates Text payloads.
+    validate_text_utf8: bool,
     /// Endpoint role
     pub(crate) role: Role,
     /// Current state
@@ -304,6 +310,7 @@ impl Protocol {
 
         Self {
             role,
+            validate_text_utf8: true,
             state: State::Open,
             parser: FrameParser::new(max_frame_size, expect_masked),
             fragment_buf: BytesMut::new(),
@@ -314,6 +321,13 @@ impl Protocol {
             utf8: Utf8Stream::new(),
             partial_checked: 0,
         }
+    }
+
+    /// Apply the connection's policy before processing any input.
+    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime", test))]
+    pub(crate) fn with_text_utf8_validation(mut self, enabled: bool) -> Self {
+        self.validate_text_utf8 = enabled;
+        self
     }
 
     /// Keep receive progress in the reader and only copy control state to the writer.
@@ -335,6 +349,9 @@ impl Protocol {
     /// text validation to a single linear pass however the message is chopped.
     #[inline]
     fn prevalidate_partial_text(&mut self, buf: &BytesMut) -> Result<()> {
+        if !self.validate_text_utf8 {
+            return Ok(());
+        }
         let Some(pending) = self.parser.pending_payload() else {
             return Ok(());
         };
@@ -466,12 +483,12 @@ impl Protocol {
 
     /// Process incoming data and return complete raw messages.
     ///
-    /// Unlike [`Protocol::process`], this path does not validate text payloads
-    /// as UTF-8. It is useful for low-level adapters that only need to proxy or
-    /// echo frames and want to avoid extra payload scans. If typed processing
-    /// resumes before a fragmented text message ends, it validates the bytes
-    /// accumulated by raw calls as well as the new typed input. A message
-    /// completed through the raw API remains unvalidated.
+    /// This path never validates text payloads as UTF-8, independently of the
+    /// ordinary receive policy. It is useful for low-level adapters that only
+    /// need to proxy or echo frames and want to avoid extra payload scans. If
+    /// validated typed processing resumes before a fragmented text message
+    /// ends, it validates bytes accumulated by raw calls as well as the new
+    /// typed input. A message completed through the raw API remains unvalidated.
     #[inline]
     pub fn process_raw(&mut self, buf: &mut BytesMut) -> Result<Vec<RawMessage>> {
         let mut messages = Vec::new();
@@ -535,6 +552,11 @@ impl Protocol {
 
     /// Handle text frame
     fn handle_text(&mut self, frame: Frame, prevalidated: usize) -> Result<Option<Message>> {
+        if !self.validate_text_utf8 {
+            return self
+                .handle_raw_text(frame)
+                .map(|message| message.map(raw_data_message));
+        }
         if self.fragment_opcode.is_some() {
             return Err(Error::Protocol("expected continuation frame"));
         }
@@ -613,6 +635,11 @@ impl Protocol {
         frame: Frame,
         prevalidated: usize,
     ) -> Result<Option<Message>> {
+        if !self.validate_text_utf8 {
+            return self
+                .handle_raw_continuation(frame)
+                .map(|message| message.map(raw_data_message));
+        }
         let opcode = self
             .fragment_opcode
             .ok_or(Error::Protocol("unexpected continuation frame"))?;
@@ -932,6 +959,13 @@ impl CompressedProtocol {
         }
     }
 
+    /// Apply the connection's policy before processing any input.
+    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime", test))]
+    pub(crate) fn with_text_utf8_validation(mut self, enabled: bool) -> Self {
+        self.inner.validate_text_utf8 = enabled;
+        self
+    }
+
     /// Check if connection is closed
     #[inline]
     pub fn is_closed(&self) -> bool {
@@ -1049,10 +1083,10 @@ impl CompressedProtocol {
                 frame.payload
             };
 
-            if !validate_utf8(&payload) {
+            if self.inner.validate_text_utf8 && !validate_utf8(&payload) {
                 return Err(Error::InvalidUtf8);
             }
-            // Zero-copy: just return the Bytes directly (already UTF-8 validated)
+            // Zero-copy: return the Bytes directly after the configured text validation.
             Ok(Some(Message::Text(payload)))
         } else {
             // Start of fragmented message
@@ -1065,13 +1099,10 @@ impl CompressedProtocol {
             }
             self.fragment_compressed = compressed;
 
-            // For compressed fragments, store as binary (don't validate UTF-8 yet)
-            // We'll decompress and validate when the message is complete
-            if compressed {
-                self.inner
-                    .start_fragment(OpCode::Binary, frame.payload, 0)?;
-                // Override the opcode back to Text for proper handling
-                self.inner.fragment_opcode = Some(OpCode::Text);
+            // Compressed bytes cannot be validated until decompression at completion.
+            // Raw fragment storage also preserves Text without validation when disabled.
+            if compressed || !self.inner.validate_text_utf8 {
+                self.inner.start_raw_fragment(OpCode::Text, frame.payload)?;
             } else {
                 self.inner.start_fragment(OpCode::Text, frame.payload, 0)?;
             }
@@ -1143,10 +1174,10 @@ impl CompressedProtocol {
 
         match opcode {
             OpCode::Text => {
-                if !validate_utf8(&data) {
+                if self.inner.validate_text_utf8 && !validate_utf8(&data) {
                     return Err(Error::InvalidUtf8);
                 }
-                // Zero-copy: just return the Bytes directly (already UTF-8 validated)
+                // Zero-copy: return the Bytes directly after the configured text validation.
                 Ok(Some(Message::Text(data)))
             }
             OpCode::Binary => Ok(Some(Message::Binary(data))),
@@ -1220,6 +1251,7 @@ impl CompressedProtocol {
 
         // Keep parser and fragment state already consumed by the unified stream.
         let reader = CompressedReaderProtocol {
+            validate_text_utf8: self.inner.validate_text_utf8,
             role,
             parser: self.inner.parser,
             fragment_buf: self.inner.fragment_buf,
@@ -1244,6 +1276,8 @@ impl CompressedProtocol {
 /// Contains the decoder and frame parser for reading compressed messages.
 #[cfg(feature = "permessage-deflate")]
 pub struct CompressedReaderProtocol {
+    /// Text validation policy retained from the unified protocol when split.
+    validate_text_utf8: bool,
     /// Endpoint role
     role: Role,
     /// Frame parser
@@ -1265,6 +1299,7 @@ impl CompressedReaderProtocol {
     /// Create a new reader protocol for server role
     pub fn server(max_frame_size: usize, max_message_size: usize, config: &DeflateConfig) -> Self {
         Self {
+            validate_text_utf8: true,
             role: Role::Server,
             parser: FrameParser::new(max_frame_size, true),
             fragment_buf: BytesMut::new(),
@@ -1281,6 +1316,7 @@ impl CompressedReaderProtocol {
     /// Create a new reader protocol for client role
     pub fn client(max_frame_size: usize, max_message_size: usize, config: &DeflateConfig) -> Self {
         Self {
+            validate_text_utf8: true,
             role: Role::Client,
             parser: FrameParser::new(max_frame_size, false),
             fragment_buf: BytesMut::new(),
@@ -1369,7 +1405,7 @@ impl CompressedReaderProtocol {
                 frame.payload
             };
 
-            if !validate_utf8(&payload) {
+            if self.validate_text_utf8 && !validate_utf8(&payload) {
                 return Err(Error::InvalidUtf8);
             }
             Ok(Some(Message::Text(payload)))
@@ -1449,7 +1485,7 @@ impl CompressedReaderProtocol {
 
         match opcode {
             OpCode::Text => {
-                if !validate_utf8(&data) {
+                if self.validate_text_utf8 && !validate_utf8(&data) {
                     return Err(Error::InvalidUtf8);
                 }
                 Ok(Some(Message::Text(data)))
@@ -1602,6 +1638,18 @@ fn ensure_message_size(size: usize, max_message_size: usize) -> Result<()> {
     Ok(())
 }
 
+// This conversion only receives outputs of raw data-frame handlers, which
+// cannot produce control messages.
+fn raw_data_message(message: RawMessage) -> Message {
+    match message {
+        RawMessage::Text(payload) => Message::Text(payload),
+        RawMessage::Binary(payload) => Message::Binary(payload),
+        RawMessage::Ping(_) | RawMessage::Pong(_) | RawMessage::Close(_) => {
+            unreachable!("raw data-frame handler returned a control message")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1704,3 +1752,6 @@ mod tests {
         assert!(matches!(validated, Err(Error::InvalidUtf8)));
     }
 }
+
+#[cfg(test)]
+mod utf8_option_tests;
