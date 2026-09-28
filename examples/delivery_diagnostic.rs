@@ -469,7 +469,8 @@ fn check_wake_forwarding() {
     let counter = Arc::new(Counter(std::sync::atomic::AtomicUsize::new(0)));
     let trace = Arc::new(WakeTrace {
         parent: Waker::from(counter.clone()),
-        epoch: Instant::now(),
+        // Zero denotes no recorded wake; immediate elapsed() can be zero at clock resolution.
+        epoch: Instant::now() - Duration::from_secs(1),
         first_wake_ns: AtomicU64::new(0),
     });
     let waker = Waker::from(trace.clone());
@@ -482,11 +483,8 @@ fn check_wake_forwarding() {
 }
 
 fn main() {
-    // Cargo passes --bench to harness-free benchmark executables.
-    let args: Vec<_> = std::env::args()
-        .skip(1)
-        .filter(|arg| arg != "--bench")
-        .collect();
+    sockudo_ws::init_clock();
+    let args: Vec<_> = std::env::args().skip(1).collect();
     let values: Vec<usize> = if args == ["--test"] {
         check_wake_forwarding();
         vec![1, 0, 1, 16, 1_000]

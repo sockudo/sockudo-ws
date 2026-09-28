@@ -5,9 +5,9 @@
 
 use bytes::BytesMut;
 use criterion::measurement::WallTime;
-use criterion::{BatchSize, BenchmarkGroup, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkGroup, Criterion};
 use sockudo_ws::deflate::{DeflateConfig, DeflateEncoder, MAX_WINDOW_BITS};
-use sockudo_ws::frame::{FrameParser, OpCode, encode_frame, encode_frame_with_rsv};
+use sockudo_ws::frame::{OpCode, encode_frame, encode_frame_with_rsv};
 use sockudo_ws::protocol::{
     CompressedProtocol, CompressedReaderProtocol, Message, Protocol, RawMessage, Role,
 };
@@ -44,31 +44,14 @@ fn verify_messages(messages: Vec<Message>, opcode: OpCode, payload: &[u8]) {
     assert_eq!(messages[0].as_bytes(), payload);
 }
 
-fn bench_receive_limits(c: &mut Criterion) {
-    let mut group = c.benchmark_group("receive_limits");
+pub fn bench_receive_limits(c: &mut Criterion) {
+    let mut group = c.benchmark_group("protocol/extended/receive_limits");
     for masked in [false, true] {
         let direction = if masked { "masked" } else { "unmasked" };
         let role = if masked { Role::Server } else { Role::Client };
         let mask = masked.then_some([7, 13, 19, 23]);
-        for size in [64, 125, 126, 4096] {
-            let payload = vec![b'x'; size];
-            let mut wire = BytesMut::new();
-            encode_frame(&mut wire, OpCode::Binary, &payload, true, mask);
-            let mut parser = FrameParser::new(1 << 20, masked);
-            measure(
-                &mut group,
-                format!("{direction}_frame_{size}"),
-                &wire,
-                |input| parser.parse(input).unwrap().unwrap(),
-                |frame| {
-                    assert_eq!(frame.header.opcode, OpCode::Binary);
-                    assert!(frame.header.fin);
-                    assert_eq!(frame.header.masked, masked);
-                    assert_eq!(frame.payload.as_ref(), payload);
-                },
-            );
-        }
-        for size in [64, 126] {
+        {
+            let size = 64;
             for opcode in [OpCode::Text, OpCode::Binary] {
                 let kind = if opcode == OpCode::Text {
                     "text"
@@ -262,6 +245,3 @@ fn bench_receive_limits(c: &mut Criterion) {
     }
     group.finish();
 }
-
-criterion_group!(benches, bench_receive_limits);
-criterion_main!(benches);

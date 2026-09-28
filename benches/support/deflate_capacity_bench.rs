@@ -2,15 +2,24 @@
 //! Use isolated build/output directories and interleaved runs on each revision.
 
 use std::hint::black_box;
+#[cfg(feature = "tokio-runtime")]
 use std::time::Instant;
 
-use bytes::{Bytes, BytesMut};
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use bytes::Bytes;
+#[cfg(feature = "tokio-runtime")]
+use bytes::BytesMut;
+use criterion::{BenchmarkId, Criterion, Throughput};
 use flate2::{Compress, Compression, FlushCompress};
+#[cfg(feature = "tokio-runtime")]
 use futures_util::StreamExt;
-use sockudo_ws::deflate::{DeflateConfig, DeflateDecoder};
+#[cfg(feature = "tokio-runtime")]
+use sockudo_ws::deflate::DeflateConfig;
+use sockudo_ws::deflate::DeflateDecoder;
+#[cfg(feature = "tokio-runtime")]
 use sockudo_ws::frame::{OpCode, encode_frame_with_rsv};
+#[cfg(feature = "tokio-runtime")]
 use sockudo_ws::{CompressedWebSocketStream, Config};
+#[cfg(feature = "tokio-runtime")]
 use tokio::io::AsyncWriteExt;
 
 const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
@@ -27,8 +36,8 @@ const CASES: &[(&str, &[usize], bool)] = &[
     ),
 ];
 
-fn bench_decode(c: &mut Criterion) {
-    let mut group = c.benchmark_group("deflate_capacity_decode");
+pub fn bench_decode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("deflate/extended/capacity_decode");
     for &(name, sizes, mixed) in CASES {
         for reset in [false, true] {
             let context = if reset { "reset" } else { "takeover" };
@@ -62,15 +71,16 @@ fn bench_decode(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_tcp(c: &mut Criterion) {
+#[cfg(feature = "tokio-runtime")]
+pub fn bench_tcp(c: &mut Criterion) {
     const MESSAGES: usize = 256;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
         .unwrap();
-    let mut group = c.benchmark_group("deflate_capacity_tcp");
-    for &(name, sizes, mixed) in CASES {
+    let mut group = c.benchmark_group("transport/extended/deflate_capacity_tcp");
+    for &(name, sizes, mixed) in CASES.iter().filter(|(name, _, _)| *name == "alternating") {
         for reset in [false, true] {
             let context = if reset { "reset" } else { "takeover" };
             group.throughput(Throughput::Elements(MESSAGES as u64));
@@ -188,6 +198,3 @@ fn fixture(sizes: &[usize], mixed: bool, reset: bool) -> (Vec<Bytes>, Vec<Bytes>
     // Replay whole cycles so each block sees the same dictionary suffix.
     (payloads, first, repeated)
 }
-
-criterion_group!(benches, bench_decode, bench_tcp);
-criterion_main!(benches);

@@ -1,7 +1,7 @@
 //! Queued-write backpressure through the unified Tokio Sink API.
 //!
 //! Run with `cargo bench --no-default-features --features
-//! tokio-runtime,permessage-deflate --bench sink_backpressure`.
+//! tokio-runtime,permessage-deflate --bench transport`.
 //! Each Criterion iteration is 1,024 messages on a current-thread runtime.
 //! Timing covers the sender loop and final flush, including any peer reads and
 //! byte validation scheduled during that interval. Runtime/stream/input setup
@@ -17,12 +17,12 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use sockudo_ws::frame::{OpCode, encode_frame};
-use sockudo_ws::{
-    CompressedWebSocketStream, Config, DeflateConfig, Error, Message, WebSocketStream,
-};
+#[cfg(feature = "permessage-deflate")]
+use sockudo_ws::{CompressedWebSocketStream, DeflateConfig};
+use sockudo_ws::{Config, Error, Message, WebSocketStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 const MESSAGES_PER_ITERATION: usize = 1_024;
@@ -154,14 +154,15 @@ where
 }
 
 async fn sample(
-    compressed: bool,
+    _compressed: bool,
     operation: Operation,
     payload_len: usize,
     count: usize,
 ) -> Duration {
     let (socket, peer) = tokio::io::duplex(1 << 20);
     let payload = payload(payload_len);
-    if compressed {
+    #[cfg(feature = "permessage-deflate")]
+    if _compressed {
         let writer = CompressedWebSocketStream::server(
             socket,
             operation.config(),
@@ -170,21 +171,24 @@ async fn sample(
                 ..Default::default()
             },
         );
-        measure(writer, peer, operation, payload, count).await
-    } else {
-        let writer = WebSocketStream::server(socket, operation.config());
-        measure(writer, peer, operation, payload, count).await
+        return measure(writer, peer, operation, payload, count).await;
     }
+    let writer = WebSocketStream::server(socket, operation.config());
+    measure(writer, peer, operation, payload, count).await
 }
 
-fn bench_backpressure(c: &mut Criterion) {
+pub fn bench_backpressure(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    let mut group = c.benchmark_group("backpressure");
+    let mut group = c.benchmark_group("transport/extended/duplex_backpressure");
     group.throughput(Throughput::Elements(MESSAGES_PER_ITERATION as u64));
-    for (stream, compressed) in [("plain", false), ("compressed", true)] {
+    for (stream, compressed) in [
+        ("plain", false),
+        #[cfg(feature = "permessage-deflate")]
+        ("compressed_rsv1_clear", true),
+    ] {
         for operation in [
             Operation::Send,
             Operation::FeedDefaultThreshold,
@@ -212,6 +216,3 @@ fn bench_backpressure(c: &mut Criterion) {
     }
     group.finish();
 }
-
-criterion_group!(benches, bench_backpressure);
-criterion_main!(benches);

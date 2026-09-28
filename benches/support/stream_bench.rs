@@ -8,7 +8,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput};
 use futures_util::{SinkExt, StreamExt};
 use sockudo_ws::frame::{OpCode, encode_frame};
 use sockudo_ws::protocol::{Protocol, Role};
@@ -240,7 +240,7 @@ async fn sample(
     }
 }
 
-fn bench_stream(c: &mut Criterion) {
+pub fn bench_stream(c: &mut Criterion) {
     for (placement, workers, spawn_caller) in [
         ("current_thread", 0, false),
         ("worker_1", 1, true),
@@ -260,7 +260,8 @@ fn bench_stream(c: &mut Criterion) {
                 .unwrap()
         };
         for (transport, tcp) in [("duplex", false), ("tcp", true)] {
-            let mut group = c.benchmark_group(format!("stream/{transport}/{placement}"));
+            let mut group =
+                c.benchmark_group(format!("transport/extended/{transport}/{placement}"));
             group.throughput(Throughput::Elements(MESSAGES_PER_ITERATION as u64));
             for (name, operation) in [
                 ("read_unified", Operation::ReadUnified),
@@ -271,11 +272,24 @@ fn bench_stream(c: &mut Criterion) {
                 ("prototype_direct", Operation::PrototypeDirect),
                 ("prototype_batch_16", Operation::PrototypeBatch),
             ] {
-                let timings: &[&str] = if operation.is_read() {
-                    &["default", "idle_only", "ping_only", "off"]
-                } else {
-                    &["off"]
-                };
+                if matches!(
+                    operation,
+                    Operation::PrototypeDirect | Operation::PrototypeBatch
+                ) && placement != "current_thread"
+                {
+                    continue;
+                }
+                if matches!(placement, "worker_1" | "caller_4") && (!operation.is_read() || !tcp) {
+                    continue;
+                }
+                let timings: &[&str] =
+                    if operation.is_read() && placement == "current_thread" && !tcp {
+                        &["default", "idle_only", "ping_only", "off"]
+                    } else if operation.is_read() {
+                        &["default", "off"]
+                    } else {
+                        &["off"]
+                    };
                 for &timing in timings {
                     group.bench_function(BenchmarkId::new(name, timing), |b| {
                         b.iter_custom(|iterations| {
@@ -298,13 +312,13 @@ fn bench_stream(c: &mut Criterion) {
     }
 }
 
-fn bench_masked_receive(c: &mut Criterion) {
+pub fn bench_masked_receive(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     for (transport, tcp) in [("duplex", false), ("tcp", true)] {
-        let mut group = c.benchmark_group(format!("masked_receive/{transport}"));
+        let mut group = c.benchmark_group(format!("transport/extended/masked_receive/{transport}"));
         group.throughput(Throughput::Elements(MESSAGES_PER_ITERATION as u64));
         for payload in [&[0x41; 125][..], &[0x41; 256], &[0x41; 1024]] {
             for (name, operation) in [
@@ -325,6 +339,3 @@ fn bench_masked_receive(c: &mut Criterion) {
         group.finish();
     }
 }
-
-criterion_group!(benches, bench_stream, bench_masked_receive);
-criterion_main!(benches);

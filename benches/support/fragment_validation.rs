@@ -5,7 +5,7 @@
 //! Returned messages are dropped outside the measured routine.
 
 use bytes::{Bytes, BytesMut};
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion};
 use sockudo_ws::frame::{OpCode, encode_frame};
 use sockudo_ws::protocol::{Message, Protocol, RawMessage, Role};
 use std::hint::black_box;
@@ -107,8 +107,8 @@ fn process(
     black_box(messages)
 }
 
-fn bench_fragments(c: &mut Criterion) {
-    let mut group = c.benchmark_group("fragment_validation");
+pub fn bench_fragments(c: &mut Criterion) {
+    let mut group = c.benchmark_group("protocol/extended/fragment_fresh");
     for masked in [false, true] {
         let direction = if masked { "masked" } else { "unmasked" };
         for (size, unicode, fragments, mixed, partial) in [
@@ -139,6 +139,3 @@ fn bench_fragments(c: &mut Criterion) {
     }
     group.finish();
 }
-
-criterion_group!(benches, bench_fragments);
-criterion_main!(benches);

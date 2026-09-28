@@ -1,12 +1,12 @@
 # Delivery diagnostic benchmark
 
-`delivery_diagnostic_bench` records per-connection timelines for generated 32-byte sequence messages over WebSocket or a raw TCP control path. It separates pre-send-to-local-completion cost, pre-send-to-peer-delivery latency, scheduled latency and sender lateness, with per-connection P99-P1 spreads for the last two.
+`delivery_diagnostic` records per-connection timelines for generated 32-byte sequence messages over WebSocket or a raw TCP control path. The WebSocket receiver is tokio-tungstenite; use the transport suite for sockudo-to-sockudo round trips. It separates pre-send-to-local-completion cost, pre-send-to-peer-delivery latency, scheduled latency and sender lateness, with per-connection P99-P1 spreads for the last two.
 
 The default invocation is a short fixed-rate WebSocket smoke case: one runtime
 worker, one connection, 128 messages, and 1,000 messages per second.
 
 ```sh
-cargo bench --locked --bench delivery_diagnostic_bench
+cargo run --locked --release --example delivery_diagnostic
 ```
 
 Pass an explicit case after `--` for measurement:
@@ -18,9 +18,9 @@ sender_workers receiver_workers connections count rate_per_connection [ws|raw of
 For example:
 
 ```sh
-cargo bench --locked --bench delivery_diagnostic_bench -- \
+cargo run --locked --release --example delivery_diagnostic -- \
   4 4 16 20000 1000 ws off
-cargo bench --locked --bench delivery_diagnostic_bench -- \
+cargo run --locked --release --example delivery_diagnostic -- \
   4 4 16 20000 1000 raw off
 ```
 

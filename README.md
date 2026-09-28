@@ -1201,10 +1201,12 @@ sockudo-ws/
 ├── tests/
 │   └── e2e_runtime_transports.rs # Tokio and Compio HTTP/2 + HTTP/3 loopback tests
 └── benches/
-    └── throughput.rs     # Criterion benchmarks
+    └── README.md         # Benchmark suites and measurement contracts
 ```
 
 ## Performance Optimizations
+
+Benchmark development: see [the benchmark suite guide](benches/README.md) for hot-path coverage, core/extended commands, feature matrices and reproducible comparisons.
 
 1. **SIMD Masking**: Uses AVX2/AVX-512/SSE2/NEON/AltiVec/LSX to XOR mask frames at 16-64 bytes per cycle
 2. **SIMD UTF-8**: Validates UTF-8 text at memory bandwidth speeds via simdutf8

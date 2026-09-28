@@ -1,13 +1,13 @@
 # Stream benchmarks and diagnostics
 
-The default inputs are synthetic; `receive_state_bench` also accepts a caller-supplied UTF-8 fixture. Build and compare revisions with the same profile, features and harness sources. Separate checkouts need independent target directories; one checkout can reuse its target when sequential builds are verified and executables are preserved before switching revisions. Preserve raw runs, A/A controls, paired execution order, executable hashes and runtime configuration.
+The default inputs are synthetic; `receive_state_diagnostic` also accepts a caller-supplied UTF-8 fixture. Build and compare revisions with the same profile, features and harness sources. Separate checkouts need independent target directories; one checkout can reuse its target when sequential builds are verified and executables are preserved before switching revisions. Preserve raw runs, A/A controls, paired execution order, executable hashes and runtime configuration.
 
 ## Stream benchmark
 
-`stream_bench` uses Criterion to compare unified and split reads and writes over Tokio duplex and TCP transports. Each Criterion iteration contains 1,024 messages; reported time is per batch, not per message. Socket/runtime setup, split construction and final peer join are outside the timer. A single timed loop processes all iterations requested by Criterion on one connection.
+The `transport/extended/duplex` and `transport/extended/tcp` groups use Criterion to compare unified and split reads and writes over Tokio duplex and TCP transports. Each Criterion iteration contains 1,024 messages; reported time is per batch, not per message. Socket/runtime setup, split construction and final peer join are outside the timer. A single timed loop processes all iterations requested by Criterion on one connection. Other transport groups have different denominators: the socket/adapter round-trip cases measure one round trip per iteration; see [suite contracts](README.md#measurement-contracts).
 
 ```sh
-cargo bench --locked --bench stream_bench
+cargo bench --locked --bench transport
 ```
 
 The benchmark separates timer configurations and includes masked receive sizes around framing boundaries. TCP loopback results do not represent TLS, a physical NIC, an application handler or production tail latency. Multi-worker cases need enough physical cores for runtime workers, the benchmark driver and the peer.
@@ -19,14 +19,14 @@ The benchmark separates timer configurations and includes masked receive sizes a
 | `feed_16` | Feed 16 messages then flush; includes message clones and local flush completion. The same concurrent peer validation applies. |
 | `prototype_direct`, `prototype_batch_16` | Data-only protocol/write models, including encoding and local flush. The batch model includes Vec/channel/oneshot costs. They omit production heartbeat, control ownership and close handling and are not API-equivalent replacements for split. |
 
-`current_thread` drives the caller and peer on one runtime thread. `worker_1` and `worker_4` spawn the caller onto their respective runtime; `caller_4` drives the caller through `block_on` outside the four workers. Peer/driver tasks share the runtime workers. The prototypes are control paths, not proposed production optimizations. Append `-- --test` to run the full Criterion smoke matrix without timing samples.
+`current_thread` drives the caller and peer on one runtime thread. `worker_1` and `worker_4` spawn the caller onto their respective runtime; `caller_4` drives the caller through `block_on` outside the four workers. Peer/driver tasks share the runtime workers. The full operation set uses current_thread and worker_4. The worker_1 and caller_4 placements retain paired TCP receive cases only; idle_only/ping_only retain current-thread duplex attribution cases. Prototypes run only on current_thread over duplex/TCP, as control paths rather than proposed production optimizations. Append `-- --test` to run the full Criterion smoke matrix without timing samples.
 
 ## Controlled receive state
 
-`receive_state_bench` always measures the native split reader. It separates read readiness, input batching, dispatch and retained message ownership from socket scheduling; constructing a unified stream here does not mean the timed path is unified:
+`receive_state_diagnostic` always measures the native split reader. It separates read readiness, input batching, dispatch and retained message ownership from socket scheduling; constructing a unified stream here does not mean the timed path is unified:
 
 ```sh
-cargo bench --locked --bench receive_state_bench --no-run
+cargo run --locked --release --example receive_state_diagnostic -- --test
 # executable arguments:
 # fixture connections frames_per_read ready|pending retain typed|boxed
 ```

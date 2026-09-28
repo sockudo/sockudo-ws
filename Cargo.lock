@@ -2261,7 +2261,6 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-uring",
  "tokio-util",
- "tokio-websockets",
  "webpki-roots",
 ]
 
@@ -2527,24 +2526,6 @@ dependencies = [
  "futures-sink",
  "pin-project-lite",
  "tokio",
-]
-
-[[package]]
-name = "tokio-websockets"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f591660438b3038dd04d16c938271c79e7e06260ad2ea2885a4861bfb238605d"
-dependencies = [
- "base64",
- "bytes",
- "fastrand",
- "futures-core",
- "futures-sink",
- "http",
- "httparse",
- "sha1_smol",
- "tokio",
- "tokio-util",
 ]
 
 [[package]]

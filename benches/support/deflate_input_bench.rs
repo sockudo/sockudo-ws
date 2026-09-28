@@ -5,15 +5,24 @@
 //! exploratory; repeat interleaved comparisons before drawing conclusions.
 
 use std::hint::black_box;
+#[cfg(feature = "tokio-runtime")]
 use std::time::Instant;
 
-use bytes::{Bytes, BytesMut};
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use bytes::Bytes;
+#[cfg(feature = "tokio-runtime")]
+use bytes::BytesMut;
+use criterion::{BenchmarkId, Criterion, Throughput};
 use flate2::{Compress, Compression, FlushCompress};
+#[cfg(feature = "tokio-runtime")]
 use futures_util::StreamExt;
-use sockudo_ws::deflate::{DeflateConfig, DeflateDecoder};
+#[cfg(feature = "tokio-runtime")]
+use sockudo_ws::deflate::DeflateConfig;
+use sockudo_ws::deflate::DeflateDecoder;
+#[cfg(feature = "tokio-runtime")]
 use sockudo_ws::frame::{OpCode, encode_frame_with_rsv};
+#[cfg(feature = "tokio-runtime")]
 use sockudo_ws::{CompressedWebSocketStream, Config};
+#[cfg(feature = "tokio-runtime")]
 use tokio::io::AsyncWriteExt;
 
 fn fixture(size: usize, mixed: bool, no_context_takeover: bool) -> (Vec<u8>, Bytes, Bytes) {
@@ -51,8 +60,8 @@ fn fixture(size: usize, mixed: bool, no_context_takeover: bool) -> (Vec<u8>, Byt
     (payload, first, repeated)
 }
 
-fn bench_decompression(c: &mut Criterion) {
-    let mut group = c.benchmark_group("deflate_input_decode");
+pub fn bench_decompression(c: &mut Criterion) {
+    let mut group = c.benchmark_group("deflate/extended/input_decode");
     for size in [32, 1024, 4096, 65536] {
         for mixed in [false, true] {
             for no_context_takeover in [false, true] {
@@ -85,18 +94,20 @@ fn bench_decompression(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_tcp(c: &mut Criterion) {
+#[cfg(feature = "tokio-runtime")]
+pub fn bench_tcp(c: &mut Criterion) {
     const MESSAGES: usize = 256;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
         .unwrap();
-    let mut group = c.benchmark_group("deflate_input_tcp");
+    let mut group = c.benchmark_group("transport/extended/deflate_input_tcp");
     for size in [32, 4096, 65536] {
-        for mixed in [false, true] {
+        {
+            let mixed = true;
             for no_context_takeover in [false, true] {
-                let pattern = if mixed { "mixed" } else { "repeat" };
+                let pattern = "mixed";
                 let context = if no_context_takeover {
                     "reset"
                 } else {
@@ -180,6 +191,3 @@ fn bench_tcp(c: &mut Criterion) {
     }
     group.finish();
 }
-
-criterion_group!(benches, bench_decompression, bench_tcp);
-criterion_main!(benches);

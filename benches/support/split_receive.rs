@@ -3,55 +3,64 @@
 //! peer writes, loopback, runtime I/O, parsing, delivery and message destruction.
 
 use bytes::BytesMut;
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion};
+#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+use sockudo_ws::Config;
+#[cfg(all(
+    feature = "permessage-deflate",
+    any(feature = "tokio-runtime", feature = "compio-runtime")
+))]
+use sockudo_ws::DeflateConfig;
+use sockudo_ws::OpCode;
 use sockudo_ws::frame::{FrameParser, encode_frame};
-use sockudo_ws::{Config, DeflateConfig, OpCode};
 use std::hint::black_box;
+#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
 use std::time::Instant;
 
+#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
 fn config() -> Config {
     Config::builder().auto_ping(false).idle_timeout(0).build()
 }
 
-fn parser_cases(c: &mut Criterion) {
+pub fn parser_cases(c: &mut Criterion) {
     for masked in [false, true] {
         for size in [64, 126, 4096] {
-            for partial in [false, true] {
-                let payload = vec![b'x'; size];
-                let mut wire = BytesMut::new();
-                encode_frame(
-                    &mut wire,
-                    OpCode::Binary,
-                    &payload,
-                    true,
-                    masked.then_some([7, 13, 19, 23]),
-                );
-                let mut parser = FrameParser::new(1 << 20, masked);
-                let cut = if partial { wire.len() - 1 } else { wire.len() };
-                let mut parse = |mut input: BytesMut| {
-                    let tail = input.split_off(cut);
-                    let frame = if partial {
-                        assert!(parser.parse(&mut input).unwrap().is_none());
-                        input.extend_from_slice(&tail);
-                        parser.parse(&mut input).unwrap().unwrap()
-                    } else {
-                        parser.parse(&mut input).unwrap().unwrap()
-                    };
-                    black_box(frame)
-                };
-                assert_eq!(parse(wire.clone()).payload.as_ref(), payload);
-                let name = format!("split_receive/parser_masked{masked}_partial{partial}_{size}");
-                c.bench_function(&name, |b| {
-                    b.iter_batched(|| wire.clone(), &mut parse, BatchSize::SmallInput)
-                });
-                assert_eq!(parse(wire.clone()).payload.as_ref(), payload);
-            }
+            let payload = vec![b'x'; size];
+            let mut wire = BytesMut::new();
+            encode_frame(
+                &mut wire,
+                OpCode::Binary,
+                &payload,
+                true,
+                masked.then_some([7, 13, 19, 23]),
+            );
+            let mut parser = FrameParser::new(1 << 20, masked);
+            let cut = wire.len() - 1;
+            // Prepare a unique buffer with room for the last byte outside timing.
+            let prepare = || {
+                let mut input = BytesMut::with_capacity(wire.len());
+                input.extend_from_slice(&wire[..cut]);
+                input
+            };
+            let mut parse = |mut input: BytesMut| {
+                assert!(parser.parse(&mut input).unwrap().is_none());
+                input.extend_from_slice(&wire[cut..]);
+                let frame = parser.parse(&mut input).unwrap().unwrap();
+                black_box(frame)
+            };
+            assert_eq!(parse(prepare()).payload.as_ref(), payload);
+            let name = format!("protocol/extended/parser_partial/masked{masked}/{size}");
+            c.bench_function(&name, |b| {
+                b.iter_batched(prepare, &mut parse, BatchSize::SmallInput)
+            });
+            assert_eq!(parse(prepare()).payload.as_ref(), payload);
         }
     }
 }
 
 // Keep concrete reader types in each timed loop; the constructor is the only
 // difference between plain and compression-capable (RSV1-clear) cases.
+#[cfg(feature = "tokio-runtime")]
 macro_rules! tokio_case {
     ($c:expr, $size:expr, $name:expr, $construct:expr) => {{
         $c.bench_function($name, |b| {
@@ -97,6 +106,7 @@ macro_rules! tokio_case {
     }};
 }
 
+#[cfg(feature = "compio-runtime")]
 macro_rules! compio_case {
     ($c:expr, $size:expr, $name:expr, $construct:expr) => {{
         $c.bench_function($name, |b| {
@@ -140,34 +150,39 @@ macro_rules! compio_case {
     }};
 }
 
-fn tcp_cases(c: &mut Criterion) {
+#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+pub fn tcp_cases(c: &mut Criterion) {
     for size in [64, 4096] {
+        #[cfg(feature = "tokio-runtime")]
         tokio_case!(
             c,
             size,
-            &format!("split_receive/tokio_plain_{size}"),
+            &format!("transport/extended/split_tokio_plain_{size}"),
             |io| sockudo_ws::WebSocketStream::client(io, config())
         );
+        #[cfg(all(feature = "tokio-runtime", feature = "permessage-deflate"))]
         tokio_case!(
             c,
             size,
-            &format!("split_receive/tokio_compressed_{size}"),
+            &format!("transport/extended/split_tokio_rsv1_clear_{size}"),
             |io| sockudo_ws::CompressedWebSocketStream::client(
                 io,
                 config(),
                 DeflateConfig::default()
             )
         );
+        #[cfg(feature = "compio-runtime")]
         compio_case!(
             c,
             size,
-            &format!("split_receive/compio_plain_{size}"),
+            &format!("transport/extended/split_compio_plain_{size}"),
             |io| sockudo_ws::CompioWebSocketStream::client(io, config())
         );
+        #[cfg(all(feature = "compio-runtime", feature = "permessage-deflate"))]
         compio_case!(
             c,
             size,
-            &format!("split_receive/compio_compressed_{size}"),
+            &format!("transport/extended/split_compio_rsv1_clear_{size}"),
             |io| sockudo_ws::compio::CompioCompressedWebSocketStream::client(
                 io,
                 config(),
@@ -176,6 +191,3 @@ fn tcp_cases(c: &mut Criterion) {
         );
     }
 }
-
-criterion_group!(benches, parser_cases, tcp_cases);
-criterion_main!(benches);

@@ -1,20 +1,23 @@
 //! Client copy-and-mask experiments, including complete frames and TCP delivery.
 //!
-//! Run `cargo bench --bench client_mask_bench` on each revision with the same
+//! Run `cargo bench --bench kernels` on each revision with the same
 //! toolchain/features and separate CARGO_TARGET_DIR/CRITERION_HOME directories.
 //! Interleave repeated runs; shared-workstation timings are exploratory only.
 
 use std::hint::black_box;
+#[cfg(feature = "tokio-runtime")]
 use std::time::Instant;
 
 use bytes::BytesMut;
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput};
+#[cfg(feature = "tokio-runtime")]
 use futures_util::{SinkExt, StreamExt};
 use sockudo_ws::frame::{FrameParser, OpCode, encode_frame};
+#[cfg(feature = "tokio-runtime")]
 use sockudo_ws::{Config, Message, WebSocketStream};
 
-fn bench_encoding(c: &mut Criterion) {
-    let mut group = c.benchmark_group("client_mask_encode");
+pub fn bench_encoding(c: &mut Criterion) {
+    let mut group = c.benchmark_group("kernels/extended/copy_mask_alignment");
     for size in [8, 32, 125, 126, 256, 4096, 65536] {
         for (source_offset, destination_offset) in [(0, 0), (0, 6), (1, 13), (15, 1)] {
             let source = vec![0x42; size + 31];
@@ -79,14 +82,15 @@ fn bench_encoding(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_tcp(c: &mut Criterion) {
+#[cfg(feature = "tokio-runtime")]
+pub fn bench_tcp(c: &mut Criterion) {
     const MESSAGES: usize = 1024;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
         .unwrap();
-    let mut group = c.benchmark_group("client_mask_tcp");
+    let mut group = c.benchmark_group("transport/extended/client_mask_tcp");
     for size in [32, 256, 4096] {
         let message = Message::binary(vec![0x42; size]);
         for batch in [1, 16] {
@@ -147,6 +151,3 @@ fn bench_tcp(c: &mut Criterion) {
     }
     group.finish();
 }
-
-criterion_group!(benches, bench_encoding, bench_tcp);
-criterion_main!(benches);

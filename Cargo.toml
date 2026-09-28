@@ -10,15 +10,18 @@ license = "MIT"
 [lib]
 name = "sockudo_ws"
 path = "src/lib.rs"
+bench = false
 
 [[bin]]
 name = "sockudo-bench"
 path = "src/bin/bench.rs"
+bench = false
 required-features = ["tokio-runtime"]
 
 [[bin]]
 name = "autobahn-server"
 path = "autobahn/server.rs"
+bench = false
 required-features = ["tokio-runtime", "permessage-deflate"]
 
 [features]
@@ -220,7 +223,6 @@ rand = "^0.9"
 rstest = { version = "0.27.0", default-features = false }
 tokio = { version = "^1.48", features = ["full", "test-util"] }
 tokio-tungstenite = "^0.26"
-tokio-websockets = { version = "^0.10", features = ["client", "server", "sha1_smol", "fastrand"] }
 futures-util = "^0.3"
 axum = "^0.8"
 hyper = { version = "^1.0", features = ["full"] }
@@ -289,35 +291,6 @@ required-features = ["tokio-runtime"]
 name = "wtx_bench_echo"
 required-features = ["tokio-runtime"]
 
-[[bench]]
-name = "websocket_bench"
-harness = false
-required-features = ["tokio-runtime"]
-
-[[bench]]
-name = "comparison_bench"
-harness = false
-required-features = ["tokio-runtime"]
-
-[[bench]]
-name = "sink_backpressure"
-harness = false
-required-features = ["tokio-runtime", "permessage-deflate"]
-
-[[bench]]
-name = "fragment_validation"
-harness = false
-
-[[bench]]
-name = "receive_limits"
-harness = false
-required-features = ["permessage-deflate"]
-
-[[bench]]
-name = "split_receive"
-harness = false
-required-features = ["tokio-runtime", "compio-runtime", "permessage-deflate"]
-
 [profile.release]
 opt-level = 3
 lto = "fat"
@@ -331,51 +304,50 @@ opt-level = 3
 lto = "thin"
 debug = true
 
-[[bench]]
-name = "protocol_bench"
-harness = false
-required-features = ["tokio-runtime"]
-
-[[bench]]
-name = "masking_bench"
-harness = false
-required-features = ["tokio-runtime"]
-
-[[bench]]
-name = "client_mask_bench"
-harness = false
-required-features = ["tokio-runtime"]
-
-[[bench]]
-name = "deflate_input_bench"
-harness = false
-required-features = ["tokio-runtime", "permessage-deflate"]
-
-[[bench]]
-name = "deflate_capacity_bench"
-harness = false
-required-features = ["tokio-runtime", "permessage-deflate"]
-
-[[bench]]
-name = "services_bench"
-harness = false
-required-features = ["tokio-runtime", "permessage-deflate"]
-
-[[bench]]
-name = "stream_bench"
-harness = false
-required-features = ["tokio-runtime"]
-
-[[bench]]
-name = "receive_state_bench"
-harness = false
-required-features = ["tokio-runtime"]
-
 [[example]]
 name = "send_latency_diagnostic"
 required-features = ["tokio-runtime"]
 
 [[bench]]
-name = "delivery_diagnostic_bench"
+name = "kernels"
+harness = false
+
+[[bench]]
+name = "protocol"
+harness = false
+
+[[bench]]
+name = "deflate"
+harness = false
+required-features = ["permessage-deflate"]
+
+[[bench]]
+name = "pubsub"
 harness = false
 required-features = ["tokio-runtime"]
+
+[[bench]]
+name = "lifecycle"
+harness = false
+
+[[bench]]
+name = "transport"
+harness = false
+
+[[example]]
+name = "receive_state_diagnostic"
+required-features = ["tokio-runtime"]
+
+[[example]]
+name = "delivery_diagnostic"
+required-features = ["tokio-runtime"]
+
+[[bench]]
+name = "stream_tokio"
+harness = false
+required-features = ["tokio-runtime"]
+
+[[bench]]
+name = "stream_compio"
+harness = false
+required-features = ["compio-runtime"]

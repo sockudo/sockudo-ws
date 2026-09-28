@@ -106,7 +106,11 @@ async fn measure<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 }
 
 fn main() {
-    let mut args: Vec<_> = std::env::args().filter(|arg| arg != "--bench").collect();
+    sockudo_ws::init_clock();
+    let mut args: Vec<_> = std::env::args().collect();
+    if args.len() == 2 && args[1] == "--test" {
+        args.pop();
+    }
     if args.len() == 1 {
         args.extend(["-", "1", "1", "ready", "0", "typed"].map(str::to_owned));
     }
