@@ -679,7 +679,7 @@ pub fn generate_mask() -> [u8; 4] {
         not(feature = "getrandom")
     ))]
     {
-        use rand::Rng;
+        use rand::RngExt;
         return rand::rng().random::<[u8; 4]>();
     }
 

@@ -1,7 +1,7 @@
 //! Deterministic synthetic events: changing fields, shared text and varying data.
 //! This is a workload model, not a claim about a production traffic distribution.
 use bytes::Bytes;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 pub fn json_messages(size: usize, count: usize) -> Vec<Bytes> {
     assert!(size >= 256);

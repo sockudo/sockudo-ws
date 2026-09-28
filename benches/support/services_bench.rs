@@ -8,7 +8,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput};
 #[cfg(feature = "permessage-deflate")]
-use rand::{RngCore, SeedableRng};
+use rand::{Rng, SeedableRng};
 #[cfg(feature = "tokio-runtime")]
 use sockudo_ws::Message;
 #[cfg(feature = "permessage-deflate")]

@@ -1,6 +1,6 @@
 //! Encoding context and threshold costs; outputs are dropped inside timing.
 use criterion::{BenchmarkId, Criterion, Throughput};
-use rand::{RngCore, SeedableRng};
+use rand::{Rng, SeedableRng};
 use sockudo_ws::deflate::{DeflateConfig, DeflateDecoder, DeflateEncoder};
 use std::hint::black_box;
 

@@ -71,7 +71,7 @@ fn generate_key_bytes_inner() -> [u8; 16] {
 #[cfg(all(feature = "rand_rng", not(feature = "getrandom")))]
 #[inline]
 fn generate_key_bytes_inner() -> [u8; 16] {
-    use rand::Rng;
+    use rand::RngExt;
     let mut bytes = [0; 16];
     rand::rng().fill(&mut bytes[..]);
     bytes
@@ -106,7 +106,7 @@ fn generate_mask_inner() -> [u8; 4] {
 #[cfg(all(feature = "rand_rng", not(feature = "getrandom")))]
 #[inline]
 fn generate_mask_inner() -> [u8; 4] {
-    use rand::Rng;
+    use rand::RngExt;
     rand::rng().random()
 }
 

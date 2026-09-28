@@ -1,7 +1,7 @@
 //! Local send completion into a controlled sink. Capture/decoding runs outside timing.
 use super::controlled_io::{Output, Written};
 use bytes::{Bytes, BytesMut};
-use rand::{RngCore, SeedableRng};
+use rand::{Rng, SeedableRng};
 use sockudo_ws::{Config, Message, Role, protocol::Protocol};
 use std::sync::{Arc, Mutex};
 
