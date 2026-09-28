@@ -185,7 +185,7 @@ simdutf8 = "^0.1"
 
 # Random number generators for mask generation
 fastrand = { version = "^2.5", optional = true }
-getrandom = { version = "^0.2", optional = true }
+getrandom = { version = "^0.4", optional = true }
 rand = { version = "^0.9", optional = true }
 
 # TLS support via native-tls
