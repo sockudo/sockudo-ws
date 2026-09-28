@@ -937,7 +937,7 @@ The first clock read performs quanta's one-time calibration, which can block for
 
 Enable this crate's `test-util` feature when using Tokio's `pause`, `advance`, or `start_paused`. It selects Tokio's clock for connection timestamps as well as timers, including when sockudo-ws is an integration-test dependency. Enabling only `tokio/test-util` does not switch sockudo-ws's clock.
 
-`test-util` is not included in `full`. `--all-features` enables it, so use default features or `full` without `test-util` when measuring quanta performance. Cargo unifies features across dependencies; a dev-dependency enabling `test-util` also selects the Tokio clock for benchmarks in that build.
+`test-util` is not included in `full`. `--all-features` enables it, so use default features or `full` without `test-util` when measuring quanta performance. Cargo unifies features across dependencies; a dev-dependency enabling `test-util` also selects the Tokio clock for benchmarks in that build. The quanta dev-dependency separately enables its `mock` feature for native-clock tests. Default/full benchmark builds consequently include a mock-clock lookup that ordinary production builds without `quanta/mock` omit; account for this difference when interpreting clock-sensitive measurements.
 
 ## SIMD Architecture Support
 
