@@ -227,7 +227,7 @@ futures-util = "^0.3"
 axum = "^0.8"
 hyper = { version = "^1.11", features = ["full"] }
 hyper-util = { version = "^0.1", features = ["tokio"] }
-rcgen = "^0.13"
+rcgen = "^0.14"
 rustls = { version = "^0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "^2.2"
 

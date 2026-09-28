@@ -131,7 +131,7 @@ fn load_certs_and_key()
         // Use rcgen to generate self-signed cert
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
         let cert_der = CertificateDer::from(cert.cert.der().to_vec());
-        let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der())?;
+        let key_der = PrivateKeyDer::try_from(cert.signing_key.serialize_der())?;
 
         Ok((vec![cert_der], key_der))
     }

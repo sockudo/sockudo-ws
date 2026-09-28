@@ -10,7 +10,7 @@ pub fn configs(h3: bool) -> (rustls::ServerConfig, rustls::ClientConfig) {
         .with_no_client_auth()
         .with_single_cert(
             vec![cert.cert.der().clone()],
-            rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap(),
+            rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap(),
         )
         .unwrap();
     let mut roots = rustls::RootCertStore::empty();

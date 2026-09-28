@@ -17,10 +17,10 @@ fn tls_configs() -> (rustls::ServerConfig, rustls::ClientConfig) {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
 
-    let rcgen::CertifiedKey { cert, key_pair } =
+    let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
-    let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
+    let key_der = rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
 
     let server = rustls::ServerConfig::builder()
         .with_no_client_auth()

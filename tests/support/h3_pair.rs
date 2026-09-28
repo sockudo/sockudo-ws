@@ -30,7 +30,7 @@ pub async fn quic_pair() -> ([quinn::Endpoint; 2], [quinn::Connection; 2]) {
         .with_no_client_auth()
         .with_single_cert(
             vec![cert.cert.der().clone()],
-            rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap(),
+            rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap(),
         )
         .unwrap();
     server_tls.alpn_protocols = vec![b"h3".to_vec()];
