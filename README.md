@@ -77,7 +77,7 @@ sockudo-ws matches or exceeds uWebSockets performance while providing a safe, er
 - **Zero-Copy Parsing**: Direct buffer access without intermediate allocations
 - **Write Batching (Corking)**: Minimizes syscalls via vectored I/O
 - **permessage-deflate**: Full compression support with shared/dedicated compressors
-- **Lock-Free Split Streams**: True concurrent read/write using OS-level stream splitting (zero mutex contention)
+- **Concurrent Split Streams**: Separate reader and writer tasks with coordinated control frames and short transport-poll locks
 - **Runtime-Separated APIs**: Tokio support via `tokio-runtime`, native Compio support via `compio-runtime`
 - **Pub/Sub System**: High-performance topic-based messaging with sender exclusion
 - **HTTP/2 WebSocket**: RFC 8441 Extended CONNECT protocol support
@@ -178,9 +178,9 @@ async fn handle(stream: TcpStream) {
 }
 ```
 
-### Lock-Free Split Streams (Concurrent Read/Write)
+### Split Streams (Concurrent Read/Write)
 
-sockudo-ws uses **tokio::io::split()** for true concurrent I/O with **zero mutex contention**:
+Tokio split streams let reader and writer tasks progress independently. A shared transport mutex protects each synchronous I/O poll, and an async sink mutex serializes application and control-frame writes:
 
 ```rust
 use sockudo_ws::{Config, Message, WebSocketStream};
@@ -189,11 +189,11 @@ use tokio::sync::mpsc;
 async fn handle(stream: TcpStream) {
     let ws = WebSocketStream::server(stream, Config::default());
     
-    // Split into independent read/write halves
-    // Reader and writer can operate 100% concurrently!
+    // Split into separately owned read/write handles.
+    // Reader and writer can progress in separate tasks.
     let (mut reader, mut writer) = ws.split();
 
-    // Writer task - NEVER blocks reader
+    // Application writer task
     let (tx, mut rx) = mpsc::channel::<Message>(32);
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -201,7 +201,7 @@ async fn handle(stream: TcpStream) {
         }
     });
 
-    // Reader loop - NEVER blocks writer
+    // Receive on the current task
     while let Some(msg) = reader.next().await {
         match msg.unwrap() {
             Message::Text(text) => {
@@ -214,11 +214,12 @@ async fn handle(stream: TcpStream) {
 }
 ```
 
-**Why This is Fast:**
-- ✅ **Zero mutex contention** - reader and writer operate independently
-- ✅ **OS-level splitting** - leverages tokio's optimized `ReadHalf` and `WriteHalf`
-- ✅ **True concurrency** - can read and write simultaneously without blocking
-- ✅ **Control frame coordination** - Ping/Pong/Close handled via lightweight mpsc channel
+**How This Coordinates I/O:**
+
+- **Separate tasks** - a pending transport read does not hold the transport mutex
+- **Short transport locks** - the mutex is released after each synchronous I/O poll
+- **Serialized writes** - application and control frames share an async sink mutex to preserve frame boundaries
+- **Control frame coordination** - Ping/Pong/Close requests use a bounded mpsc channel and a connection driver
 
 ### HTTP/1.1 Custom Headers
 
@@ -1011,9 +1012,9 @@ if ws.is_backpressured() {
 }
 ```
 
-### Lock-Free Split Streams
+### Split Streams
 
-For concurrent read/write operations with zero mutex contention:
+For read/write operations in separate tasks:
 
 ```rust
 let (reader, writer) = ws.split();
@@ -1022,7 +1023,7 @@ let (reader, writer) = ws.split();
 reader.next().await  // Receive message
 reader.is_closed()   // Check if closed (non-blocking)
 
-// SplitWriter - bounded command handle to the connection writer driver
+// SplitWriter - application writes serialized with the control driver
 writer.send(msg).await?;
 writer.send_text("hello").await?;
 writer.send_binary(bytes).await?;
@@ -1032,13 +1033,14 @@ writer.flush().await?;  // Flush accepted application writes
 ```
 
 **Implementation Details:**
-- Uses `tokio::io::split()` for OS-level stream splitting
-- Reader owns `ReadHalf<S>` and protocol decoder
-- One connection-scoped driver exclusively owns `WriteHalf<S>` and the encoder
-- Bounded control/application queues provide backpressure under Ping floods
+
+- Reader and writer share the original transport through `SplitTransport<S>`
+- The reader owns the protocol decoder; a mutex protects each synchronous transport I/O poll
+- Application sends and the connection driver share the encoder and write buffer under an async sink mutex
+- A bounded control queue provides backpressure under Ping floods
 - Pong and Close responses progress without later application `send()`/`flush()`
 - Dropping either half cancels the driver; EOF/Close/timeout propagates to both
-- No lock is held across an await
+- The transport mutex is never held across an await; the async sink mutex remains held while writing and flushing a frame
 
 ### Message Types
 
