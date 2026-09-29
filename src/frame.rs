@@ -1158,7 +1158,7 @@ pub fn encode_frame_with_rsv(
 /// Inline masking during copy - single pass for masked frames.
 ///
 /// Disjoint slices expose the copy's aliasing contract to the optimizer. Like
-/// `apply_mask_words`, the 64-byte blocks leave vectorization and unrolling to
+/// `apply_mask_words`, fixed-size blocks leave vectorization and unrolling to
 /// LLVM. The destination may be uninitialized: only stores may access it.
 #[inline(always)]
 fn encode_payload_masked_inline(dst: &mut [MaybeUninit<u8>], src: &[u8], mask: [u8; 4]) {
@@ -1173,7 +1173,16 @@ fn encode_payload_masked_inline(dst: &mut [MaybeUninit<u8>], src: &[u8], mask: [
 // short payloads to retain caller specialization.
 #[inline(never)]
 fn copy_mask_long(dst: &mut [MaybeUninit<u8>], src: &[u8], mask: [u8; 4]) {
-    copy_mask_words(dst, src, mask);
+    assert_eq!(dst.len(), src.len());
+    let mask_u32 = u32::from_ne_bytes(mask);
+    let mask_u64 = u64::from(mask_u32) | (u64::from(mask_u32) << 32);
+    let (dst_blocks, dst_tail) = dst.as_chunks_mut::<256>();
+    let (src_blocks, src_tail) = src.as_chunks::<256>();
+    for (dst, src) in dst_blocks.iter_mut().zip(src_blocks) {
+        copy_mask_block(dst, src, mask_u64);
+    }
+    // Full blocks preserve mask phase zero; reuse the short path for the tail.
+    copy_mask_words(dst_tail, src_tail, mask);
 }
 
 #[inline(always)]
@@ -1254,7 +1263,7 @@ mod tests {
     #[test]
     fn copy_mask_preserves_destination_boundaries() {
         let mask = [0x37, 0xfa, 0x21, 0x3d];
-        for len in (0..=129).chain([255, 256, 257, 511, 512, 513]) {
+        for len in 0..=513 {
             for offset in 0..16 {
                 // The payload ends at the allocation boundary, without readable padding.
                 let source: Box<[u8]> = (0..offset + len).map(|i| (i * 37 + 17) as u8).collect();
@@ -1282,7 +1291,7 @@ mod tests {
     #[test]
     fn copy_mask_initializes_exact_destination() {
         let mask = [0x37, 0xfa, 0x21, 0x3d];
-        for len in (0..=129).chain([255, 256, 257, 511, 512, 513]) {
+        for len in 0..=513 {
             let source: Box<[u8]> = (0..len).map(|i| (i * 37 + 17) as u8).collect();
             let mut destination = Box::<[u8]>::new_uninit_slice(len);
             encode_payload_masked_inline(&mut destination, &source, mask);
