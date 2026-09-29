@@ -86,22 +86,25 @@ fn unmasked_data_frames_survive_header_and_payload_splits() {
 }
 
 #[test]
-fn coalesced_medium_frames_preserve_following_control_and_data_frames() {
-    for size in [126, 193, 65535] {
-        let mut parser = FrameParser::new(size, false);
-        let payload = vec![b'x'; size];
-        let mut wire = BytesMut::new();
-        encode_frame(&mut wire, OpCode::Binary, &payload, true, None);
-        encode_frame(&mut wire, OpCode::Ping, b"ping", true, None);
-        encode_frame(&mut wire, OpCode::Text, b"next", true, None);
-        let frames: Vec<_> = (0..3)
-            .map(|_| parser.parse(&mut wire).unwrap().unwrap())
-            .collect();
-        assert_eq!(frames[0].payload.as_ref(), payload);
-        assert_eq!(frames[1].header.opcode, OpCode::Ping);
-        assert_eq!(frames[1].payload.as_ref(), b"ping");
-        assert_eq!(frames[2].payload.as_ref(), b"next");
-        assert!(wire.is_empty());
+fn coalesced_extended_frames_preserve_following_control_and_data_frames() {
+    for size in [126, 193, 65535, 65536] {
+        for mask in [None, Some([1, 2, 3, 4])] {
+            let mut parser = FrameParser::new(size, mask.is_some());
+            let payload = vec![b'x'; size];
+            let mut wire = BytesMut::new();
+            encode_frame(&mut wire, OpCode::Binary, &payload, true, mask);
+            encode_frame(&mut wire, OpCode::Ping, b"ping", true, mask);
+            encode_frame(&mut wire, OpCode::Text, b"next", true, mask);
+            let frames: Vec<_> = (0..3)
+                .map(|_| parser.parse(&mut wire).unwrap().unwrap())
+                .collect();
+            assert_eq!(frames[0].payload.as_ref(), payload);
+            assert_eq!(frames[1].header.opcode, OpCode::Ping);
+            assert_eq!(frames[1].payload.as_ref(), b"ping");
+            assert_eq!(frames[2].payload.as_ref(), b"next");
+            assert!(wire.is_empty());
+            assert!(parser.pending_payload().is_none());
+        }
     }
 }
 

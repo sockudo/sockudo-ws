@@ -100,13 +100,13 @@ use futures_util::StreamExt;
 
 #[cfg(feature = "tokio-runtime")]
 #[tokio::test]
-async fn split_keeps_an_already_parsed_close_response() {
+async fn split_preserves_the_buffered_peer_close_response() {
     use bytes::{Bytes, BytesMut};
     use sockudo_ws::frame::FrameParser;
     use sockudo_ws::{Config, Role, WebSocketStream};
     use tokio::io::AsyncReadExt;
 
-    // Parsing "one" also accepts the following Close before split is called.
+    // The Close remains buffered when "one" is delivered; split must preserve its reply.
     let (io, mut peer) = tokio::io::duplex(64);
     let mut socket = WebSocketStream::from_raw_with_leftover(
         io,

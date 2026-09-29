@@ -456,7 +456,8 @@ impl Protocol {
 
     /// Accept one message, leaving later frames for the next reader call.
     /// Non-final fragments still report activity even without a complete message.
-    #[inline]
+    // Keep the parser result handling within each reader's receive path.
+    #[inline(always)]
     pub(crate) fn process_next_with_activity(
         &mut self,
         buf: &mut BytesMut,
@@ -464,7 +465,13 @@ impl Protocol {
     ) -> Result<Option<Message>> {
         *accepted_fragment = false;
         while !buf.is_empty() {
-            match self.parser.parse(buf)? {
+            if let Some((opcode, payload)) = self.parser.try_parse_complete_unmasked_data(buf) {
+                let prevalidated = std::mem::take(&mut self.partial_checked);
+                return self
+                    .handle_complete_data(opcode, payload, prevalidated)
+                    .map(Some);
+            }
+            match self.parser.parse_after_complete_data_miss(buf)? {
                 Some(frame) => {
                     let prevalidated = std::mem::take(&mut self.partial_checked);
                     if let Some(msg) = self.handle_frame(frame, prevalidated)? {
@@ -524,6 +531,7 @@ impl Protocol {
     ///
     /// `prevalidated` is the number of leading payload bytes that were already
     /// UTF-8 validated while the frame was still incomplete.
+    #[inline(always)]
     fn handle_frame(&mut self, frame: Frame, prevalidated: usize) -> Result<Option<Message>> {
         match frame.header.opcode {
             OpCode::Continuation => self.handle_continuation(frame, prevalidated),
@@ -551,7 +559,13 @@ impl Protocol {
     }
 
     /// Handle text frame
+    #[inline(always)]
     fn handle_text(&mut self, frame: Frame, prevalidated: usize) -> Result<Option<Message>> {
+        if frame.header.fin {
+            return self
+                .handle_complete_data(OpCode::Text, frame.payload, prevalidated)
+                .map(Some);
+        }
         if !self.validate_text_utf8 {
             return self
                 .handle_raw_text(frame)
@@ -560,42 +574,57 @@ impl Protocol {
         if self.fragment_opcode.is_some() {
             return Err(Error::Protocol("expected continuation frame"));
         }
-
-        if frame.header.fin {
-            // Complete message in one frame (fast path: one SIMD pass)
-            ensure_message_size(frame.payload.len(), self.max_message_size)?;
-            let valid = if prevalidated == 0 {
-                validate_utf8(&frame.payload)
-            } else {
-                let prevalidated = prevalidated.min(frame.payload.len());
-                self.utf8.push(&frame.payload[prevalidated..]) && self.utf8.finish()
-            };
-            if !valid {
-                return Err(Error::InvalidUtf8);
-            }
-            // Zero-copy: just return the Bytes directly (already UTF-8 validated)
-            Ok(Some(Message::Text(frame.payload)))
-        } else {
-            // Start of fragmented message
-            self.start_fragment(OpCode::Text, frame.payload, prevalidated)?;
-            Ok(None)
-        }
+        // Start of fragmented message
+        self.start_fragment(OpCode::Text, frame.payload, prevalidated)?;
+        Ok(None)
     }
 
     /// Handle binary frame
+    #[inline]
     fn handle_binary(&mut self, frame: Frame) -> Result<Option<Message>> {
+        if frame.header.fin {
+            // Complete message in one frame (fast path)
+            return self
+                .handle_complete_data(OpCode::Binary, frame.payload, 0)
+                .map(Some);
+        }
         if self.fragment_opcode.is_some() {
             return Err(Error::Protocol("expected continuation frame"));
         }
+        // Start of fragmented message
+        self.start_fragment(OpCode::Binary, frame.payload, 0)?;
+        Ok(None)
+    }
 
-        if frame.header.fin {
-            // Complete message in one frame (fast path)
-            ensure_message_size(frame.payload.len(), self.max_message_size)?;
-            Ok(Some(Message::Binary(frame.payload)))
+    /// Share complete Text/Binary validation between frame and direct-payload readers.
+    #[inline(always)]
+    fn handle_complete_data(
+        &mut self,
+        opcode: OpCode,
+        payload: Bytes,
+        prevalidated: usize,
+    ) -> Result<Message> {
+        if self.fragment_opcode.is_some() {
+            return Err(Error::Protocol("expected continuation frame"));
+        }
+        ensure_message_size(payload.len(), self.max_message_size)?;
+        if opcode == OpCode::Text {
+            if self.validate_text_utf8 {
+                // Complete message in one frame (fast path: one SIMD pass)
+                let valid = if prevalidated == 0 {
+                    validate_utf8(&payload)
+                } else {
+                    let prevalidated = prevalidated.min(payload.len());
+                    self.utf8.push(&payload[prevalidated..]) && self.utf8.finish()
+                };
+                if !valid {
+                    return Err(Error::InvalidUtf8);
+                }
+            }
+            // Zero-copy: just return the Bytes directly (validated when enabled)
+            Ok(Message::Text(payload))
         } else {
-            // Start of fragmented message
-            self.start_fragment(OpCode::Binary, frame.payload, 0)?;
-            Ok(None)
+            Ok(Message::Binary(payload))
         }
     }
 
@@ -885,6 +914,16 @@ impl Protocol {
             None
         };
         encode_frame(buf, OpCode::Pong, ping_data, true, mask);
+    }
+
+    /// Respond using the Close accepted by an independently owned reader.
+    pub(crate) fn encode_split_close_response(
+        &mut self,
+        reason: Option<CloseReason>,
+        buf: &mut BytesMut,
+    ) {
+        self.pending_close = reason;
+        self.encode_close_response(buf);
     }
 
     /// Encode a close response

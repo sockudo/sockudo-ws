@@ -195,6 +195,9 @@ async fn unified_sink_close_after_parse_error_shuts_down_transport() {
     peer.write_all(b"\x82\x01a\x82\x01b\x83\x00").await.unwrap();
     assert_eq!(stream.next().await.unwrap().unwrap().as_bytes(), b"a");
 
+    assert_eq!(stream.next().await.unwrap().unwrap().as_bytes(), b"b");
+    assert!(stream.next().await.unwrap().is_err());
+
     SinkExt::close(&mut stream).await.unwrap();
 
     let mut received = Vec::new();
@@ -308,22 +311,27 @@ async fn split_parse_error_releases_transport_while_writer_lives() {
 }
 
 #[tokio::test]
-async fn unified_parse_error_stops_writes_before_messages_are_drained() {
-    use futures_util::SinkExt;
+async fn unified_writes_stop_after_the_buffered_error_is_discovered() {
     let (io, mut peer) = tokio::io::duplex(128);
     let mut stream = WebSocketStream::client(io, config());
     peer.write_all(b"\x82\x01a\x82\x01b\x83\x00").await.unwrap();
     assert_eq!(stream.next().await.unwrap().unwrap().as_bytes(), b"a");
-
-    let result = stream.send(sockudo_ws::Message::text("late")).await;
-
-    assert!(matches!(result, Err(sockudo_ws::Error::ConnectionClosed)));
+    stream
+        .send(sockudo_ws::Message::text("before discovery"))
+        .await
+        .unwrap();
     assert_eq!(stream.next().await.unwrap().unwrap().as_bytes(), b"b");
+
     assert!(stream.next().await.unwrap().is_err());
+
+    assert!(matches!(
+        stream.send(sockudo_ws::Message::text("late")).await,
+        Err(sockudo_ws::Error::ConnectionClosed)
+    ));
 }
 
 #[tokio::test]
-async fn splitting_after_parse_error_does_not_reopen_writes() {
+async fn splitting_preserves_lazy_error_discovery_and_stops_writes_on_discovery() {
     let (io, mut peer) = tokio::io::duplex(128);
     let mut stream = WebSocketStream::client(io, config());
     peer.write_all(b"\x82\x01a\x82\x01b\x83\x00").await.unwrap();
@@ -331,13 +339,37 @@ async fn splitting_after_parse_error_does_not_reopen_writes() {
 
     let (mut reader, mut writer) = stream.split();
 
+    assert!(!writer.is_closed());
+    writer
+        .send(sockudo_ws::Message::text("before discovery"))
+        .await
+        .unwrap();
+    assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), b"b");
+    assert!(reader.next().await.unwrap().is_err());
     assert!(writer.is_closed());
     assert!(matches!(
         writer.send(sockudo_ws::Message::text("late")).await,
         Err(sockudo_ws::Error::ConnectionClosed)
     ));
-    assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), b"b");
-    assert!(reader.next().await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn splitting_after_a_discovered_error_does_not_reopen_writes() {
+    let (io, mut peer) = tokio::io::duplex(128);
+    let mut stream = WebSocketStream::client(io, config());
+    peer.write_all(b"\x83\x00").await.unwrap();
+    assert!(stream.next().await.unwrap().is_err());
+
+    let (mut reader, mut writer) = stream.split();
+
+    assert!(writer.is_closed());
+    assert!(
+        writer
+            .send(sockudo_ws::Message::text("late"))
+            .await
+            .is_err()
+    );
+    assert!(reader.next().await.is_none());
 }
 
 #[tokio::test]

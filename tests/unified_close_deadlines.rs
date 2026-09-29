@@ -15,7 +15,7 @@ struct ShutdownIo {
     input: DuplexStream,
     pending_shutdown: bool,
     fail_flush: bool,
-    block_write: bool,
+    block_write: Rc<Cell<bool>>,
     block_after_local_close: bool,
     writes: Rc<Cell<usize>>,
     shutdowns: Rc<Cell<usize>>,
@@ -41,7 +41,7 @@ impl AsyncWrite for ShutdownIo {
         if self.block_after_local_close && self.writes.get() > 1 {
             return Poll::Pending;
         }
-        if self.block_write {
+        if self.block_write.get() {
             return if self.writes.get() == 1 {
                 Poll::Ready(Ok(bytes.len().min(3)))
             } else {
@@ -76,7 +76,7 @@ fn connection(pending_shutdown: bool, fail_flush: bool) -> (ShutdownIo, DuplexSt
             input,
             pending_shutdown,
             fail_flush,
-            block_write: false,
+            block_write: Rc::new(Cell::new(false)),
             block_after_local_close: false,
             writes: Rc::new(Cell::new(0)),
             shutdowns: Rc::new(Cell::new(0)),
@@ -94,7 +94,7 @@ fn config() -> Config {
 }
 
 macro_rules! close_cases {
-    ($module:ident, $make:expr) => {
+    ($module:ident, $make:expr, $incremental:expr) => {
         mod $module {
             use super::*;
 
@@ -134,7 +134,7 @@ macro_rules! close_cases {
 
             #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
-            async fn accepted_close_before_parse_error_suppresses_all_pongs() {
+            async fn pong_response_follows_receive_discovery_policy() {
                 let (io, mut peer) = connection(false, false);
                 let writes = io.writes.clone();
                 let mut ws = ($make)(io, config());
@@ -143,7 +143,7 @@ macro_rules! close_cases {
                     .unwrap();
                 assert!(ws.next().await.unwrap().unwrap().is_ping());
                 assert!(ws.next().await.unwrap().unwrap().is_ping());
-                assert_eq!(writes.get(), 0);
+                assert_eq!(writes.get(), if $incremental { 2 } else { 0 });
                 assert!(ws.next().await.unwrap().unwrap().is_close());
                 assert!(ws.next().await.is_none());
             }
@@ -178,8 +178,8 @@ macro_rules! close_cases {
             #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn zero_budget_queued_close_cannot_stall_before_read() {
-                let (mut io, _peer) = connection(false, false);
-                io.block_write = true;
+                let (io, _peer) = connection(false, false);
+                io.block_write.set(true);
                 let writes = io.writes.clone();
                 let mut cfg = config();
                 cfg.close_timeout = 0;
@@ -244,11 +244,18 @@ macro_rules! close_cases {
 
             #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
-            async fn accepted_close_does_not_wait_for_preceding_pong() {
-                let (mut io, mut peer) = connection(true, false);
-                io.block_write = true;
+            async fn buffered_close_with_blocked_pong_follows_receive_discovery_policy() {
+                let (io, mut peer) = connection(true, false);
+                io.block_write.set(true);
+                let block_write = io.block_write.clone();
                 let mut ws = ($make)(io, config());
                 peer.write_all(b"\x89\x01p\x88\x02\x03\xe8").await.unwrap();
+                if $incremental {
+                    // The later Close is still unparsed; the current Pong must
+                    // finish before the reader advances to it.
+                    assert!(futures_util::poll!(ws.next()).is_pending());
+                    block_write.set(false);
+                }
                 assert!(
                     tokio::time::timeout(Duration::from_secs(2), ws.next())
                         .await
@@ -436,8 +443,8 @@ macro_rules! close_cases {
             #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn expired_close_write_is_not_restarted() {
-                let (mut io, _peer) = connection(false, false);
-                io.block_write = true;
+                let (io, _peer) = connection(false, false);
+                io.block_write.set(true);
                 let writes = io.writes.clone();
                 let shutdowns = io.shutdowns.clone();
                 let mut ws = ($make)(
@@ -462,8 +469,54 @@ macro_rules! close_cases {
     };
 }
 
-close_cases!(plain, WebSocketStream::client);
+close_cases!(plain, WebSocketStream::client, true);
 #[cfg(feature = "permessage-deflate")]
-close_cases!(compressed, |io, config| {
-    sockudo_ws::CompressedWebSocketStream::client(io, config, Default::default())
-});
+close_cases!(
+    compressed,
+    |io, config| { sockudo_ws::CompressedWebSocketStream::client(io, config, Default::default()) },
+    false
+);
+
+#[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
+#[tokio::test(start_paused = true)]
+async fn pending_shutdown_after_parse_error_uses_a_bounded_cleanup_budget() {
+    let (io, mut peer) = connection(true, false);
+    let writes = io.writes.clone();
+    let shutdowns = io.shutdowns.clone();
+    let mut ws = WebSocketStream::client(io, config());
+    peer.write_all(b"\x83\x00").await.unwrap();
+    assert!(ws.next().await.unwrap().is_err());
+    let start = tokio::time::Instant::now();
+
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), SinkExt::close(&mut ws))
+            .await
+            .unwrap(),
+        Err(Error::ConnectionClosed)
+    ));
+
+    assert_eq!(start.elapsed(), Duration::from_secs(1));
+    assert_eq!(writes.get(), 0);
+    assert!(shutdowns.get() > 0);
+    assert!(ws.next().await.is_none());
+}
+
+#[tokio::test]
+async fn parse_error_cleanup_discards_queued_data_and_reports_shutdown_error() {
+    let (io, mut peer) = connection(false, false);
+    let writes = io.writes.clone();
+    let shutdowns = io.shutdowns.clone();
+    let mut ws = WebSocketStream::client(io, config());
+    peer.write_all(b"\x82\x01a\x83\x00").await.unwrap();
+    assert_eq!(ws.next().await.unwrap().unwrap().as_bytes(), b"a");
+    ws.feed(Message::binary(vec![1, 2, 3])).await.unwrap();
+    assert!(ws.next().await.unwrap().is_err());
+    assert_eq!(writes.get(), 0);
+
+    let result = SinkExt::close(&mut ws).await;
+
+    assert!(matches!(result, Err(Error::Io(_))));
+    assert_eq!(shutdowns.get(), 1);
+    assert_eq!(writes.get(), 0);
+    assert!(ws.next().await.is_none());
+}
