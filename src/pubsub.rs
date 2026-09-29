@@ -65,7 +65,8 @@
 //! pubsub.remove_subscriber_by_socket_id(socket_id);
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
@@ -120,20 +121,29 @@ impl PublishResult {
     }
 }
 
+// Share one channel handle per subscriber so snapshots only update one reference
+// count. Each recipient still releases its own handle after delivery.
+type SubscriberSender = Arc<UnboundedSender<Message>>;
+
+enum RecipientSnapshot {
+    One(SubscriberSender),
+    Many(Vec<SubscriberSender>),
+}
+
 /// A subscriber with its message channel
 struct Subscriber {
     /// Channel for sending messages to this subscriber
-    sender: UnboundedSender<Message>,
-    /// Topics this subscriber is subscribed to (for cleanup)
-    topics: HashSet<String>,
+    sender: SubscriberSender,
+    /// Topics and member positions for constant-time cleanup
+    topics: HashMap<Arc<str>, usize>,
     /// Optional Pusher-style socket ID (e.g., "1234.5678")
     socket_id: Option<String>,
 }
 
 #[derive(Default)]
 struct PubSubData {
-    /// Topics mapped to their subscriber sets
-    topics: HashMap<String, HashSet<SubscriberId>>,
+    /// Topics mapped to indexed subscriber selections
+    topics: HashMap<Arc<str>, Vec<(SubscriberId, SubscriberSender)>>,
     /// All subscribers indexed by ID
     subscribers: HashMap<SubscriberId, Subscriber>,
     /// Socket ID to SubscriberId mapping (for Pusher-style IDs)
@@ -192,8 +202,8 @@ impl PubSub {
     ) {
         let socket_id = socket_id.map(str::to_owned);
         let subscriber = Subscriber {
-            sender,
-            topics: HashSet::new(),
+            sender: Arc::new(sender),
+            topics: HashMap::new(),
             socket_id: socket_id.clone(),
         };
 
@@ -207,10 +217,7 @@ impl PubSub {
         }
     }
 
-    fn remove_subscriber_from(
-        data: &mut PubSubData,
-        id: SubscriberId,
-    ) -> Option<UnboundedSender<Message>> {
+    fn remove_subscriber_from(data: &mut PubSubData, id: SubscriberId) -> Option<SubscriberSender> {
         // Get the subscriber
         let subscriber = data.subscribers.remove(&id)?;
 
@@ -221,21 +228,8 @@ impl PubSub {
         }
 
         // Unsubscribe from all topics
-        for topic in subscriber.topics {
-            let remove_topic = {
-                let topic_subscribers = data
-                    .topics
-                    .get_mut(&topic)
-                    .expect("subscriber topic must exist in topic index");
-                let removed = topic_subscribers.remove(&id);
-                debug_assert!(removed, "topic index must contain subscriber");
-                topic_subscribers.is_empty()
-            };
-
-            if remove_topic {
-                // Remove empty topics
-                data.topics.remove(&topic);
-            }
+        for (topic, position) in subscriber.topics {
+            Self::remove_topic_member(data, &topic, position);
         }
 
         // Dropping the last sender can wake its receiver. The caller releases
@@ -244,52 +238,70 @@ impl PubSub {
     }
 
     fn subscribe_in(data: &mut PubSubData, id: SubscriberId, topic: &str) -> bool {
-        // Add topic to subscriber's set
+        // Add topic to subscriber's index
         let Some(subscriber) = data.subscribers.get_mut(&id) else {
             // Subscriber doesn't exist
             return false;
         };
 
-        if !subscriber.topics.insert(topic.to_owned()) {
+        if subscriber.topics.contains_key(topic) {
             // Already subscribed
             return false;
         }
 
+        // Share the canonical name with reverse indexes instead of allocating
+        // another string for each subscription to an existing topic.
+        let topic = data
+            .topics
+            .get_key_value(topic)
+            .map_or_else(|| Arc::<str>::from(topic), |(name, _)| Arc::clone(name));
+
         // Add subscriber to topic
-        let inserted = data.topics.entry(topic.to_owned()).or_default().insert(id);
-        debug_assert!(
-            inserted,
-            "subscriber topic index must be updated atomically"
-        );
+        let members = data.topics.entry(Arc::clone(&topic)).or_default();
+        subscriber.topics.insert(topic, members.len());
+        members.push((id, subscriber.sender.clone()));
         true
     }
 
     fn unsubscribe_in(data: &mut PubSubData, id: SubscriberId, topic: &str) -> bool {
-        // Remove topic from subscriber's set
+        // Remove topic from subscriber's index
         let Some(subscriber) = data.subscribers.get_mut(&id) else {
             return false;
         };
 
-        if !subscriber.topics.remove(topic) {
+        let Some(position) = subscriber.topics.remove(topic) else {
             return false;
-        }
+        };
 
-        let remove_topic = {
-            let topic_subscribers = data
+        Self::remove_topic_member(data, topic, position);
+        true
+    }
+
+    fn remove_topic_member(data: &mut PubSubData, topic: &str, position: usize) {
+        let (moved, remove_topic) = {
+            let members = data
                 .topics
                 .get_mut(topic)
                 .expect("subscriber topic must exist in topic index");
-            let removed = topic_subscribers.remove(&id);
-            debug_assert!(removed, "topic index must contain subscriber");
-            topic_subscribers.is_empty()
+            // The caller keeps the removed subscriber's authoritative sender
+            // alive until unlocking, so dropping this copy cannot wake it here.
+            members.swap_remove(position);
+            (members.get(position).map(|(id, _)| *id), members.is_empty())
         };
 
+        if let Some(moved) = moved {
+            *data
+                .subscribers
+                .get_mut(&moved)
+                .expect("moved topic member must be an active subscriber")
+                .topics
+                .get_mut(topic)
+                .expect("moved topic member must have a reverse index") = position;
+        }
         if remove_topic {
             // Remove empty topics
             data.topics.remove(topic);
         }
-
-        true
     }
 
     // =========================================================================
@@ -534,7 +546,7 @@ impl PubSub {
 
         data.subscribers
             .get(id)
-            .is_some_and(|subscriber| subscriber.topics.contains(topic))
+            .is_some_and(|subscriber| subscriber.topics.contains_key(topic))
     }
 
     /// Get all topics a subscriber is subscribed to by socket ID
@@ -546,7 +558,13 @@ impl PubSub {
 
         data.subscribers
             .get(id)
-            .map(|subscriber| subscriber.topics.iter().cloned().collect())
+            .map(|subscriber| {
+                subscriber
+                    .topics
+                    .keys()
+                    .map(|topic| topic.as_ref().to_owned())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -637,32 +655,41 @@ impl PubSub {
         data: &PubSubData,
         topic: &str,
         exclude: Option<SubscriberId>,
-    ) -> Option<Vec<UnboundedSender<Message>>> {
+    ) -> Option<RecipientSnapshot> {
         let topic_subscribers = data.topics.get(topic)?;
-        let recipient_count = topic_subscribers.len()
-            - usize::from(exclude.is_some_and(|id| topic_subscribers.contains(&id)));
+        let exclude = exclude.filter(|id| {
+            if let [(member, _)] = topic_subscribers.as_slice() {
+                return member == id;
+            }
+            data.subscribers
+                .get(id)
+                .is_some_and(|subscriber| subscriber.topics.contains_key(topic))
+        });
+        let recipient_count = topic_subscribers.len() - usize::from(exclude.is_some());
+        if recipient_count == 1 {
+            let (_, sender) = if Some(topic_subscribers[0].0) == exclude {
+                &topic_subscribers[1]
+            } else {
+                &topic_subscribers[0]
+            };
+            return Some(RecipientSnapshot::One(sender.clone()));
+        }
         // Avoid growing the snapshot under the lock, including allocating for an
         // empty snapshot when the only subscriber is excluded.
         let mut recipients = Vec::with_capacity(recipient_count);
         recipients.extend(
             topic_subscribers
                 .iter()
-                .filter(|id| Some(**id) != exclude)
-                .map(|id| {
-                    data.subscribers
-                        .get(id)
-                        .expect("topic index must reference an active subscriber")
-                        .sender
-                        .clone()
-                }),
+                .filter(|(id, _)| Some(*id) != exclude)
+                .map(|(_, sender)| sender.clone()),
         );
 
-        Some(recipients)
+        Some(RecipientSnapshot::Many(recipients))
     }
 
     fn send_to_recipients(
         &self,
-        recipients: Option<Vec<UnboundedSender<Message>>>,
+        recipients: Option<RecipientSnapshot>,
         message: Message,
     ) -> PublishResult {
         let Some(recipients) = recipients else {
@@ -671,13 +698,22 @@ impl PubSub {
 
         // Channel sends can synchronously invoke receiver wakers that reenter
         // PubSub. No membership lock may be held while delivering this snapshot.
-        let mut sent = 0;
-        for sender in recipients {
-            // Clone is O(1) for Message because it uses Bytes internally
-            if sender.send(message.clone()).is_ok() {
-                sent += 1;
+        let sent = match recipients {
+            // Keep the original message alive through delivery, including when a
+            // receiver waker consumes the queued clone synchronously.
+            #[expect(clippy::redundant_clone, reason = "preserve message owner drop timing")]
+            RecipientSnapshot::One(sender) => usize::from(sender.send(message.clone()).is_ok()),
+            RecipientSnapshot::Many(recipients) => {
+                let mut sent = 0;
+                for sender in recipients {
+                    // Clone is O(1) for Message because it uses Bytes internally
+                    if sender.send(message.clone()).is_ok() {
+                        sent += 1;
+                    }
+                }
+                sent
             }
-        }
+        };
 
         self.messages_published.fetch_add(1, Ordering::Relaxed);
 
@@ -698,7 +734,7 @@ impl PubSub {
             .read()
             .subscribers
             .get(&id)
-            .is_some_and(|subscriber| subscriber.topics.contains(topic))
+            .is_some_and(|subscriber| subscriber.topics.contains_key(topic))
     }
 
     /// Get the number of subscribers to a topic
@@ -707,7 +743,7 @@ impl PubSub {
             .read()
             .topics
             .get(topic)
-            .map(HashSet::len)
+            .map(Vec::len)
             .unwrap_or(0)
     }
 
@@ -732,13 +768,24 @@ impl PubSub {
             .read()
             .subscribers
             .get(&id)
-            .map(|subscriber| subscriber.topics.iter().cloned().collect())
+            .map(|subscriber| {
+                subscriber
+                    .topics
+                    .keys()
+                    .map(|topic| topic.as_ref().to_owned())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
     /// Get all topic names in the system
     pub fn all_topics(&self) -> Vec<String> {
-        self.state.read().topics.keys().cloned().collect()
+        self.state
+            .read()
+            .topics
+            .keys()
+            .map(|topic| topic.as_ref().to_owned())
+            .collect()
     }
 
     /// Get all socket IDs in the system
@@ -776,12 +823,8 @@ mod tests {
                 assert_eq!(data.socket_id_map.get(socket_id), Some(id));
             }
 
-            for topic in &subscriber.topics {
-                assert!(
-                    data.topics
-                        .get(topic)
-                        .is_some_and(|subscribers| subscribers.contains(id))
-                );
+            for (topic, position) in &subscriber.topics {
+                assert_eq!(data.topics[topic][*position].0, *id);
             }
         }
 
@@ -796,12 +839,14 @@ mod tests {
 
         for (topic, subscribers) in &data.topics {
             assert!(!subscribers.is_empty());
-            for id in subscribers {
+            for (position, (id, sender)) in subscribers.iter().enumerate() {
+                assert_eq!(data.subscribers[id].topics.get(topic), Some(&position));
                 assert!(
                     data.subscribers
                         .get(id)
-                        .is_some_and(|subscriber| subscriber.topics.contains(topic))
+                        .is_some_and(|subscriber| subscriber.topics.contains_key(topic))
                 );
+                assert!(sender.same_channel(&data.subscribers[id].sender));
             }
         }
     }
