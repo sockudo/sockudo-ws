@@ -391,8 +391,33 @@ impl FrameParser {
     /// - Ok(Some(frame)) if a complete frame was parsed
     /// - Ok(None) if more data is needed
     /// - Err(e) if parsing failed
-    #[inline]
+    #[inline(always)]
     pub fn parse(&mut self, buf: &mut BytesMut) -> Result<Option<Frame>> {
+        if let Some((opcode, payload)) = self.try_parse_complete_unmasked_data(buf) {
+            return Ok(Some(Frame {
+                header: FrameHeader {
+                    fin: true,
+                    rsv1: false,
+                    rsv2: false,
+                    rsv3: false,
+                    opcode,
+                    masked: false,
+                    payload_len: payload.len() as u64,
+                    mask: None,
+                },
+                payload,
+            }));
+        }
+        self.parse_after_complete_data_miss(buf)
+    }
+
+    /// Continue after the complete-data fast path misses, without classifying it twice.
+    /// Typed readers share this path when they extract complete payloads directly.
+    #[inline(always)]
+    pub(crate) fn parse_after_complete_data_miss(
+        &mut self,
+        buf: &mut BytesMut,
+    ) -> Result<Option<Frame>> {
         // Ultra-fast path for small unmasked frames (server->client)
         // This handles the common case without any state machine overhead
         if self.state == ParseState::Header && !self.expect_masked && buf.len() >= 2 {
@@ -516,6 +541,47 @@ impl FrameParser {
         }
 
         self.parse_slow(buf)
+    }
+
+    /// Extract a complete, final, uncompressed Text/Binary payload for typed readers.
+    /// A miss leaves both the input and incremental parser state untouched.
+    #[inline(always)]
+    pub(crate) fn try_parse_complete_unmasked_data(
+        &mut self,
+        buf: &mut BytesMut,
+    ) -> Option<(OpCode, Bytes)> {
+        if self.state != ParseState::Header || self.expect_masked || buf.len() < 2 {
+            return None;
+        }
+        let b0 = buf[0];
+        if !matches!(b0, 0x81 | 0x82) {
+            return None;
+        }
+        // Complete unmasked text/binary frames with a 16-bit length
+        // need no incremental parser state. All other headers retain the
+        // slow path's validation order and partial-read behavior.
+        let (header_len, payload_len) = match buf[1] {
+            length @ 0..=125 => (2, length as usize),
+            126 if buf.len() >= 4 => {
+                let length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+                if length < 126 {
+                    return None;
+                }
+                (4, length)
+            }
+            _ => return None,
+        };
+        if payload_len > self.max_frame_size || buf.len() < header_len + payload_len {
+            return None;
+        }
+        buf.advance(header_len);
+        let payload = buf.split_to(payload_len).freeze();
+        let opcode = if b0 == 0x81 {
+            OpCode::Text
+        } else {
+            OpCode::Binary
+        };
+        Some((opcode, payload))
     }
 
     /// Slow path for frame parsing - handles all edge cases
@@ -674,7 +740,7 @@ impl FrameParser {
                     // We have the complete header
                     buf.advance(total_header);
 
-                    self.header = Some(FrameHeader {
+                    let header = FrameHeader {
                         fin,
                         rsv1,
                         rsv2,
@@ -683,7 +749,22 @@ impl FrameParser {
                         masked,
                         payload_len,
                         mask,
-                    });
+                    };
+                    // Complete frames need no intermediate parser state. All
+                    // length and header checks above also apply to this path.
+                    let payload_len = payload_len as usize;
+                    if buf.len() >= payload_len {
+                        let mut payload = buf.split_to(payload_len);
+                        if let Some(mask) = mask {
+                            apply_mask(&mut payload, mask);
+                        }
+                        return Ok(Some(Frame {
+                            header,
+                            payload: payload.freeze(),
+                        }));
+                    }
+
+                    self.header = Some(header);
                     self.state = ParseState::Payload;
                 }
 
