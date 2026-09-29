@@ -285,15 +285,16 @@ where
 {
     let cancel = CancelToken::new();
     let read = CompioFutureExt::with_cancel(read_more(reader, buf), cancel.clone()).fuse();
-    let delay = Duration::from_millis(
-        deadline
-            .at()
-            .saturating_sub(epoch.elapsed().as_millis() as u64),
-    );
-    let timer = ::compio::time::sleep(delay).fuse();
+    let timer = async {
+        ::compio::time::sleep_until(epoch + Duration::from_millis(deadline.at())).await;
+    }
+    .fuse();
     futures_util::pin_mut!(read, timer);
 
-    futures_util::select! {
+    // A ready read needs no timer registration. The caller rechecks heartbeat
+    // deadlines before parsing newly read bytes; simultaneous EOF/errors keep
+    // the read result, which the previous unbiased selection also permitted.
+    futures_util::select_biased! {
         result = read => DeadlineReadOutcome::Read(result),
         () = timer => {
             cancel.cancel();
@@ -1688,12 +1689,14 @@ where
             }
 
             if let Some(msg) = self.next_pending_message() {
-                let now = self.clock_epoch.elapsed().as_millis() as u64;
-                let pong = match &msg {
-                    Message::Pong(payload) => Some(payload),
-                    _ => None,
-                };
-                self.heartbeat.on_inbound(now, pong);
+                if self.heartbeat.tracks_inbound_activity() {
+                    let now = self.clock_epoch.elapsed().as_millis() as u64;
+                    let pong = match &msg {
+                        Message::Pong(payload) => Some(payload),
+                        _ => None,
+                    };
+                    self.heartbeat.on_inbound(now, pong);
+                }
                 return Some(self.handle_incoming_message(msg).await);
             }
 
@@ -3053,12 +3056,14 @@ where
             }
 
             if let Some(msg) = self.next_pending_message() {
-                let now = self.clock_epoch.elapsed().as_millis() as u64;
-                let pong = match &msg {
-                    Message::Pong(payload) => Some(payload),
-                    _ => None,
-                };
-                self.heartbeat.on_inbound(now, pong);
+                if self.heartbeat.tracks_inbound_activity() {
+                    let now = self.clock_epoch.elapsed().as_millis() as u64;
+                    let pong = match &msg {
+                        Message::Pong(payload) => Some(payload),
+                        _ => None,
+                    };
+                    self.heartbeat.on_inbound(now, pong);
+                }
                 return Some(self.handle_incoming_message(msg).await);
             }
 
