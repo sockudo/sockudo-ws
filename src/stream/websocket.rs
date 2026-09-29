@@ -369,7 +369,11 @@ where
         // Reuse an empty receive window when no delivered payload still owns it.
         if *this.reclaim_read_window && this.read_buf.is_empty() {
             *this.reclaim_read_window = false;
-            let _ = this.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE);
+            if !this.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE) {
+                // Retained messages still own the old allocation. Grow the empty
+                // window now so a later reserve does not copy a partial frame.
+                this.read_buf.reserve(crate::RECV_BUFFER_SIZE);
+            }
         }
 
         if this.read_buf.capacity() - this.read_buf.len() < 4096 {
@@ -1688,7 +1692,11 @@ where
             // Reuse an empty receive window when no delivered payload still owns it.
             if self.reclaim_read_window && self.read_buf.is_empty() {
                 self.reclaim_read_window = false;
-                let _ = self.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE);
+                if !self.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE) {
+                    // Retained messages still own the old allocation. Grow the empty
+                    // window now so a later reserve does not copy a partial frame.
+                    self.read_buf.reserve(crate::RECV_BUFFER_SIZE);
+                }
             }
 
             if self.read_buf.capacity() - self.read_buf.len() < 4096 {
