@@ -37,12 +37,11 @@ pin_project! {
     /// This type implements both `Stream<Item = Result<Message>>` for receiving
     /// and `Sink<Message>` for sending messages.
     ///
-    /// Each receive call parses only through the next complete message. Later
-    /// buffered frames, including errors and Close, remain undiscovered until
-    /// another receive call. Writes remain allowed until an error is discovered;
-    /// heartbeat deadlines take precedence over an unparsed buffered tail.
-    /// Before splitting, a Ping is answered before parsing later frames, even if
-    /// a later Close is already buffered by the transport. After `split()`, the
+    /// Each receive call normally parses only through the next complete message.
+    /// After a Ping, the already-buffered tail is parsed so a buffered Close can
+    /// suppress the automatic Pong; accepted messages remain in wire order.
+    /// Writes remain allowed until an error is discovered, and heartbeat deadlines
+    /// take precedence over an unparsed buffered tail. After `split()`, the
     /// connection driver handles control output asynchronously; the reader does
     /// not wait for a Pong to flush before parsing another frame.
     ///
@@ -88,10 +87,12 @@ pin_project! {
         closing_deadline: Option<u64>,
         post_expiry_read_attempted: bool,
         immediate_write_shutdown: bool,
-        write_shutdown_complete: bool,
+        write_shutdown_state: WriteShutdownState,
         config: Config,
         // At most one message accepted for delivery by the read path.
         pending_message: Option<Message>,
+        // Messages parsed after a Ping while checking for a buffered Close.
+        pending_ping_batch: Vec<Message>,
         // Deliver successfully parsed messages before a later parse failure.
         pending_parse_error: Option<Error>,
         // A control message is only returned after its automatic response is flushed.
@@ -122,6 +123,24 @@ enum StreamState {
     CloseSent,
     /// Connection closed
     Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteShutdownState {
+    NotStarted,
+    Pending,
+    Complete,
+    Failed,
+}
+
+impl WriteShutdownState {
+    fn can_poll(self) -> bool {
+        matches!(self, Self::NotStarted | Self::Pending)
+    }
+
+    fn is_complete(self) -> bool {
+        self == Self::Complete
+    }
 }
 
 impl<S> WebSocketStream<S>
@@ -161,9 +180,10 @@ where
             closing_deadline: None,
             post_expiry_read_attempted: false,
             immediate_write_shutdown: false,
-            write_shutdown_complete: false,
+            write_shutdown_state: WriteShutdownState::NotStarted,
             config,
             pending_message: None,
+            pending_ping_batch: Vec::new(),
             pending_parse_error: None,
             pending_control_message: None,
             pending_terminal_error: None,
@@ -326,8 +346,14 @@ where
             self.flush_write_buf().await?;
             if self.immediate_write_shutdown {
                 // Finish the send half so multiplexed transports retain queued frames.
-                self.inner.shutdown().await?;
-                self.write_shutdown_complete = true;
+                self.write_shutdown_state = WriteShutdownState::Pending;
+                match self.inner.shutdown().await {
+                    Ok(()) => self.write_shutdown_state = WriteShutdownState::Complete,
+                    Err(error) => {
+                        self.write_shutdown_state = WriteShutdownState::Failed;
+                        return Err(error.into());
+                    }
+                }
             }
             Ok(())
         })
@@ -410,6 +436,7 @@ where
     #[inline(always)]
     fn process_read_buf(&mut self) -> Result<Option<Message>> {
         debug_assert!(self.pending_message.is_none());
+        debug_assert!(self.pending_ping_batch.is_empty());
         let mut accepted_fragment = false;
         let result = self
             .protocol
@@ -426,10 +453,49 @@ where
         Ok(message)
     }
 
+    /// Parse only the bytes already buffered after an accepted Ping.
+    fn process_buffered_after_ping(&mut self) {
+        debug_assert!(self.pending_ping_batch.is_empty());
+        debug_assert!(self.has_unprocessed_read_data);
+        let mut accepted_fragment = false;
+        let result = self.protocol.process_into_with_activity(
+            &mut self.read_buf,
+            &mut self.pending_ping_batch,
+            &mut accepted_fragment,
+        );
+        if accepted_fragment && self.heartbeat.tracks_inbound_activity() {
+            self.heartbeat
+                .on_inbound(self.clock_epoch.elapsed().as_millis() as u64, None);
+        }
+        self.has_unprocessed_read_data = false;
+        self.pending_ping_batch.reverse();
+        if let Err(error) = result {
+            self.pending_parse_error = Some(error);
+            if self.state == StreamState::Open {
+                self.state = StreamState::ReadErrorPending;
+            }
+        }
+    }
+
     /// Get the next pending message (moved out, no clone)
     #[inline]
     fn next_pending_message(&mut self) -> Option<Message> {
-        self.pending_message.take()
+        self.pending_message
+            .take()
+            .or_else(|| self.pending_ping_batch.pop())
+    }
+
+    fn poll_transport_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.write_shutdown_state = WriteShutdownState::Pending;
+        let result = Pin::new(&mut self.inner).poll_shutdown(cx);
+        if let Poll::Ready(result) = &result {
+            self.write_shutdown_state = if result.is_ok() {
+                WriteShutdownState::Complete
+            } else {
+                WriteShutdownState::Failed
+            };
+        }
+        result
     }
 
     fn begin_closing(&mut self) -> u64 {
@@ -447,6 +513,10 @@ where
     // Cleanup cannot replace an accepted Close or the original timeout cause.
     #[cold]
     fn finish_read_close(&mut self, fallback: Option<Error>) -> Option<Result<Message>> {
+        if self.write_shutdown_state == WriteShutdownState::Pending {
+            // Terminal cleanup must not restart an unfinished transport shutdown.
+            self.write_shutdown_state = WriteShutdownState::Failed;
+        }
         self.state = StreamState::Closed;
         self.heartbeat.stop();
         self.heartbeat_sleep = None;
@@ -454,6 +524,7 @@ where
         self.close_after_flush = false;
         self.ping_flush_pending = false;
         self.pending_message = None;
+        self.pending_ping_batch.clear();
         let close = self
             .pending_control_message
             .take()
@@ -582,9 +653,9 @@ where
                             this.heartbeat.ping_flushed(now);
                         }
 
-                        if this.close_after_flush && !this.write_shutdown_complete {
-                            match Pin::new(&mut this.inner).poll_shutdown(cx) {
-                                Poll::Ready(Ok(())) => this.write_shutdown_complete = true,
+                        if this.close_after_flush && !this.write_shutdown_state.is_complete() {
+                            match this.poll_transport_shutdown(cx) {
+                                Poll::Ready(Ok(())) => {}
                                 Poll::Ready(Err(_)) => {}
                                 Poll::Pending => {
                                     if this.poll_closing_expired(cx) {
@@ -616,8 +687,7 @@ where
                                 this.finish_read_close(Some(Error::ConnectionClosed)),
                             );
                         }
-                        if this.pending_parse_error.is_none()
-                            && let Some(deadline) = this.heartbeat.next_hard_deadline()
+                        if let Some(deadline) = this.heartbeat.next_hard_deadline()
                             && this.poll_heartbeat_timer(cx, deadline.at()).is_ready()
                         {
                             expired_deadline = Some(deadline);
@@ -633,6 +703,7 @@ where
 
             if parsed_message.is_none()
                 && self.pending_message.is_none()
+                && self.pending_ping_batch.is_empty()
                 && let Some(error) = self.as_mut().get_mut().pending_parse_error.take()
             {
                 let this = self.as_mut().get_mut();
@@ -729,7 +800,14 @@ where
                     Message::Ping(data) => {
                         // Queue pong response
                         let this = self.as_mut().get_mut();
-                        if this.write_shutdown_complete || this.poll_closing_expired(cx) {
+                        if this.has_unprocessed_read_data {
+                            debug_assert!(this.pending_ping_batch.is_empty());
+                            this.process_buffered_after_ping();
+                        }
+                        if this.write_shutdown_state.is_complete()
+                            || this.poll_closing_expired(cx)
+                            || this.pending_ping_batch.iter().any(Message::is_close)
+                        {
                             // END_STREAM forbids a Pong, but the read half must
                             // still deliver this Ping and the following Close.
                             // Expiry permits draining accepted input, not new writes.
@@ -744,6 +822,7 @@ where
                         let this = self.as_mut().get_mut();
                         this.begin_closing();
                         this.pending_message = None;
+                        this.pending_ping_batch.clear();
                         this.pending_parse_error = None;
                         this.read_buf.clear();
                         if matches!(
@@ -778,11 +857,11 @@ where
                         let this = self.as_mut().get_mut();
                         // No pending frame may be flushed through transport cleanup.
                         // At expiry shutdown gets one poll, without a new waiting budget.
-                        if !this.write_shutdown_complete
+                        if this.write_shutdown_state.can_poll()
                             && !this.write_buf.has_data()
-                            && let Poll::Ready(Ok(())) = Pin::new(&mut this.inner).poll_shutdown(cx)
+                            && let Poll::Ready(Ok(())) = this.poll_transport_shutdown(cx)
                         {
-                            this.write_shutdown_complete = true;
+                            debug_assert!(this.write_shutdown_state.is_complete());
                         }
                         return Poll::Ready(this.finish_read_close(Some(Error::ConnectionClosed)));
                     }
@@ -972,15 +1051,14 @@ where
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if self.state == StreamState::Closed || self.write_shutdown_complete {
+        if self.state == StreamState::Closed || self.write_shutdown_state.is_complete() {
             let this = self.as_mut().get_mut();
             // A read error can end the WebSocket before the transport send half
             // is shut down. Do not flush an abandoned partial frame during cleanup.
-            if !this.write_shutdown_complete && !this.write_buf.has_data() {
+            if this.write_shutdown_state.can_poll() && !this.write_buf.has_data() {
                 this.begin_closing();
-                match Pin::new(&mut this.inner).poll_shutdown(cx) {
+                match this.poll_transport_shutdown(cx) {
                     Poll::Ready(result) => {
-                        this.write_shutdown_complete = result.is_ok();
                         this.finish_read_close(None);
                         return Poll::Ready(result.map_err(Into::into));
                     }
@@ -1007,8 +1085,9 @@ where
         let result = match self.as_mut().poll_write_out(cx) {
             Poll::Ready(Ok(())) => {
                 // Shutdown the underlying stream
-                Pin::new(&mut self.as_mut().get_mut().inner)
-                    .poll_shutdown(cx)
+                self.as_mut()
+                    .get_mut()
+                    .poll_transport_shutdown(cx)
                     .map_err(Into::into)
             }
             other => other,
@@ -1016,7 +1095,6 @@ where
         match result {
             Poll::Ready(result) => {
                 let this = self.as_mut().get_mut();
-                this.write_shutdown_complete = result.is_ok();
                 this.finish_read_close(None);
                 Poll::Ready(result)
             }
@@ -1520,6 +1598,8 @@ pub struct SplitReader<S> {
     reclaim_read_window: bool,
     has_unprocessed_read_data: bool,
     pending_message: Option<Message>,
+    // Messages parsed by the unified reader after a Ping and moved through split().
+    pending_ping_batch: Vec<Message>,
     // Deliver successfully parsed messages before a later parse failure.
     pending_parse_error: Option<Error>,
     control_tx: mpsc::Sender<ControlRequest>,
@@ -1591,6 +1671,7 @@ where
                 reclaim_read_window: self.reclaim_read_window,
                 has_unprocessed_read_data: self.has_unprocessed_read_data,
                 pending_message: self.pending_message,
+                pending_ping_batch: self.pending_ping_batch,
                 pending_parse_error: self.pending_parse_error,
                 control_tx: control_tx.clone(),
                 terminal_rx,
@@ -1635,7 +1716,11 @@ where
                 return result;
             }
 
-            let message = if let Some(msg) = self.pending_message.take() {
+            let message = if let Some(msg) = self
+                .pending_message
+                .take()
+                .or_else(|| self.pending_ping_batch.pop())
+            {
                 Some(msg)
             } else if self.pending_parse_error.is_none() && self.has_unprocessed_read_data {
                 self.has_unprocessed_read_data = false;
@@ -1673,6 +1758,7 @@ where
                     Message::Close(reason) => {
                         self.shared.begin_peer_closing();
                         self.pending_message = None;
+                        self.pending_ping_batch.clear();
                         self.pending_parse_error = None;
                         self.read_buf.clear();
                         ControlRequest::PeerClose(reason.clone())
@@ -2716,8 +2802,7 @@ where
                                 this.finish_read_close(Some(Error::ConnectionClosed)),
                             );
                         }
-                        if this.pending_parse_error.is_none()
-                            && let Some(deadline) = this.heartbeat.next_hard_deadline()
+                        if let Some(deadline) = this.heartbeat.next_hard_deadline()
                             && this.poll_heartbeat_timer(cx, deadline.at()).is_ready()
                         {
                             expired_deadline = Some(deadline);

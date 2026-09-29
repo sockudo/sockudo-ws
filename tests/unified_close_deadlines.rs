@@ -93,8 +93,12 @@ fn config() -> Config {
         .build()
 }
 
+fn heartbeat_config() -> Config {
+    Config::builder().close_timeout(1).build()
+}
+
 macro_rules! close_cases {
-    ($module:ident, $make:expr, $incremental:expr) => {
+    ($module:ident, $make:expr) => {
         mod $module {
             use super::*;
 
@@ -134,7 +138,7 @@ macro_rules! close_cases {
 
             #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
-            async fn pong_response_follows_receive_discovery_policy() {
+            async fn accepted_close_suppresses_preceding_pongs() {
                 let (io, mut peer) = connection(false, false);
                 let writes = io.writes.clone();
                 let mut ws = ($make)(io, config());
@@ -143,7 +147,7 @@ macro_rules! close_cases {
                     .unwrap();
                 assert!(ws.next().await.unwrap().unwrap().is_ping());
                 assert!(ws.next().await.unwrap().unwrap().is_ping());
-                assert_eq!(writes.get(), if $incremental { 2 } else { 0 });
+                assert_eq!(writes.get(), 0);
                 assert!(ws.next().await.unwrap().unwrap().is_close());
                 assert!(ws.next().await.is_none());
             }
@@ -244,18 +248,11 @@ macro_rules! close_cases {
 
             #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
-            async fn buffered_close_with_blocked_pong_follows_receive_discovery_policy() {
+            async fn buffered_close_does_not_wait_for_blocked_pong() {
                 let (io, mut peer) = connection(true, false);
                 io.block_write.set(true);
-                let block_write = io.block_write.clone();
                 let mut ws = ($make)(io, config());
                 peer.write_all(b"\x89\x01p\x88\x02\x03\xe8").await.unwrap();
-                if $incremental {
-                    // The later Close is still unparsed; the current Pong must
-                    // finish before the reader advances to it.
-                    assert!(futures_util::poll!(ws.next()).is_pending());
-                    block_write.set(false);
-                }
                 assert!(
                     tokio::time::timeout(Duration::from_secs(2), ws.next())
                         .await
@@ -270,19 +267,89 @@ macro_rules! close_cases {
 
             #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
+            async fn buffered_data_before_close_is_delivered_without_waiting_for_pong() {
+                let (io, mut peer) = connection(true, false);
+                io.block_write.set(true);
+                let writes = io.writes.clone();
+                let mut ws = ($make)(io, config());
+                peer.write_all(b"\x89\x01p\x82\x01d\x88\x02\x03\xe8")
+                    .await
+                    .unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(2), ws.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap()
+                        .is_ping()
+                );
+                assert!(matches!(ws.next().await, Some(Ok(Message::Binary(_)))));
+                assert_eq!(writes.get(), 0);
+                assert!(ws.next().await.unwrap().unwrap().is_close());
+                assert!(ws.next().await.is_none());
+            }
+
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
+            #[tokio::test(start_paused = true)]
+            async fn buffered_parse_error_does_not_disable_blocked_pong_deadline() {
+                let (io, mut peer) = connection(false, false);
+                io.block_write.set(true);
+                let mut ws = ($make)(io, heartbeat_config());
+                peer.write_all(b"\x89\x01p\x83\x00").await.unwrap();
+                let start = tokio::time::Instant::now();
+
+                // With no accepted data ahead of it, the discovered parse error
+                // is reported as soon as the hard deadline releases the blocked Pong.
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(122), ws.next())
+                        .await
+                        .expect("hard idle deadline must wake the blocked Pong"),
+                    Some(Err(Error::InvalidFrame("invalid opcode")))
+                ));
+                assert_eq!(start.elapsed(), Duration::from_secs(120));
+                assert!(ws.next().await.is_none());
+            }
+
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
+            #[tokio::test(start_paused = true)]
+            async fn buffered_data_and_parse_error_keep_blocked_pong_deadline() {
+                let (io, mut peer) = connection(false, false);
+                io.block_write.set(true);
+                let mut ws = ($make)(io, heartbeat_config());
+                peer.write_all(b"\x89\x01p\x82\x01d\x83\x00").await.unwrap();
+                let start = tokio::time::Instant::now();
+
+                // Accepted data must remain ahead of the parse error. The hard idle
+                // deadline therefore becomes terminal, with close_timeout adding 1s.
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(122), ws.next())
+                        .await
+                        .expect("hard idle deadline must wake the blocked Pong"),
+                    Some(Err(Error::IdleTimeout))
+                ));
+                assert_eq!(start.elapsed(), Duration::from_secs(121));
+                assert!(ws.next().await.is_none());
+            }
+
+            #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
+            #[tokio::test(start_paused = true)]
             async fn shutdown_failure_preserves_peer_close_once() {
                 let (io, mut peer) = connection(false, false);
+                let shutdowns = io.shutdowns.clone();
                 let mut ws = ($make)(io, config());
                 peer.write_all(b"\x88\x02\x03\xe8").await.unwrap();
                 assert!(ws.next().await.unwrap().unwrap().is_close());
                 assert!(ws.next().await.is_none());
                 assert!(ws.next().await.is_none());
+                SinkExt::close(&mut ws).await.unwrap();
+                assert_eq!(shutdowns.get(), 1);
             }
 
             #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
             async fn pending_shutdown_cannot_hold_peer_close_forever() {
                 let (io, mut peer) = connection(true, false);
+                let shutdowns = io.shutdowns.clone();
                 let mut ws = ($make)(io, config());
                 peer.write_all(b"\x88\x02\x03\xe8").await.unwrap();
                 let start = tokio::time::Instant::now();
@@ -292,6 +359,9 @@ macro_rules! close_cases {
                 assert!(msg.unwrap().unwrap().is_close());
                 assert_eq!(start.elapsed(), Duration::from_secs(1));
                 assert!(ws.next().await.is_none());
+                let attempts = shutdowns.get();
+                SinkExt::close(&mut ws).await.unwrap();
+                assert_eq!(shutdowns.get(), attempts);
             }
 
             #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
@@ -469,13 +539,11 @@ macro_rules! close_cases {
     };
 }
 
-close_cases!(plain, WebSocketStream::client, true);
+close_cases!(plain, WebSocketStream::client);
 #[cfg(feature = "permessage-deflate")]
-close_cases!(
-    compressed,
-    |io, config| { sockudo_ws::CompressedWebSocketStream::client(io, config, Default::default()) },
-    false
-);
+close_cases!(compressed, |io, config| {
+    sockudo_ws::CompressedWebSocketStream::client(io, config, Default::default())
+});
 
 #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]

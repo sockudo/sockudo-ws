@@ -131,6 +131,65 @@ async fn split_preserves_the_buffered_peer_close_response() {
 
 #[cfg(feature = "tokio-runtime")]
 #[tokio::test]
+async fn split_preserves_messages_batched_after_ping_before_buffered_close() {
+    use bytes::{Bytes, BytesMut};
+    use sockudo_ws::frame::FrameParser;
+    use sockudo_ws::{Config, Role, WebSocketStream};
+    use tokio::io::AsyncReadExt;
+
+    let (io, mut peer) = tokio::io::duplex(64);
+    let mut socket = WebSocketStream::from_raw_with_leftover(
+        io,
+        Role::Client,
+        Config::builder().auto_ping(false).idle_timeout(0).build(),
+        Some(Bytes::from_static(
+            b"\x89\x01p\x82\x03one\x88\x05\x03\xe9bye",
+        )),
+    );
+    assert!(socket.next().await.unwrap().unwrap().is_ping());
+
+    let (mut reader, _writer) = socket.split();
+    assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), b"one");
+    assert!(reader.next().await.unwrap().unwrap().is_close());
+
+    let mut wire = BytesMut::with_capacity(64);
+    tokio::time::timeout(std::time::Duration::from_secs(1), peer.read_buf(&mut wire))
+        .await
+        .unwrap()
+        .unwrap();
+    let response = FrameParser::new(64, true)
+        .parse(&mut wire)
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.payload.as_ref(), b"\x03\xe9bye");
+}
+
+#[cfg(feature = "tokio-runtime")]
+#[tokio::test]
+async fn split_preserves_messages_batched_after_ping_before_parse_error() {
+    use bytes::Bytes;
+    use sockudo_ws::{Config, Error, Role, WebSocketStream};
+
+    let (io, _peer) = tokio::io::duplex(64);
+    let mut socket = WebSocketStream::from_raw_with_leftover(
+        io,
+        Role::Client,
+        Config::builder().auto_ping(false).idle_timeout(0).build(),
+        Some(Bytes::from_static(b"\x89\x01p\x82\x03one\x83\x00")),
+    );
+    assert!(socket.next().await.unwrap().unwrap().is_ping());
+
+    let (mut reader, _writer) = socket.split();
+    assert_eq!(reader.next().await.unwrap().unwrap().as_bytes(), b"one");
+    assert!(matches!(
+        reader.next().await,
+        Some(Err(Error::InvalidFrame("invalid opcode")))
+    ));
+    assert!(reader.next().await.is_none());
+}
+
+#[cfg(feature = "tokio-runtime")]
+#[tokio::test]
 async fn tokio_split_preserves_parser_and_fragment_state() {
     use bytes::Bytes;
     use sockudo_ws::{Config, Message, Role, WebSocketStream};
