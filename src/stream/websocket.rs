@@ -445,6 +445,7 @@ where
     }
 
     // Cleanup cannot replace an accepted Close or the original timeout cause.
+    #[cold]
     fn finish_read_close(&mut self, fallback: Option<Error>) -> Option<Result<Message>> {
         self.state = StreamState::Closed;
         self.heartbeat.stop();
@@ -948,7 +949,7 @@ where
 
         // Encode message into write buffer
         this.protocol
-            .encode_message(&item, this.write_buf.buffer_mut())?;
+            .encode_message_into(&item, this.write_buf.buffer_mut());
         Ok(())
     }
 
@@ -956,12 +957,18 @@ where
         if self.state == StreamState::Closed {
             return Poll::Ready(Err(Error::ConnectionClosed));
         }
-        let result = self.as_mut().poll_write_out(cx);
-        if result.is_pending() && self.as_mut().get_mut().poll_closing_expired(cx) {
-            self.as_mut().get_mut().finish_read_close(None);
-            return Poll::Ready(Err(Error::ConnectionClosed));
+        // Construct success directly without forwarding storage for an error payload.
+        match self.as_mut().poll_write_out(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => {
+                if self.as_mut().get_mut().poll_closing_expired(cx) {
+                    self.as_mut().get_mut().finish_read_close(None);
+                    return Poll::Ready(Err(Error::ConnectionClosed));
+                }
+                Poll::Pending
+            }
         }
-        result
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
@@ -1486,7 +1493,8 @@ where
 
 impl SplitEncoder for Protocol {
     fn encode_message(&mut self, msg: &Message, buf: &mut BytesMut) -> Result<()> {
-        Protocol::encode_message(self, msg, buf)
+        Protocol::encode_message_into(self, msg, buf);
+        Ok(())
     }
 
     fn encode_pong(&mut self, payload: &[u8], buf: &mut BytesMut) {
