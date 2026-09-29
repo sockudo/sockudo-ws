@@ -866,6 +866,13 @@ impl Protocol {
 
     /// Encode a message for sending
     pub fn encode_message(&mut self, msg: &Message, buf: &mut BytesMut) -> Result<()> {
+        self.encode_message_into(msg, buf);
+        Ok(())
+    }
+
+    // Ordinary frame encoding has no recoverable failure. Internal send paths
+    // need not carry the public Result's error representation through each call.
+    pub(crate) fn encode_message_into(&mut self, msg: &Message, buf: &mut BytesMut) {
         let mask = if self.role == Role::Client {
             Some(crate::mask::generate_mask())
         } else {
@@ -902,8 +909,6 @@ impl Protocol {
                 encode_frame(buf, OpCode::Close, &payload, true, mask);
             }
         }
-
-        Ok(())
     }
 
     /// Encode a pong response for a ping
