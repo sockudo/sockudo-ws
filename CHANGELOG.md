@@ -7,81 +7,153 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+### Enhancements
 
-- Add connection-level `Config::validate_text_utf8` and builder method (default `true`). Disabling it delivers unvalidated Text bytes through normal Tokio/Compio unified and split readers, including compressed connections; Close reasons and checked text accessors remain validated. Consumers using unchecked string conversion must establish UTF-8 validity independently. **Breaking for exhaustive struct literals:** initialize the new field or use `..Config::default()`.
-- `init_clock()` allows applications to initialize the Tokio connection clock before constructing their runtime. The `test-util` feature selects Tokio virtual time for paused-time tests and is excluded from `full`.
-- **Breaking for exhaustive struct literals:** `Http2Config::max_frame_size` and `ConfigBuilder::http2_max_frame_size` configure the advertised HTTP/2 receive frame limit on Tokio and Compio endpoints. The default remains 16 KiB; values outside 16,384–16,777,215 return a handshake error. Larger settings trade framing overhead for receive memory and latency of other streams.
-- Compressed Tokio streams now accept post-handshake frame bytes through `client_with_leftover` and `server_with_leftover`, including when split before the first read; existing constructors continue to start with an empty receive buffer.
-- `WebSocketServer<Http1>::protocols` configures HTTP/1 subprotocol selection in server preference order while preserving the existing first-offered default when no list is configured.
+- Added `init_clock()` to initialize the Tokio connection clock before constructing the runtime, moving the first quanta calibration read out of latency-sensitive work (#58)
+- Added `CompressedWebSocketStream::client_with_leftover` and `server_with_leftover` for post-handshake frame bytes, including when splitting before the first read (#42)
+- Added `WebSocketServer<Http1>::protocols` to select HTTP/1 subprotocols in server preference order; without a list, the first offered protocol is still selected (#80)
+- Added `negotiate_server_deflate` and `DeflateNegotiation` for server-side `permessage-deflate` offer negotiation (#32)
+- Added `with_immediate_write_shutdown()` for directly constructed HTTP/2 and HTTP/3 streams to shut down the write half after an explicit Close; built-in entry points enable it automatically (#38)
+- Added zero-copy sends for server data payloads of 8 KiB or more, queued by reference behind their frame header and written with vectored I/O (`CorkBuffer::push_segment`, `cork::ZERO_COPY_MIN`) (#18)
+- Added `TCP_NODELAY` to sockets created by built-in Tokio HTTP/1 URL clients and listener servers; client option errors propagate, listener errors are reported per connection, and caller-provided streams keep their settings (#47)
 
-### Changed
+### Breaking Changes
 
-- **Breaking for paused-time tests:** Tokio heartbeat and activity timestamps, including unified Close deadlines, use quanta with runtime wakeups rechecked against the logical deadline. The first clock read can block for calibration; preinitialize with `init_clock()` to move that cost out of latency-sensitive work. Paused Tokio time now requires this crate's `test-util` feature, not just `tokio/test-util`. Compio clocks are unchanged.
-- Unified Tokio plain and compressed streams write contiguous cork buffers directly, avoiding vectored-write setup when there are no separately owned segments. Segmented output retains vectored writes on capable transports and preserves partial-write ordering otherwise.
-- Ordinary Tokio split readers poll transport reads before terminal notifications, avoiding notification waiter registration for immediately ready reads. A terminal cause published during the read is rechecked before handling its data, EOF or I/O error.
-- Ordinary Tokio split readers deliver each newly parsed message without first parsing the rest of a buffered burst. Later malformed frames are discovered by a subsequent `next()` call, so writes remain allowed until that discovery and a terminal heartbeat or idle timeout can take precedence over the unparsed tail. Messages and errors parsed before splitting preserve their order. Unified, compressed and Compio readers retain batch parsing.
-- Compio HTTP/2 and HTTP/3 adapters retain owned DATA chunks instead of staging every byte in a preallocated 64 KiB buffer. The last read releases the retained owner; reads still copy into the caller buffer.
-- Tokio HTTP/3 client and server adapters retain unread DATA chunks instead of copying them into a preallocated 64 KiB buffer, and release fully consumed chunks immediately. Raw QUIC wrappers also stop allocating an unused 64 KiB receive buffer.
-- Tokio HTTP/2 adapters retain unread DATA chunks instead of copying their remainder into a preallocated 64 KiB buffer. Fully consumed chunks are released immediately; flow-control capacity is returned at the same point as before.
-- Tokio unified and split readers try reclaiming an empty receive window once buffered input has reached half the window, avoiding later movement of partially received frames when the storage can be reused. Small buffered inputs avoid repeated shared-buffer ownership checks; retained payloads can prevent reclamation, and continuously nonempty receive buffers cannot use this reclaim point. Compio readers are unchanged.
-- Reduce compression overhead for outgoing messages with `no_context_takeover` by clearing DEFLATE history at completed message boundaries. This includes the no-takeover settings selected by `Compression::Shared`, `Compression::Window1KB`, `Compression::Window2KB`, and `DeflateConfig::low_memory()`. Context-takeover compression is unchanged; this does not accelerate receiving existing compressed traffic. Measured improvements use a 32 KiB window and do not establish the same gain for smaller windows.
-- Reduce client frame encoding latency for medium and large payloads with compiler-vectorized copy-and-mask blocks. Results depend on payload size, alignment and target CPU features; the copy-and-mask kernel is used only for masked client frames.
-- **Breaking:** Built-in Tokio and Compio HTTP/1 server handshakes validate request targets and normalize absolute HTTP/HTTPS targets to a resource path and query. `HandshakeRequest.path` is now `Cow<'_, str>` (use `.as_ref()` for a borrowed `&str`), and `host` reports the absolute target's authority when present. A Host header remains required. The existing `http` dependency is now mandatory, including in default-feature builds. Axum's upgrade extractor is unaffected. Path/query characters retain `http::Uri` compatibility rules (including raw UTF-8 and JSON path characters), with additional strict `%XX` validation; this is not full RFC 3986 validation. Invalid percent escapes, fragments, unsupported target forms/schemes, userinfo, empty absolute hosts and nonnumeric ports now return errors.
-- Built-in Tokio HTTP/1 URL clients and listener servers enable `TCP_NODELAY` on their TCP sockets. Client socket-option errors propagate; the listener server reports failures for the affected connection and continues its handshake. Caller-provided streams retain their socket settings.
-- **Breaking:** Built-in Tokio and Compio HTTP/3 endpoints now apply configured QUIC idle timeout, stream receive window and maximum accepted UDP payload size. Default window (1,250,000 bytes) and payload limit (1472 bytes) preserve Quinn's previously implicit defaults. Extended CONNECT can be disabled; unsupported 0-RTT requests are rejected and early data is disabled on endpoints created by the library. Caller-provided endpoints retain their transport and TLS settings. Previously ignored out-of-range QUIC limits, a zero stream receive window, and `enable_0rtt = true` now return errors.
-- **Breaking:** native io_uring read/write methods now require mutable access to preserve ordering with poll I/O, so these methods no longer support concurrent reads and writes through a shared stream. Exclusively direct I/O through `get_ref` still supports concurrent reads and writes, provided it is never mixed with bridge I/O or the wrapper's native methods.
-- `io_uring::has_recommended_kernel()` now checks Linux 5.10 or later, matching tokio-uring 0.5's minimum requirement; Linux 5.6–5.9 now returns `false`.
-- PubSub selects publication recipients atomically with membership changes and enqueues messages after releasing the membership lock. Removal after selection does not cancel that publication's already selected deliveries; socket-ID exclusion uses the same snapshot.
-- **Breaking:** Compio 0.19 HTTP/2 entry points require Splittable; wrap other transports with compio::io::util::Split::new. Automatic Ping requires pending custom reads to cooperate with cancellation; an existing idle/Pong deadline remains terminal. With idle timeout disabled, nonzero pong_timeout also bounds read-buffer recovery from Ping's due time; expiry reports HeartbeatTimeout even if Ping has not been sent. Setting both timeouts to zero leaves recovery unbounded.
-- **Breaking:** DEFLATE encoder windows use `DeflateWindowBits` (9–15), including the public window constants and codec configuration fields. An unsupported 8-bit encoder limit is rejected instead of panicking or widening it; server negotiation can still receive an 8-bit client stream with a larger decoder window. A server policy below 15 client window bits declines a `permessage-deflate` offer that omits `client_max_window_bits` rather than exceeding the configured policy. Public offer parsing now rejects duplicate or empty parameters, malformed quoted values, leading zeroes, and non-ASCII optional whitespace.
+- Added `Config::validate_text_utf8` and builder method (default `true`); disabling it delivers unvalidated Text bytes through Tokio and Compio unified, split, plain, and compressed readers while Close reasons and checked text accessors stay validated; struct-literal callers must add the field (#107)
+- Added `Config::write_coalescing` and builder method (default `true`) to batch frames across Tokio `SinkExt::feed` calls until `flush()`; struct-literal callers must add the field (#18, #22)
+- Added `Http2Config::max_frame_size` and `ConfigBuilder::http2_max_frame_size` for the advertised HTTP/2 receive frame limit on Tokio and Compio endpoints (default 16 KiB); values outside 16,384–16,777,215 return a handshake error, and struct-literal callers must add the field (#106)
+- Changed Tokio heartbeat and activity timestamps, including unified Close deadlines, to quanta; paused-time tests must enable this crate's new `test-util` feature (excluded from `full`) rather than only `tokio/test-util`, and Compio clocks are unchanged (#58)
+- Changed Tokio Sink readiness to drain queued output at the smaller of the high-water mark and `max_backpressure`, or before each frame with `write_coalescing` disabled, so `feed`, `send_all`, and `forward` may wait for a slow reader (#22, #35)
+- Changed ordinary Tokio unified and split readers to deliver each parsed message before parsing the rest of a buffered burst; later malformed frames surface on a subsequent `next()`, writes stay allowed until then, heartbeat or idle timeouts take precedence over the unparsed tail, and compressed and Compio readers keep batch parsing (#96, #109)
+- Changed ordinary Tokio unified readers to parse the already-buffered tail after accepting a Ping, so a buffered Close suppresses the automatic Pong; accepted messages stay in wire order and transfer through `split()`
+- Changed `SplitWriter` and `CompressedSplitWriter` to write through a transport sink shared with the control driver instead of a command channel; automatic control frames interleave at frame boundaries, cancelling a send after it acquires the sink closes the connection, and `SplitWriter::send` requires `S: AsyncWrite + Unpin` (#18, #20)
+- Changed unified Tokio and Compio `flush()` on a closed stream to return `ConnectionClosed` even with no buffered output, and Compio application sends after a local Close to fail (#38)
+- Changed Tokio plain unified streams to discard queued output after a parse error before cleanup shutdown; `SinkExt::close` still attempts shutdown after EOF or a read or parse error when no encoded output remains (#109)
+- Changed DEFLATE encoder windows to `DeflateWindowBits` (9–15) across `DeflateConfig` fields, window constants, and codec constructors; `Compression::window_bits()` now returns `Option<DeflateWindowBits>` (#32)
+- Removed `Compression::Window256B`; 8-bit encoder windows are rejected instead of panicking or widening, while servers still accept 8-bit client streams with a larger decoder window (#32)
+- Changed `permessage-deflate` negotiation to decline offers without `client_max_window_bits` when the server policy allows fewer than 15 client window bits, and public offer parsing to reject duplicate or empty parameters, malformed quoted values, leading zeroes, and non-ASCII optional whitespace (#32)
+- Changed `HandshakeRequest.path` to `Cow<'_, str>` (use `.as_ref()` for `&str`); built-in Tokio and Compio HTTP/1 servers normalize absolute HTTP/HTTPS targets to path and query, report their authority as `host`, and reject invalid percent escapes, fragments, unsupported forms or schemes, userinfo, empty hosts, and nonnumeric ports; Axum's upgrade extractor is unaffected (#87)
+- Changed `http` to a mandatory dependency, including default-feature builds (#87)
+- Changed default Tokio and Compio HTTP/1 servers to select the client's first offered subprotocol instead of echoing the whole offer, so `HandshakeResult::protocol` holds the selected protocol (#86)
+- Changed built-in Tokio and Compio HTTP/3 endpoints to apply the previously ignored QUIC idle timeout, stream receive window, maximum UDP payload size, and Extended CONNECT settings, with defaults preserving Quinn's previous values; out-of-range limits, a zero receive window, or `enable_0rtt = true` return errors, 0-RTT requests are rejected, and caller-provided endpoints keep their settings (#43)
+- Changed the Compio dependency to 0.19; Compio HTTP/2 entry points require `Splittable` transports, so wrap others with `compio::io::util::Split::new` (#40)
+- Changed Compio automatic Ping to require pending custom reads to cooperate with cancellation; with idle timeout disabled, a nonzero `pong_timeout` also bounds read-buffer recovery and reports `HeartbeatTimeout`, while zero for both leaves recovery unbounded (#40)
+- Changed native io_uring `read_native`, `write_native`, and `write_all_native` to take `&mut self`, so concurrent reads and writes require exclusive direct I/O through `get_ref`; `has_recommended_kernel()` now requires Linux 5.10 (#30)
 
-- Tokio `SinkExt::send()` and `SinkExt::flush()` now always complete the transport flush, including while parsed inbound messages remain unread. Use `feed()` followed by `flush()` to batch frames, and flush before waiting for replies or pausing reads. Readiness drains at the smaller of the high-water mark and `max_backpressure`, or before accepting another frame when `write_coalescing` is disabled; partial drains still wait for the transport flush to complete.
-- Server-side data payloads of 8 KiB or more are queued by reference behind
-  their frame header and sent with vectored I/O instead of being copied into
-  the write buffer (`CorkBuffer::push_segment`, `cork::ZERO_COPY_MIN`).
-- `CorkBuffer` is now an ordered list of `Bytes` segments plus an open tail
-  buffer; `write_bytes` keeps output order and `write` no longer spills into a
-  separate overflow queue.
-- `SplitWriter` / `CompressedSplitWriter` write directly to the transport
-  through a sink shared with the connection's control driver, instead of a
-  channel plus a oneshot completion per `send()`. Automatic Pong/Ping/Close
-  frames interleave at frame boundaries. `SplitWriter::send` now requires
-  `S: AsyncWrite + Unpin` (which `split()` already required).
-- Frame masking uses an auto-vectorised 64-byte block loop on aarch64 and
-  other non-x86 targets (aligned above 2 KiB): 1 KiB 53 -> 84 GB/s,
-  16 KiB 67 -> 127 GB/s, 64 B 12 -> 19 GB/s on an Apple M5 Pro.
-- Compio streams and split readers reuse the message Vec across reads, pop
-  messages instead of cloning them, and publish inbound activity through a
-  shared cell instead of a channel message per data frame.
+### Security
 
-### Fixed
+- Fixed `Message::as_text` and `Message::into_text` performing unchecked UTF-8 conversion on publicly constructed Text payloads; invalid payloads now return `None` (#19)
+- Fixed Tokio receive and DEFLATE paths treating uninitialized buffer capacity as initialized (#23)
+- Fixed control bytes in handshake-managed HTTP/1 client request fields (host, target, key, protocol, and extensions) allowing request-line or header injection; the raw `build_request` remains unchecked (#78)
+- Fixed DEFLATE decompression exceeding `max_message_size` when the final inflate call produced more than the remaining limit (#76)
 
-- Tokio plain and compressed split readers and writers observe closure and its terminal cause atomically, preserving the first cause before notification completes. Compressed split reads also preserve a terminal cause published during I/O over the returned transport error.
-- Compio HTTP/3 adapters complete zero-capacity reads without waiting for incoming DATA.
-- Tokio HTTP/3 request adapters complete zero-capacity reads immediately without waiting for or consuming data.
-- Tokio and Compio HTTP/2 adapters skip empty DATA frames without reporting premature EOF; zero-capacity read buffers complete immediately without consuming DATA. END_STREAM still terminates reads after queued bytes, and pending Compio reads remain cancellable.
-- Accepted non-final data frames, including empty continuations and compressed fragments, refresh inbound activity for Tokio and Compio streams and split readers. Partial frame bytes and repeated polls do not extend inactivity deadlines, and fragment activity does not postpone an outstanding Pong or Close deadline.
-- HTTP/1 `Stream` forwards vectored writes and reports the underlying transport's vectored-write capability; Axum `UpgradedStream` now reports that capability as well. Partial writes, pending operations and transport errors retain their underlying semantics.
-- HTTP/1 handshake nonces now use the selected RNG backend (`getrandom`, then `rand_rng`, then `fastrand`) instead of a timestamp-seeded byte loop. The default fastrand nonce generator forks the thread RNG once, then keeps separate state from frame masking; no-RNG builds also keep separate fallback states. Native fastrand seeds from a clock and thread ID, not OS entropy. These non-cryptographic backends do not provide a cryptographic isolation guarantee; use `getrandom` or `rand_rng` when cryptographically secure output is required.
-- Tokio HTTP/3 servers now advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1` when Extended CONNECT is enabled, including with the default configuration.
-- Drive io_uring completion operations across poll calls, flush buffered writes before shutdown, and enable the required Tokio integration for the `io-uring` feature.
-- PubSub subscriber, socket-ID, and topic indexes now update atomically, preventing duplicate socket IDs and stale membership under concurrent changes. Publication and removal release the membership lock before waking channel receivers so their wakers can reenter membership operations.
-- Cancelled native Compio HTTP/3 DATA writes now abort both directions of the affected WebSocket stream with `H3_REQUEST_CANCELLED`; subsequent operations on that stream fail with `ConnectionAborted`, while the multiplexed connection can open new streams.
-- Built-in HTTP/1 WebSocket handshakes now reject repeated request `Sec-WebSocket-Key` and `Sec-WebSocket-Version` fields and repeated response `Sec-WebSocket-Accept` and `Sec-WebSocket-Extensions` fields. Repeated response `Sec-WebSocket-Protocol` was already rejected; request protocol and extension field handling is unchanged.
-- Built-in HTTP/1 WebSocket server handshakes now reject nonzero or invalid `Content-Length` values and any `Transfer-Encoding` request header; absent and zero-valued lengths remain accepted. Checked HTTP/1 client request construction now rejects custom `Content-Length` and `Transfer-Encoding` headers.
-- The built-in HTTP/1 handshake parsers and Tokio/Compio clients and servers now require HTTP/1.1, a nonempty request Host, a request key that decodes to 16 bytes, and an exact `Upgrade: websocket` response with a `Connection: Upgrade` token. Checked request construction, including client connect with an empty Host, now rejects invalid required fields before sending; token matching treats only SP/HTAB as optional whitespace. The separate Axum upgrade extractor is unchanged.
-- HTTP/1 upgrade handshakes enforce the 8 KiB limit on the request or response header itself, not on WebSocket frame bytes read with it; oversized incomplete headers remain rejected.
-- Frame parsers with compression enabled, including unified and split readers, now reject RSV1 on continuation and control frames as soon as the base header arrives, without waiting for the payload; RSV1 remains valid on the first text or binary frame of a compressed message.
-- Splitting a Tokio or Compio stream now preserves partially parsed frames and receive-side fragment/UTF-8 state. Compressed protocol splitting retains parser progress while applying the supplied frame and message limits, including a lowered frame limit for an already accepted header.
-- Frame size limits now apply equally to complete and partially received short frames. Single-frame text and binary messages honor the message size limit in typed, raw, and compression-capable protocols, including uncompressed input to compressed readers. Exact-limit payloads remain accepted.
-- Resuming typed protocol processing during a fragmented text message now validates bytes accumulated by raw calls without losing split UTF-8 code points. Messages completed through the raw API remain unvalidated.
-- Tokio Sink readiness now drains queued encoded output at `max_backpressure`, continuing partial drains before accepting another message. This is a soft queue threshold, not a message size limit: individual messages may exceed it, and zero drains any pending output. `feed`, `send_all`, and `forward` may now wait for a slow reader; blocked unified writes do not drive inbound heartbeat/idle processing. The high-water mark can trigger readiness draining earlier when batching is enabled. A completed transport flush also clears a cancelled readiness drain.
-- Explicit `close()` on unified Tokio and Compio HTTP/2/HTTP/3 streams now shuts down the transport write half after flushing the WebSocket Close frame, preserving queued frames when the handler releases its stream. TCP/TLS streams keep the write half open until the peer's Close so crossing Pings can still receive a Pong. Directly constructed multiplexed streams must opt in with `with_immediate_write_shutdown()`; built-in HTTP/2 and HTTP/3 entry points do so automatically. Repeated Sink close no longer repeats transport shutdown.
-- Unified closing now uses one `close_timeout` budget (5 seconds by default) for local Close writes, peer response, automatic control writes, and best-effort shutdown. A peer that remains silent after the final read attempt ends with `ConnectionClosed` once; cleanup failure or expiry preserves an already accepted Close or the original idle/Pong timeout. Deadline expiry alone preserves parsed messages in wire order, but control write failure/timeout still terminates immediately and may discard undelivered Ping/data messages; queued Close suppresses preceding automatic Pong writes. All budgets allow one nonwaiting read poll after expiry, not a fresh attempt on every `next()`; cancelled Compio owned reads are not restarted and completion depends on the transport driver. Compio application sends are rejected after local Close, and `flush()` on a closed unified stream returns `ConnectionClosed`, even with no buffered output, so timed-out owned I/O is never restarted. Compio `next()` remains cancellation-unsafe, including during Close cleanup.
-- Shared compression contexts now reuse role-aware encoder pools instead of allocating four encoders per connection while preserving connection-local decoders. Client contexts honor `client_max_window_bits`.
-- Compio split writers now keep hard idle/Pong and closing deadlines active while a transport write is pending. EOF aborts immediately, while peer Close and parse errors allow the existing write to finish within `close_timeout`; with `close_timeout = 0`, an immediately writable Close still gets one best-effort poll. A send-only connection that receives no inbound frames now reliably reaches the configured idle timeout (120 seconds by default).
-- UTF-8 validation no longer rejects valid multi-byte characters that cross internal SIMD block boundaries on SSE2-only x86 or nightly LoongArch64, PowerPC, and s390x paths; complete inputs now use `simdutf8` and its portable fallback where no dedicated backend exists.
+### Fixes
+
+- Fixed messages accepted before a malformed frame in the same read being dropped; Tokio and Compio readers deliver them before the parse error and reject new writes once it is known (#36, #96)
+- Fixed Tokio plain and compressed unified streams stalling hard idle and Pong deadlines while an automatic control write or queued output is blocked (#108)
+- Fixed Tokio plain and compressed unified streams staying pending without a heartbeat deadline when an automatic control write blocks after a later parse error has been discovered
+- Fixed Tokio plain unified `SinkExt::close` retrying failed or abandoned transport shutdown attempts
+- Fixed Tokio split readers dropping the peer's Close reason from their automatic Close response after splitting (#109)
+- Fixed Tokio plain and compressed split readers and writers observing closure separately from its terminal cause; the first cause is published atomically, and compressed reads keep a cause published during I/O over the transport error (#97)
+- Fixed Tokio split drivers ignoring heartbeat, idle, and close deadlines while a control or application write is blocked; interrupted sends return the same typed timeout (#75)
+- Fixed Tokio split transports staying open after terminal deadlines while reader or writer handles remain alive (#100)
+- Fixed split `close()` exceeding `close_timeout` while waiting behind blocked control writes, and a concurrent peer Close queuing a duplicate Close; once the budget starts, cancelling `close()` does not reopen the connection (#101)
+- Fixed Compio split writers ignoring hard idle, Pong, and closing deadlines while a transport write is pending, so send-only connections reach the configured idle timeout (#98)
+- Fixed Compio heartbeat wakeups losing partially read frames on unified, compressed, HTTP/2, and HTTP/3 transports (#40)
+- Fixed split idle timers expiring at a stale deadline after the reader published newer activity (#69)
+- Fixed accepted non-final data frames, including empty continuations and compressed fragments, not refreshing inbound activity on Tokio and Compio streams and split readers; fragments do not postpone Pong or Close deadlines (#37)
+- Fixed an outstanding Ping postponing an earlier hard idle deadline; such connections now close with `IdleTimeout` (#91)
+- Fixed explicit unified `close()` on Tokio and Compio HTTP/2 and HTTP/3 streams losing queued frames when the handler releases its stream, and repeated Sink close repeating transport shutdown; TCP and TLS keep the write half open until the peer's Close (#38)
+- Fixed unified closing without an overall bound; Close writes, peer response, automatic control writes, and shutdown share one `close_timeout` budget (default 5 s) while preserving an accepted Close or the original idle or Pong timeout (#38)
+- Fixed Tokio Sink readiness ignoring `max_backpressure`, which is a soft queue threshold rather than a message size limit; zero drains any pending output (#35)
+- Fixed frame size limits skipping partially received short frames, and single-frame Text and Binary messages bypassing the message size limit in typed, raw, and compression-capable protocols (#24)
+- Fixed mixed raw and typed fragment processing skipping UTF-8 validation of accumulated bytes or split code points; messages completed through the raw API remain unvalidated (#25)
+- Fixed splitting Tokio and Compio streams discarding partially parsed frames and fragment or UTF-8 state; compressed splits keep parser progress under the supplied limits (#26)
+- Fixed compressed frame parsers accepting RSV1 on continuation and control frames; they are rejected as soon as the base header arrives (#29)
+- Fixed UTF-8 validation rejecting valid multibyte characters across internal SIMD block boundaries on SSE2-only x86 and nightly LoongArch64, PowerPC, and s390x; complete inputs now use `simdutf8` (#28)
+- Fixed DEFLATE compression truncating large incompressible context-takeover messages when output filled after the input was consumed (#68)
+- Fixed DEFLATE decompression after BFINAL blocks losing context for later messages, dropping later streams in the same message, and accepting trailing invalid data (#88)
+- Fixed `Compression::Shared` contexts allocating four encoders per connection; role-aware encoder pools are shared while decoders stay connection-local, and client contexts honor `client_max_window_bits` (#60)
+- Fixed built-in HTTP/1 handshakes accepting malformed `Sec-WebSocket-Protocol` or `Sec-WebSocket-Extensions` fields and duplicate client subprotocol offers (#86)
+- Fixed Tokio and Compio HTTP/1 clients accepting an unoffered, case-mismatched, or repeated `Sec-WebSocket-Protocol` selection (#79)
+- Fixed built-in HTTP/1 handshakes accepting non-HTTP/1.1 messages, an empty request Host, request keys that do not decode to 16 bytes, or responses without an exact `Upgrade: websocket` and a `Connection: Upgrade` token; Axum's upgrade extractor is unchanged (#81)
+- Fixed built-in HTTP/1 servers accepting upgrade requests with a nonzero or invalid `Content-Length` or any `Transfer-Encoding`; checked client requests reject these custom headers (#82)
+- Fixed built-in HTTP/1 handshakes accepting repeated request `Sec-WebSocket-Key` or `Sec-WebSocket-Version` and response `Sec-WebSocket-Accept` or `Sec-WebSocket-Extensions` fields (#83)
+- Fixed the 8 KiB HTTP/1 handshake limit counting WebSocket frame bytes read with the headers; oversized incomplete headers remain rejected (#77)
+- Fixed HTTP/1 handshake nonces using a timestamp-seeded byte loop instead of the selected RNG backend, with nonce state separate from frame masking; use `getrandom` or `rand_rng` when cryptographic output is required (#48)
+- Fixed HTTP/1 `Stream` and Axum `UpgradedStream` not forwarding vectored writes or reporting vectored-write capability (#70)
+- Fixed Tokio HTTP/3 servers not advertising `SETTINGS_ENABLE_CONNECT_PROTOCOL` when Extended CONNECT is enabled (#43)
+- Fixed Tokio HTTP/3 writes failing with `H3_INTERNAL_ERROR` when QUIC flow control returned Pending (#39)
+- Fixed Tokio and Compio HTTP/3 zero-capacity reads waiting for or consuming DATA (#63, #94)
+- Fixed Tokio and Compio HTTP/2 adapters reporting premature EOF on empty DATA frames and consuming DATA on zero-capacity reads (#105)
+- Fixed cancelled native Compio HTTP/3 DATA writes leaving the stream usable; both directions now abort with `H3_REQUEST_CANCELLED` while the connection can open new streams (#84)
+- Fixed io_uring completion operations not being driven across poll calls, buffered writes not flushing before shutdown, and the `io-uring` feature not enabling the required Tokio integration (#30)
+- Fixed PubSub subscriber, socket-ID, and topic indexes updating non-atomically, allowing duplicate socket IDs and stale membership; publication delivers to a recipient snapshot taken atomically with membership changes, and receivers wake outside the membership lock (#27)
+
+### Internal Improvements
+
+- Added the bundled Rust Autobahn conformance suite to CI and the pre-publish workflow (#85)
+- Added codec, fan-out, stream, receive-state, and paced-delivery benchmarks and diagnostics (#44, #45, #46)
+- Added masked frame parsing and short UTF-8 validation boundary regression tests (#103, #104)
+- Added focused Clippy lints and retained benchmark debug symbols
+- Improved CI with parallel feature-combination nextest runs, `rust-cache`, and `rstest` table-driven cases (#102)
+- Improved CI caching by rebuilding CPU-specific native-target artifacts on each runner (#99)
+- Reorganized benchmarks into layered suites with unique IDs and controlled stream I/O, compression-context, and transport coverage
+- Refined `CorkBuffer` into an ordered list of `Bytes` segments plus an open tail buffer; `write_bytes` keeps output order and `write` no longer spills into an overflow queue (#18)
+- Fixed Axum TCP heartbeat tests stalling under paused-clock auto-advance by using real time (#41)
+- Optimized ordinary Tokio split reads by polling the transport before registering terminal waiters (#97)
+- Optimized unified Tokio plain and compressed flushes by writing contiguous cork buffers without vectored-write setup (#57)
+- Optimized Tokio receive buffers by reclaiming empty windows once buffered input reaches half the window, and reserving a fresh window before reading when retained payloads prevent reuse, trading earlier allocation for fewer partial-frame copies (#53, #110)
+- Optimized Tokio and Compio HTTP/2 and HTTP/3 adapters by retaining owned DATA chunks instead of copying through a preallocated 64 KiB buffer; raw QUIC wrappers drop their unused buffer (#54, #63, #94)
+- Optimized outgoing `no_context_takeover` compression by clearing DEFLATE history at message boundaries, including `Compression::Shared`, `Window1KB`, `Window2KB`, and `DeflateConfig::low_memory()` (#55)
+- Optimized client frame encoding with vectorized copy-and-mask blocks, using 256-byte blocks for long payloads (#50, #112)
+- Optimized frame masking on aarch64 and other non-x86 targets with a 64-byte block loop (#18)
+- Optimized receive unmasking across partial reads with integer mask-phase rotation (#114)
+- Optimized ordinary Tokio send success paths and skipped inbound clock reads when heartbeat tracking is disabled (#108, #111)
+- Optimized Compio reads by polling ready input before registering heartbeat timers (#113)
+- Optimized Compio streams and split readers by reusing message vectors and publishing inbound activity through a shared cell (#18)
+- Optimized PubSub recipient selection with positional topic indexes and shared sender handles (#115)
+- Added `quanta` v0.13 dependency for Tokio heartbeat timestamps (#58)
+- Enabled the `quanta` `mock` feature for tests; benchmarks inherit it through Cargo feature unification, so their clock reads cost more than in production
+- Added `libz-rs-sys` dependency for DEFLATE decompression across final blocks (#88)
+- Added `rstest` dev dependency (#102)
+- Removed `dashmap` dependency (#27)
+- Removed `tokio-websockets` dev dependency
+- Upgraded `aws-lc-rs` crate to v1.18
+- Upgraded `base64` crate to v0.23
+- Upgraded `bytes` crate to v1.12
+- Upgraded `compio` crate to v0.19 (#40)
+- Upgraded `criterion` crate to v0.8
+- Upgraded `fastrand` crate to v2.5
+- Upgraded `flate2` crate to v1.1.10 (#23, #88)
+- Upgraded `getrandom` crate to v0.4
+- Upgraded `http` crate to v1.5 (#87)
+- Upgraded `httparse` crate to v1.10
+- Upgraded `hyper` crate to v1.11
+- Upgraded `rand` crate to v0.10
+- Upgraded `rustls-platform-verifier` crate to v0.7
+- Upgraded `sha1` crate to v0.11
+- Upgraded `socket2` crate to v0.6
+- Upgraded `tokio` crate to v1.53
+- Upgraded `rcgen` crate (dev) to v0.14
+- Upgraded `rustls-pemfile` crate (dev) to v2.2
+- Upgraded `tokio-tungstenite` crate (dev) to v0.30
+
+### Documentation Updates
+
+- Documented Tokio Sink `feed`/`flush` batching, readiness thresholds, and `write_coalescing` (#22, #35)
+- Documented unified `close_timeout` semantics, including undelivered messages lost on control-write failure and Compio `next()` not being cancellation-safe during Close cleanup (#38)
+- Documented split send cancellation boundaries and split Close timeout semantics (#20, #101)
+- Documented split stream ownership and the shared transport and sink locks (#108)
+- Documented the `validate_text_utf8` byte contract (#107)
+- Documented io_uring bridge contracts and kernel requirements, and compiled the runtime and HTTP/2 examples as doctests (#30)
+- Documented HTTP/2 receive frame limits and HTTP/3 endpoint ownership, configuration errors, and receive-buffer costs (#43, #106)
+- Documented the raw `build_request` as unchecked; use `build_request_with_headers` for external values (#78)
+- Documented the production and paused-time clock features (#58)
+- Documented UTF-8 validation backend coverage by architecture (#28)
+- Documented running the bundled Autobahn suite (#85)
+- Added codec, stream, and delivery benchmark guides and a benchmark suite overview in `benches/README.md` (#44, #45, #46)
+- Updated `docs/PERFORMANCE_AUDIT.md` with post-2.1.0 write batching, zero-copy send, split writer, masking, and Compio results, and PubSub snapshot delivery (#18, #27)
 
 ## [2.1.0] - 2026-09-19
 
