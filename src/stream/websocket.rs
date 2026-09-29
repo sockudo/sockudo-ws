@@ -2,6 +2,7 @@
 //!
 //! This module provides the main `WebSocketStream` type.
 
+use std::future::Future;
 use std::io;
 use std::io::IoSlice;
 use std::pin::Pin;
@@ -550,6 +551,9 @@ where
     type Item = Result<Message>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // A timer firing behind a blocked control write must advance the
+        // deadline state before that write is retried.
+        let mut expired_deadline = None;
         loop {
             // Check for connection closed before retrying any cleanup.
             if self.state == StreamState::Closed {
@@ -557,7 +561,7 @@ where
             }
 
             // Control responses and automatic pings must be driven by the read path.
-            if self.flush_on_read {
+            if self.flush_on_read && expired_deadline.is_none() {
                 match self.as_mut().poll_write_out(cx) {
                     Poll::Ready(Ok(())) => {
                         let this = self.as_mut().get_mut();
@@ -600,6 +604,13 @@ where
                                 this.finish_read_close(Some(Error::ConnectionClosed)),
                             );
                         }
+                        if this.pending_parse_error.is_none()
+                            && let Some(deadline) = this.heartbeat.next_hard_deadline()
+                            && this.poll_heartbeat_timer(cx, deadline.at()).is_ready()
+                        {
+                            expired_deadline = Some(deadline);
+                            continue;
+                        }
                         return Poll::Pending;
                     }
                 }
@@ -617,11 +628,12 @@ where
 
             // Heartbeat deadlines are based on inbound inactivity. A Pong
             // deadline starts only after the corresponding Ping is flushed.
-            let deadline = self
-                .pending_parse_error
-                .is_none()
-                .then(|| self.heartbeat.next_deadline())
-                .flatten();
+            let deadline = expired_deadline.take().or_else(|| {
+                self.pending_parse_error
+                    .is_none()
+                    .then(|| self.heartbeat.next_deadline())
+                    .flatten()
+            });
             if let Some(deadline) = deadline {
                 let now = self.clock_epoch.elapsed().as_millis() as u64;
                 if deadline.at() <= now {
@@ -674,29 +686,21 @@ where
                     this.heartbeat_sleep = None;
                     continue;
                 }
-
-                if self
-                    .as_mut()
-                    .get_mut()
-                    .poll_heartbeat_timer(cx, deadline.at())
-                    .is_ready()
-                {
-                    // Fired: loop back to re-evaluate the (possibly moved) deadline.
-                    continue;
-                }
             }
 
             // First, return any pending messages
             if let Some(msg) = self.as_mut().get_mut().next_pending_message() {
                 let this = self.as_mut().get_mut();
-                let now = this.clock_epoch.elapsed().as_millis() as u64;
-                let pong = match &msg {
-                    Message::Pong(payload) => Some(payload),
-                    _ => None,
-                };
-                // Inbound traffic only pushes deadlines later; the armed timer is
-                // left alone and re-armed lazily when it fires.
-                this.heartbeat.on_inbound(now, pong);
+                if this.heartbeat.tracks_inbound_activity() {
+                    let now = this.clock_epoch.elapsed().as_millis() as u64;
+                    let pong = match &msg {
+                        Message::Pong(payload) => Some(payload),
+                        _ => None,
+                    };
+                    // Inbound traffic only pushes deadlines later; the armed timer is
+                    // left alone and re-armed lazily when it fires.
+                    this.heartbeat.on_inbound(now, pong);
+                }
 
                 // Handle control frames
                 match &msg {
@@ -797,6 +801,13 @@ where
                                 this.finish_read_close(Some(Error::ConnectionClosed)),
                             );
                         }
+                        if this.pending_parse_error.is_none()
+                            && let Some(deadline) = this.heartbeat.next_deadline()
+                            && this.poll_heartbeat_timer(cx, deadline.at()).is_ready()
+                        {
+                            expired_deadline = Some(deadline);
+                            continue;
+                        }
                         return Poll::Pending;
                     }
                 }
@@ -836,6 +847,14 @@ where
                     let this = self.as_mut().get_mut();
                     if this.poll_closing_expired(cx) {
                         return Poll::Ready(this.finish_read_close(Some(Error::ConnectionClosed)));
+                    }
+                    if this.pending_parse_error.is_none()
+                        && let Some(deadline) = this.heartbeat.next_deadline()
+                        && this.poll_heartbeat_timer(cx, deadline.at()).is_ready()
+                    {
+                        // Fired: loop back to re-evaluate the (possibly moved) deadline.
+                        expired_deadline = Some(deadline);
+                        continue;
                     }
                     return Poll::Pending;
                 }
@@ -1059,9 +1078,9 @@ impl Default for WebSocketStreamBuilder {
 // Split stream implementation
 // ============================================================================
 //
-// One background driver owns the transport writer. Both application writes and
-// RFC control work use bounded queues; this is what lets Ping/Pong/Close make
-// progress when the application performs zero writes.
+// A background driver handles RFC control work from a bounded queue, sharing
+// the writer and encoder with application sends through an async sink mutex.
+// This lets Ping/Pong/Close progress when the application performs zero writes.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -1460,7 +1479,8 @@ pub struct SplitReader<S> {
 
 /// The write half of a split WebSocket stream.
 ///
-/// The transport writer itself is owned by the per-connection control driver.
+/// Application writes share the transport writer and encoder with the
+/// per-connection control driver through an async sink mutex.
 pub struct SplitWriter<S> {
     core: SplitWriterCore<SplitTransport<S>, Protocol>,
 }
@@ -1471,8 +1491,9 @@ where
 {
     /// Split into concurrently usable read and write handles.
     ///
-    /// This starts one connection-scoped Tokio task that exclusively owns the
-    /// transport writer. Dropping either returned half cancels that task.
+    /// This starts one connection-scoped Tokio task for control writes, serialized
+    /// with application writes through a shared async sink mutex. Dropping either
+    /// returned half cancels that task.
     ///
     /// Queued output is not transferred: finish flushing any fed messages before
     /// splitting. A control message retained by a cancelled read is not transferred
@@ -2068,14 +2089,26 @@ async fn write_split_bytes<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    if cancel.is_cancelled() {
+        return Err(Error::ConnectionClosed);
+    }
+
+    let mut write = std::pin::pin!(async {
+        writer.write_all(bytes).await?;
+        writer.flush().await
+    });
+    // A ready write needs no cancellation waiter. Keep this same future after
+    // Pending: recreating write_all would resend its already accepted prefix.
+    if let Poll::Ready(result) =
+        std::future::poll_fn(|cx| Poll::Ready(write.as_mut().poll(cx))).await
+    {
+        return result.map_err(Into::into);
+    }
+
     tokio::select! {
         biased;
         _ = cancel.cancelled() => Err(Error::ConnectionClosed),
-        result = async {
-            writer.write_all(bytes).await?;
-            writer.flush().await?;
-            Ok::<(), std::io::Error>(())
-        } => result.map_err(Into::into),
+        result = &mut write => result.map_err(Into::into),
     }
 }
 
@@ -2573,13 +2606,16 @@ where
     type Item = Result<Message>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // A timer firing behind a blocked control write must advance the
+        // deadline state before that write is retried.
+        let mut expired_deadline = None;
         loop {
             // Check for connection closed before retrying any cleanup.
             if self.state == StreamState::Closed {
                 return Poll::Ready(None);
             }
 
-            if self.flush_on_read {
+            if self.flush_on_read && expired_deadline.is_none() {
                 match self.as_mut().poll_write_out(cx) {
                     Poll::Ready(Ok(())) => {
                         let this = self.as_mut().get_mut();
@@ -2622,6 +2658,13 @@ where
                                 this.finish_read_close(Some(Error::ConnectionClosed)),
                             );
                         }
+                        if this.pending_parse_error.is_none()
+                            && let Some(deadline) = this.heartbeat.next_hard_deadline()
+                            && this.poll_heartbeat_timer(cx, deadline.at()).is_ready()
+                        {
+                            expired_deadline = Some(deadline);
+                            continue;
+                        }
                         return Poll::Pending;
                     }
                 }
@@ -2637,11 +2680,12 @@ where
                 return Poll::Ready(Some(Err(error)));
             }
 
-            let deadline = self
-                .pending_parse_error
-                .is_none()
-                .then(|| self.heartbeat.next_deadline())
-                .flatten();
+            let deadline = expired_deadline.take().or_else(|| {
+                self.pending_parse_error
+                    .is_none()
+                    .then(|| self.heartbeat.next_deadline())
+                    .flatten()
+            });
             if let Some(deadline) = deadline {
                 let now = self.clock_epoch.elapsed().as_millis() as u64;
                 if deadline.at() <= now {
@@ -2694,28 +2738,20 @@ where
                     this.heartbeat_sleep = None;
                     continue;
                 }
-
-                if self
-                    .as_mut()
-                    .get_mut()
-                    .poll_heartbeat_timer(cx, deadline.at())
-                    .is_ready()
-                {
-                    // Fired: loop back to re-evaluate the (possibly moved) deadline.
-                    continue;
-                }
             }
 
             if let Some(msg) = self.as_mut().get_mut().next_pending_message() {
                 let this = self.as_mut().get_mut();
-                let now = this.clock_epoch.elapsed().as_millis() as u64;
-                let pong = match &msg {
-                    Message::Pong(payload) => Some(payload),
-                    _ => None,
-                };
-                // Inbound traffic only pushes deadlines later; the armed timer is
-                // left alone and re-armed lazily when it fires.
-                this.heartbeat.on_inbound(now, pong);
+                if this.heartbeat.tracks_inbound_activity() {
+                    let now = this.clock_epoch.elapsed().as_millis() as u64;
+                    let pong = match &msg {
+                        Message::Pong(payload) => Some(payload),
+                        _ => None,
+                    };
+                    // Inbound traffic only pushes deadlines later; the armed timer is
+                    // left alone and re-armed lazily when it fires.
+                    this.heartbeat.on_inbound(now, pong);
+                }
 
                 match &msg {
                     Message::Ping(data) => {
@@ -2812,6 +2848,13 @@ where
                                 this.finish_read_close(Some(Error::ConnectionClosed)),
                             );
                         }
+                        if this.pending_parse_error.is_none()
+                            && let Some(deadline) = this.heartbeat.next_deadline()
+                            && this.poll_heartbeat_timer(cx, deadline.at()).is_ready()
+                        {
+                            expired_deadline = Some(deadline);
+                            continue;
+                        }
                         return Poll::Pending;
                     }
                 }
@@ -2848,6 +2891,14 @@ where
                     let this = self.as_mut().get_mut();
                     if this.poll_closing_expired(cx) {
                         return Poll::Ready(this.finish_read_close(Some(Error::ConnectionClosed)));
+                    }
+                    if this.pending_parse_error.is_none()
+                        && let Some(deadline) = this.heartbeat.next_deadline()
+                        && this.poll_heartbeat_timer(cx, deadline.at()).is_ready()
+                    {
+                        // Fired: loop back to re-evaluate the (possibly moved) deadline.
+                        expired_deadline = Some(deadline);
+                        continue;
                     }
                     return Poll::Pending;
                 }
@@ -3332,6 +3383,10 @@ impl<S> Drop for CompressedSplitWriter<S> {
 #[cfg(test)]
 #[path = "terminal_publication_tests.rs"]
 mod terminal_publication_tests;
+
+#[cfg(test)]
+#[path = "split_write_tests.rs"]
+mod split_write_tests;
 
 #[cfg(test)]
 mod tests {
