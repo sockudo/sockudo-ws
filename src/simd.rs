@@ -640,12 +640,9 @@ pub fn apply_mask_offset(data: &mut [u8], mask: [u8; 4], offset: usize) {
 
     // Rotate mask to account for offset
     let offset = offset & 3;
-    let rotated_mask = [
-        mask[offset & 3],
-        mask[(offset + 1) & 3],
-        mask[(offset + 2) & 3],
-        mask[(offset + 3) & 3],
-    ];
+    let rotated_mask = u32::from_le_bytes(mask)
+        .rotate_right((offset * 8) as u32)
+        .to_le_bytes();
     apply_mask(data, rotated_mask);
 }
 
@@ -783,6 +780,20 @@ mod tests {
 
         // With offset 1, mask should be rotated: [0x02, 0x03, 0x04, 0x01]
         assert_eq!(data, vec![0x02, 0x03, 0x04, 0x01, 0x02, 0x03, 0x04, 0x01]);
+    }
+
+    #[test]
+    fn mask_offsets_match_the_bytewise_definition() {
+        let mask = [0x11, 0x53, 0xa7, 0xe2];
+        for offset in [0, 1, 2, 3, 4, 5, 6, 7, usize::MAX] {
+            let mut data: [u8; 65] = std::array::from_fn(|i| i as u8);
+            let expected: [u8; 65] =
+                std::array::from_fn(|i| data[i] ^ mask[(i + (offset & 3)) & 3]);
+
+            apply_mask_offset(&mut data, mask, offset);
+
+            assert_eq!(data, expected, "offset {offset}");
+        }
     }
 
     #[test]
