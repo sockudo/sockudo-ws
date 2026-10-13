@@ -1281,7 +1281,16 @@ impl SplitShared {
             return;
         }
         let now_ms = self.epoch.elapsed().as_millis() as u64;
-        self.last_inbound_ms.fetch_max(now_ms, Ordering::Relaxed);
+        // Heartbeats use millisecond precision. Most messages in a burst have
+        // the same timestamp: avoid a locked read-modify-write in that case.
+        // The reader is the sole publisher (next requires &mut self); the
+        // driver only loads this field. A relaxed store is sufficient even
+        // when the two tasks run on different threads. Keep the comparison
+        // so the timestamp never regresses and repeated messages do not write
+        // the shared cache line. Do not call this from the writer driver.
+        if now_ms > self.last_inbound_ms.load(Ordering::Relaxed) {
+            self.last_inbound_ms.store(now_ms, Ordering::Relaxed);
+        }
     }
 
     fn begin_local_closing(&self) -> bool {
@@ -3540,6 +3549,37 @@ mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[cfg(not(feature = "test-util"))]
+    #[test]
+    fn split_activity_preserves_millisecond_precision_and_monotonicity() {
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let shared = SplitShared::new(false, true);
+            mock.increment(Duration::from_micros(999));
+            shared.note_inbound();
+            assert_eq!(shared.last_inbound_ms.load(Ordering::Relaxed), 0);
+            mock.increment(Duration::from_micros(1));
+            shared.note_inbound();
+            assert_eq!(shared.last_inbound_ms.load(Ordering::Relaxed), 1);
+            for _ in 0..100 {
+                shared.note_inbound();
+            }
+            assert_eq!(shared.last_inbound_ms.load(Ordering::Relaxed), 1);
+            mock.increment(Duration::from_millis(37));
+            shared.note_inbound();
+            assert_eq!(shared.last_inbound_ms.load(Ordering::Relaxed), 38);
+            // A stale observation must never move the inactivity deadline back.
+            shared.last_inbound_ms.store(39, Ordering::Relaxed);
+            shared.note_inbound();
+            assert_eq!(shared.last_inbound_ms.load(Ordering::Relaxed), 39);
+
+            let disabled = SplitShared::new(false, false);
+            mock.increment(Duration::from_secs(1));
+            disabled.note_inbound();
+            assert_eq!(disabled.last_inbound_ms.load(Ordering::Relaxed), 0);
+        });
+    }
 
     struct FailingWriter {
         polls: Arc<std::sync::atomic::AtomicUsize>,
