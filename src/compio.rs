@@ -13,6 +13,13 @@
 //! only when both idle and Pong timeouts are disabled. The peer's Pong response
 //! deadline still starts after Ping is actually flushed.
 //!
+//! Unified streams cannot read while a write is in flight: Compio's `read` and
+//! `write` both take `&mut self`. Blocked automatic control output is bounded
+//! by the existing hard idle or outstanding Ping's Pong deadline. Expiry
+//! terminates without Close because the cancelled owned write may have consumed
+//! part of the frame. Without a hard deadline, control output can wait indefinitely;
+//! an automatic Ping starts its Pong timeout only after it is flushed.
+//!
 //! HTTP/2 entry points require `compio::io::util::Splittable`. Wrap transports
 //! without that implementation (including TLS wrappers) in
 //! `compio::io::util::Split::new(transport)` before passing them to these APIs.
@@ -354,6 +361,28 @@ where
 
     writer.flush().await?;
     Ok(())
+}
+
+/// Flush an automatic control frame on an open stream, bounded by `bound`.
+///
+/// A cancelled owned write may already have consumed part of `buf`, so expiry
+/// is terminal: the caller must not reuse the buffer or queue a Close behind it.
+async fn flush_control_until<W>(
+    writer: &mut W,
+    buf: &mut BytesMut,
+    clock_epoch: Instant,
+    bound: Deadline,
+) -> Result<()>
+where
+    W: AsyncWrite + ?Sized,
+{
+    let deadline = clock_epoch + Duration::from_millis(bound.at());
+    compio_until(deadline, flush_bytes(writer, buf))
+        .await
+        .unwrap_or(Err(match bound {
+            Deadline::Idle(_) => Error::IdleTimeout,
+            Deadline::Ping(_) | Deadline::Pong(_) => Error::HeartbeatTimeout,
+        }))
 }
 
 trait CompioSplitEncoder: 'static {
@@ -1815,6 +1844,32 @@ where
         self.handle_deadline(deadline, now).await
     }
 
+    /// Flush automatic control output within the existing hard deadline.
+    ///
+    /// `begin_closing` stops the heartbeat, so a closing stream falls back to
+    /// `flush` and its closing budget. An unflushed Ping does not start a Pong
+    /// deadline; without a hard deadline this waits like an ordinary write.
+    async fn flush_control(&mut self) -> Result<()> {
+        let Some(bound) = self.heartbeat.next_hard_deadline() else {
+            return self.flush().await;
+        };
+        if self.state == CompioStreamState::Closed {
+            return Err(Error::ConnectionClosed);
+        }
+        let result = flush_control_until(
+            &mut self.inner,
+            &mut self.write_buf,
+            self.clock_epoch,
+            bound,
+        )
+        .await;
+        if result.is_err() {
+            self.state = CompioStreamState::Closed;
+            self.heartbeat.stop();
+        }
+        result
+    }
+
     async fn handle_deadline(&mut self, deadline: Deadline, now: u64) -> Option<Error> {
         match deadline {
             Deadline::Ping(at) if at <= now => {
@@ -1825,7 +1880,7 @@ where
                     {
                         return Some(error);
                     }
-                    if let Err(error) = self.flush().await {
+                    if let Err(error) = self.flush_control().await {
                         return Some(error);
                     }
                     self.heartbeat
@@ -1989,7 +2044,7 @@ where
                     && !self.closing_deadline.is_some_and(|at| Instant::now() >= at)
                 {
                     self.protocol.encode_pong(data, &mut self.write_buf);
-                    if let Err(error) = self.flush().await {
+                    if let Err(error) = self.flush_control().await {
                         self.heartbeat.stop();
                         self.state = CompioStreamState::Closed;
                         return Err(error);
@@ -3181,6 +3236,32 @@ where
         self.handle_deadline(deadline, now).await
     }
 
+    /// Flush automatic control output within the existing hard deadline.
+    ///
+    /// `begin_closing` stops the heartbeat, so a closing stream falls back to
+    /// `flush` and its closing budget. An unflushed Ping does not start a Pong
+    /// deadline; without a hard deadline this waits like an ordinary write.
+    async fn flush_control(&mut self) -> Result<()> {
+        let Some(bound) = self.heartbeat.next_hard_deadline() else {
+            return self.flush().await;
+        };
+        if self.state == CompioStreamState::Closed {
+            return Err(Error::ConnectionClosed);
+        }
+        let result = flush_control_until(
+            &mut self.inner,
+            &mut self.write_buf,
+            self.clock_epoch,
+            bound,
+        )
+        .await;
+        if result.is_err() {
+            self.state = CompioStreamState::Closed;
+            self.heartbeat.stop();
+        }
+        result
+    }
+
     async fn handle_deadline(&mut self, deadline: Deadline, now: u64) -> Option<Error> {
         match deadline {
             Deadline::Ping(at) if at <= now => {
@@ -3191,7 +3272,7 @@ where
                     {
                         return Some(error);
                     }
-                    if let Err(error) = self.flush().await {
+                    if let Err(error) = self.flush_control().await {
                         return Some(error);
                     }
                     self.heartbeat
@@ -3380,7 +3461,7 @@ where
                     && !self.closing_deadline.is_some_and(|at| Instant::now() >= at)
                 {
                     self.protocol.encode_pong(data, &mut self.write_buf);
-                    if let Err(error) = self.flush().await {
+                    if let Err(error) = self.flush_control().await {
                         self.heartbeat.stop();
                         self.state = CompioStreamState::Closed;
                         return Err(error);

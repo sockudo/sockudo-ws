@@ -14,6 +14,7 @@ struct TestIo {
     input: Option<&'static [u8]>,
     pending_shutdown: bool,
     fail_flush: bool,
+    block_flush: bool,
     block_write: bool,
     block_after_local_close: bool,
     repeat_ping: bool,
@@ -26,6 +27,7 @@ impl TestIo {
             input,
             pending_shutdown,
             fail_flush: false,
+            block_flush: false,
             block_write: false,
             block_after_local_close: false,
             repeat_ping: false,
@@ -62,6 +64,9 @@ impl AsyncWrite for TestIo {
         BufResult(Ok(buf.as_init().len()), buf)
     }
     async fn flush(&mut self) -> io::Result<()> {
+        if self.block_flush {
+            return pending().await;
+        }
         if self.fail_flush {
             Err(io::Error::other("flush failed"))
         } else {
@@ -74,6 +79,58 @@ impl AsyncWrite for TestIo {
         } else {
             Err(io::Error::other("shutdown failed"))
         }
+    }
+}
+
+// Reads use a native socket so the Ping deadline can cancel and recover them.
+struct SilentPeerBlockedWrite {
+    read: compio::net::TcpStream,
+    _peer: compio::net::TcpStream,
+    ping_after_flush: bool,
+    writes: Rc<Cell<usize>>,
+}
+
+impl SilentPeerBlockedWrite {
+    async fn new() -> Self {
+        let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let read = compio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        Self {
+            read,
+            _peer: peer,
+            ping_after_flush: false,
+            writes: Rc::new(Cell::new(0)),
+        }
+    }
+}
+
+impl AsyncRead for SilentPeerBlockedWrite {
+    async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+        if self.ping_after_flush && self.writes.get() > 0 {
+            return io::Cursor::new(b"\x89\x01p").read(buf).await;
+        }
+        self.read.read(buf).await
+    }
+}
+
+impl AsyncWrite for SilentPeerBlockedWrite {
+    async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+        self.writes.set(self.writes.get() + 1);
+        if self.ping_after_flush && self.writes.get() == 1 {
+            BufResult(Ok(buf.as_init().len()), buf)
+        } else if self.writes.get() == 1 + usize::from(self.ping_after_flush) {
+            BufResult(Ok(buf.as_init().len().min(3)), buf)
+        } else {
+            pending().await
+        }
+    }
+    async fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    async fn shutdown(&mut self) -> io::Result<()> {
+        pending().await
     }
 }
 
@@ -327,6 +384,135 @@ macro_rules! close_cases {
                 assert!(ws.send(Message::text("late")).await.is_err());
                 assert!(ws.flush().await.is_err());
                 assert_eq!(writes.get(), 2);
+            }
+
+            #[compio::test]
+            async fn blocked_pong_reply_is_bounded_by_idle_timeout() {
+                let mut io = TestIo::new(Some(b"\x89\x01p"), true);
+                io.block_write = true;
+                let writes = io.writes.clone();
+                let cfg = Config::builder()
+                    .auto_ping(false)
+                    .idle_timeout(1)
+                    .close_timeout(1)
+                    .build();
+                let mut ws = ($make)(io, cfg);
+                let result = compio::time::timeout(Duration::from_secs(3), ws.next())
+                    .await
+                    .expect("blocked Pong reply outlived the idle timeout");
+                assert!(
+                    matches!(result, Some(Err(Error::IdleTimeout))),
+                    "{result:?}"
+                );
+                assert!(ws.next().await.is_none());
+                // The cancelled write is neither restarted nor followed by Close.
+                assert_eq!(writes.get(), 2);
+            }
+
+            #[compio::test]
+            async fn blocked_auto_ping_is_bounded_by_idle_timeout() {
+                let io = SilentPeerBlockedWrite::new().await;
+                let writes = io.writes.clone();
+                let cfg = Config::builder()
+                    .auto_ping(true)
+                    .ping_interval(1)
+                    .pong_timeout(1)
+                    .idle_timeout(2)
+                    .close_timeout(1)
+                    .build();
+                let mut ws = ($make)(io, cfg);
+                let start = Instant::now();
+                let result = compio::time::timeout(Duration::from_secs(4), ws.next())
+                    .await
+                    .expect("blocked Ping outlived the idle timeout");
+                assert!(
+                    matches!(result, Some(Err(Error::IdleTimeout))),
+                    "{result:?}"
+                );
+                // The original idle budget is not restarted when Ping becomes due,
+                // and no Close follows the cancelled write.
+                let elapsed = start.elapsed();
+                assert!(
+                    (Duration::from_millis(1900)..Duration::from_millis(2600)).contains(&elapsed),
+                    "{elapsed:?}"
+                );
+                assert!(ws.next().await.is_none());
+                assert_eq!(writes.get(), 2);
+            }
+
+            #[compio::test]
+            async fn blocked_pong_flush_is_bounded_by_idle_timeout() {
+                let mut io = TestIo::new(Some(b"\x89\x01p"), true);
+                io.block_flush = true;
+                let writes = io.writes.clone();
+                let cfg = Config::builder().auto_ping(false).idle_timeout(1).build();
+                let mut ws = ($make)(io, cfg);
+                let result = compio::time::timeout(Duration::from_secs(3), ws.next())
+                    .await
+                    .expect("transport flush outlived the idle timeout");
+                assert!(
+                    matches!(result, Some(Err(Error::IdleTimeout))),
+                    "{result:?}"
+                );
+                assert!(ws.next().await.is_none());
+                assert!(ws.flush().await.is_err());
+                assert_eq!(writes.get(), 1);
+            }
+
+            #[compio::test]
+            async fn blocked_pong_reply_preserves_outstanding_ping_deadline() {
+                let mut io = SilentPeerBlockedWrite::new().await;
+                io.ping_after_flush = true;
+                let writes = io.writes.clone();
+                let cfg = Config::builder()
+                    .auto_ping(true)
+                    .ping_interval(1)
+                    .pong_timeout(1)
+                    .idle_timeout(0)
+                    .build();
+                let mut ws = ($make)(io, cfg);
+                let result = compio::time::timeout(Duration::from_secs(4), ws.next())
+                    .await
+                    .expect("Pong reply outlived the outstanding Ping deadline");
+                assert!(
+                    matches!(result, Some(Err(Error::HeartbeatTimeout))),
+                    "{result:?}"
+                );
+                assert!(ws.next().await.is_none());
+                assert!(ws.send(Message::text("late")).await.is_err());
+                assert!(ws.flush().await.is_err());
+                assert_eq!(writes.get(), 3);
+            }
+
+            #[compio::test]
+            async fn unflushed_auto_ping_does_not_start_pong_timeout() {
+                let io = SilentPeerBlockedWrite::new().await;
+                let writes = io.writes.clone();
+                let cfg = Config::builder()
+                    .auto_ping(true)
+                    .ping_interval(1)
+                    .pong_timeout(1)
+                    .idle_timeout(0)
+                    .build();
+                let mut ws = ($make)(io, cfg);
+                assert!(
+                    compio::time::timeout(Duration::from_millis(2500), ws.next())
+                        .await
+                        .is_err()
+                );
+                assert_eq!(writes.get(), 2);
+            }
+
+            #[compio::test]
+            async fn blocked_pong_reply_without_hard_deadline_is_unbounded() {
+                let mut io = TestIo::new(Some(b"\x89\x01p"), true);
+                io.block_write = true;
+                let mut ws = ($make)(io, config(1));
+                assert!(
+                    compio::time::timeout(Duration::from_millis(1500), ws.next())
+                        .await
+                        .is_err()
+                );
             }
         }
     };
