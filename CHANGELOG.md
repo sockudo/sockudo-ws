@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Changed Tokio `WebSocketStream` and `CompressedWebSocketStream` to keep receiving on an open connection while automatic control output is blocked: a Ping is delivered before its automatic Pong is flushed, only the latest unencoded Pong is retained, and a peer that keeps sending without reading is no longer ended by the inbound idle timeout; there is no output deadline
+
+### Fixes
+
+- Fixed Tokio unified `Sink` and `Stream` halves polled by different tasks (for example after `futures_util::StreamExt::split`) missing wakeups: transport readiness, the shared heartbeat and Close timer, and terminal transitions such as a read-side write error or a completed sink close now wake both halves
+- Fixed a Tokio unified automatic Ping flushed by the `Sink`, or flushed before a blocked Pong, not starting its Pong timeout until the reader's own flush completed
+- Fixed continuous `feed` calls starving pending automatic Pongs: while a Pong is pending, Sink readiness now drains output before admitting more application data, even below the batching threshold, while preserving coalescing across a blocked transport flush
+
 ## [3.0.0] - 2026-09-29
 
 ### Enhancements

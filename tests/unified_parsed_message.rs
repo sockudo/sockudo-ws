@@ -61,7 +61,9 @@ impl AsyncWrite for CrossingDeadlineIo {
 #[case(false)]
 #[case(true)]
 #[tokio::test(start_paused = true)]
-async fn parsed_data_survives_cancelled_ping_flush(#[case] split_after_pending: bool) {
+async fn parsed_data_is_delivered_once_while_ping_flush_is_blocked(
+    #[case] split_after_pending: bool,
+) {
     let (clock, mock) = quanta::Clock::mock();
     let blocked = Arc::new(AtomicBool::new(true));
     let io = CrossingDeadlineIo {
@@ -77,35 +79,26 @@ async fn parsed_data_survives_cancelled_ping_flush(#[case] split_after_pending: 
         .build();
     let mut stream = quanta::with_clock(&clock, || WebSocketStream::client(io, config));
     let mut context = Context::from_waker(Waker::noop());
+    let Poll::Ready(Some(Ok(message))) =
+        quanta::with_clock(&clock, || Pin::new(&mut stream).poll_next(&mut context))
+    else {
+        panic!("automatic Ping backpressure must not stall parsed data");
+    };
+    assert_eq!(message.as_bytes(), b"a");
     {
         let next = stream.next();
         tokio::pin!(next);
         assert!(quanta::with_clock(&clock, || next.as_mut().poll(&mut context)).is_pending());
     }
     blocked.store(false, Ordering::Relaxed);
+    futures_util::SinkExt::flush(&mut stream).await.unwrap();
 
     if split_after_pending {
         let (mut reader, _writer) = quanta::with_clock(&clock, || stream.split());
-        {
-            let next = reader.next();
-            tokio::pin!(next);
-            let Poll::Ready(Some(Ok(message))) =
-                quanta::with_clock(&clock, || next.as_mut().poll(&mut context))
-            else {
-                panic!("split must retain the parsed data");
-            };
-            assert_eq!(message.as_bytes(), b"a");
-        }
         let next = reader.next();
         tokio::pin!(next);
         assert!(quanta::with_clock(&clock, || next.as_mut().poll(&mut context)).is_pending());
     } else {
-        let Poll::Ready(Some(Ok(message))) =
-            quanta::with_clock(&clock, || Pin::new(&mut stream).poll_next(&mut context))
-        else {
-            panic!("cancelled next must retain the parsed data");
-        };
-        assert_eq!(message.as_bytes(), b"a");
         assert!(
             quanta::with_clock(&clock, || Pin::new(&mut stream).poll_next(&mut context))
                 .is_pending()

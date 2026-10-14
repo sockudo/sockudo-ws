@@ -2,6 +2,8 @@
 
 The suite measures production paths at three levels: kernels/protocol, controlled stream APIs, and real transports. Core cases support an optimization loop; extended cases cover boundaries, ownership, runtime placement and flow control. Neither tier is a production workload distribution. Diagnostic examples and allocation counters are separate from ordinary wall-time measurements.
 
+The `transport/extended/unified_control` cases measure 1,024 application messages with one peer Ping per 1 or 32 messages over a 256-byte duplex buffer. Plain and compression-disabled compressed streams are exercised directly and through `futures::split`; both halves are called sequentially on one current-thread runtime. Timing includes feed/receive cycles, final flush and peer byte/Pong validation, excluding setup. These closed-loop batch costs expose control-induced flushes; they are not per-message percentiles, cross-thread split throughput or physical-network measurements. The peer requires each Pong before accepting application data beyond that batch, so this oracle cannot isolate admission-gate cost against a variant that allows later batches to overtake the Pong.
+
 ## Run
 
 ```sh

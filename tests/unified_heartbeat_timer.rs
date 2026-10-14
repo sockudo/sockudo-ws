@@ -5,14 +5,19 @@ use std::io;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll, Wake, Waker};
+use std::sync::atomic::Ordering;
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use futures_util::future::Either;
 use futures_util::{SinkExt, Stream};
 use sockudo_ws::{CompressedWebSocketStream, Config, Error, Message, WebSocketStream};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+
+#[path = "support/wake_count.rs"]
+mod wake_count;
+
+use wake_count::WakeCount;
 
 struct BlockedControlIo {
     read: DuplexStream,
@@ -56,19 +61,6 @@ impl AsyncWrite for BlockedControlIo {
     }
 }
 
-#[derive(Default)]
-struct WakeCount(AtomicUsize);
-
-impl Wake for WakeCount {
-    fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.0.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
 #[rstest::rstest]
 #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
 #[tokio::test(start_paused = true)]
@@ -104,6 +96,12 @@ async fn idle_deadline_wakes_and_terminates_a_blocked_control_write(
     let wakes = Arc::new(WakeCount::default());
     let waker = Waker::from(wakes.clone());
     let mut cx = Context::from_waker(&waker);
+    if !outgoing_ping {
+        assert!(matches!(
+            ws.as_mut().poll_next(&mut cx),
+            Poll::Ready(Some(Ok(Message::Ping(_))))
+        ));
+    }
     assert!(ws.as_mut().poll_next(&mut cx).is_pending());
     if outgoing_ping {
         tokio::time::advance(Duration::from_millis(1001)).await;
@@ -208,6 +206,10 @@ async fn outstanding_ping_timeout_survives_a_blocked_pong_response(
     assert!(Pin::new(&mut ws).poll_next(&mut cx).is_pending());
     blocked.set(true);
     peer.write_all(b"\x89\x00").await.unwrap();
+    assert!(matches!(
+        Pin::new(&mut ws).poll_next(&mut cx),
+        Poll::Ready(Some(Ok(Message::Ping(_))))
+    ));
     assert!(Pin::new(&mut ws).poll_next(&mut cx).is_pending());
     wakes.0.store(0, Ordering::Relaxed);
 

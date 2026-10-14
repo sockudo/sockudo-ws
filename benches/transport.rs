@@ -22,6 +22,9 @@ pub mod split_receive;
 #[cfg(feature = "tokio-runtime")]
 #[path = "support/stream_bench.rs"]
 pub mod stream_bench;
+#[cfg(feature = "tokio-runtime")]
+#[path = "support/unified_control.rs"]
+pub mod unified_control;
 
 fn benchmarks(_c: &mut Criterion) {
     #[cfg(feature = "tokio-runtime")]
@@ -59,6 +62,8 @@ fn benchmarks(_c: &mut Criterion) {
     stream_bench::bench_masked_receive(_c);
     #[cfg(feature = "tokio-runtime")]
     sink_backpressure::bench_backpressure(_c);
+    #[cfg(feature = "tokio-runtime")]
+    unified_control::bench_control(_c);
     #[cfg(feature = "tokio-runtime")]
     masking_bench::bench_tcp(_c);
     #[cfg(feature = "tokio-runtime")]

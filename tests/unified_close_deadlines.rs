@@ -291,43 +291,41 @@ macro_rules! close_cases {
 
             #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
-            async fn buffered_parse_error_does_not_disable_blocked_pong_deadline() {
+            async fn buffered_parse_error_survives_blocked_pong() {
                 let (io, mut peer) = connection(false, false);
                 io.block_write.set(true);
                 let mut ws = ($make)(io, heartbeat_config());
                 peer.write_all(b"\x89\x01p\x83\x00").await.unwrap();
                 let start = tokio::time::Instant::now();
 
-                // With no accepted data ahead of it, the discovered parse error
-                // is reported as soon as the hard deadline releases the blocked Pong.
+                assert!(ws.next().await.unwrap().unwrap().is_ping());
                 assert!(matches!(
-                    tokio::time::timeout(Duration::from_secs(122), ws.next())
-                        .await
-                        .expect("hard idle deadline must wake the blocked Pong"),
-                    Some(Err(Error::InvalidFrame("invalid opcode")))
+                    futures_util::poll!(ws.next()),
+                    Poll::Ready(Some(Err(Error::InvalidFrame("invalid opcode"))))
                 ));
-                assert_eq!(start.elapsed(), Duration::from_secs(120));
+                assert_eq!(start.elapsed(), Duration::ZERO);
                 assert!(ws.next().await.is_none());
             }
 
             #[cfg_attr(not(feature = "test-util"), ignore = "requires test-util clock")]
             #[tokio::test(start_paused = true)]
-            async fn buffered_data_and_parse_error_keep_blocked_pong_deadline() {
+            async fn buffered_data_and_parse_error_handle_blocked_pong() {
                 let (io, mut peer) = connection(false, false);
                 io.block_write.set(true);
                 let mut ws = ($make)(io, heartbeat_config());
                 peer.write_all(b"\x89\x01p\x82\x01d\x83\x00").await.unwrap();
                 let start = tokio::time::Instant::now();
 
-                // Accepted data must remain ahead of the parse error. The hard idle
-                // deadline therefore becomes terminal, with close_timeout adding 1s.
+                assert!(ws.next().await.unwrap().unwrap().is_ping());
                 assert!(matches!(
-                    tokio::time::timeout(Duration::from_secs(122), ws.next())
-                        .await
-                        .expect("hard idle deadline must wake the blocked Pong"),
-                    Some(Err(Error::IdleTimeout))
+                    futures_util::poll!(ws.next()),
+                    Poll::Ready(Some(Ok(Message::Binary(data)))) if data.as_ref() == b"d"
                 ));
-                assert_eq!(start.elapsed(), Duration::from_secs(121));
+                assert!(matches!(
+                    futures_util::poll!(ws.next()),
+                    Poll::Ready(Some(Err(Error::InvalidFrame("invalid opcode"))))
+                ));
+                assert_eq!(start.elapsed(), Duration::ZERO);
                 assert!(ws.next().await.is_none());
             }
 
