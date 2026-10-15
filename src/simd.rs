@@ -648,47 +648,12 @@ pub fn apply_mask_offset(data: &mut [u8], mask: [u8; 4], offset: usize) {
 
 /// Generate a random mask for client frames
 ///
-/// Uses the configured random number generator:
-/// - `fastrand` feature: fast PRNG (default, same as tokio-websockets)
-/// - `getrandom` feature: cryptographically secure RNG
-/// - `rand_rng` feature: uses rand crate
-/// - `nightly` feature: uses std::random (cryptographically secure)
-///
-/// If no RNG feature is enabled, falls back to a simple counter-based approach
-/// (not suitable for production use).
+/// Forwards to [`crate::mask::generate_mask`], the generator that frame
+/// encoding uses, so both follow the same RNG feature priority.
+#[deprecated(note = "use `sockudo_ws::mask::generate_mask`")]
 #[inline]
 pub fn generate_mask() -> [u8; 4] {
-    #[cfg(feature = "fastrand")]
-    {
-        fastrand::u32(..).to_ne_bytes()
-    }
-
-    #[cfg(all(feature = "getrandom", not(feature = "fastrand")))]
-    {
-        let mut buf = [0u8; 4];
-        getrandom::fill(&mut buf).expect("getrandom failed");
-        return buf;
-    }
-
-    #[cfg(all(
-        feature = "rand_rng",
-        not(feature = "fastrand"),
-        not(feature = "getrandom")
-    ))]
-    {
-        use rand::RngExt;
-        return rand::rng().random::<[u8; 4]>();
-    }
-
-    // Fallback: use a simple counter-based approach (NOT cryptographically secure)
-    // This should only be used for testing or when no RNG feature is enabled
-    #[cfg(not(any(feature = "fastrand", feature = "getrandom", feature = "rand_rng")))]
-    {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0x12345678);
-        let val = COUNTER.fetch_add(0x9E3779B9, Ordering::Relaxed); // Golden ratio constant
-        val.to_ne_bytes()
-    }
+    crate::mask::generate_mask()
 }
 
 #[cfg(test)]
@@ -797,11 +762,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_generate_mask() {
         let mask1 = generate_mask();
         let mask2 = generate_mask();
 
-        // Masks should be different (fastrand maintains thread-local state)
+        // Masks should be different (every backend advances its state)
         assert_ne!(mask1, mask2);
     }
 }

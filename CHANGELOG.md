@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed `connect_to_url` URL parsing: IPv6 hosts without a port, query-only targets, and uppercase schemes now work, Host keeps a non-default port (RFC 6455), and user information, fragments, or anything but `:<digits>` after the host are rejected before connecting
 - Accepted the IANA-registered close codes 1012 (Service Restart), 1013 (Try Again Later), and 1014 (Bad Gateway) from peers and in `CloseReason::is_valid_code`
 
+### Deprecated
+
+- Deprecated `simd::generate_mask`; it now forwards to `mask::generate_mask` and follows its RNG priority (getrandom, then rand_rng, then fastrand) instead of preferring fastrand
+
 ### Documentation
 
 - Documented that outgoing messages and `close` arguments are not validated: callers must keep Text payloads valid UTF-8, Ping and Pong payloads at most 125 bytes, and Close reasons at most 123 bytes with a valid code
