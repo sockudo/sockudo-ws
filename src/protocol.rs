@@ -818,7 +818,7 @@ impl Protocol {
             let code = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
 
             // Validate close code
-            if !CloseReason::is_valid_code(code) && !(3000..=4999).contains(&code) {
+            if !CloseReason::is_valid_code(code) {
                 return Err(Error::InvalidCloseCode(code));
             }
 
@@ -1544,7 +1544,7 @@ impl CompressedReaderProtocol {
         let reason = if frame.payload.len() >= 2 {
             let code = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
 
-            if !CloseReason::is_valid_code(code) && !(3000..=4999).contains(&code) {
+            if !CloseReason::is_valid_code(code) {
                 return Err(Error::InvalidCloseCode(code));
             }
 

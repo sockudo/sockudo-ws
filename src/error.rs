@@ -116,8 +116,11 @@ impl CloseReason {
     }
 
     /// Check if the close code is valid per RFC 6455
+    ///
+    /// Also accepts 1012–1014, which the IANA WebSocket Close Code Number
+    /// Registry added after RFC 6455.
     pub fn is_valid_code(code: u16) -> bool {
-        matches!(code, 1000..=1003 | 1007..=1011 | 3000..=4999)
+        matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
     }
 }
 
