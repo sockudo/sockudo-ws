@@ -9,14 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
-- Changed Tokio `WebSocketStream` and `CompressedWebSocketStream` to keep receiving on an open connection while automatic control output is blocked: a Ping is delivered before its automatic Pong is flushed, only the latest unencoded Pong is retained, and a peer that keeps sending without reading is no longer ended by the inbound idle timeout; there is no output deadline
+- Changed Tokio `WebSocketStream` and `CompressedWebSocketStream` to keep receiving while automatic control output is blocked: a Ping is delivered before its Pong is flushed, only the latest unencoded Pong is kept, and a peer that sends without reading is no longer closed by the inbound idle timeout; there is no output deadline
 
 ### Fixes
 
-- Fixed Compio unified streams waiting indefinitely on blocked automatic Pong or Ping output instead of ending at an existing hard idle or outstanding Pong deadline; expiry terminates without sending Close, and an unflushed Ping still does not start its Pong timeout
-- Fixed Tokio unified `Sink` and `Stream` halves polled by different tasks (for example after `futures_util::StreamExt::split`) missing wakeups: transport readiness, the shared heartbeat and Close timer, and terminal transitions such as a read-side write error or a completed sink close now wake each waiting half, without waking a `Sink` whose last poll completed or waking a task waiting on both halves twice
-- Fixed a Tokio unified automatic Ping flushed by the `Sink`, or flushed before a blocked Pong, not starting its Pong timeout until the reader's own flush completed
-- Fixed continuous `feed` calls starving pending automatic Pongs: while a Pong is pending, Sink readiness now drains output before admitting more application data, even below the batching threshold, while preserving coalescing across a blocked transport flush
+- Fixed Compio unified streams waiting indefinitely on blocked automatic Pong or Ping output; they now end at an existing hard idle or outstanding Pong deadline without sending Close, and an unflushed Ping still does not start its Pong timeout
+- Fixed Tokio unified `Sink` and `Stream` halves polled by different tasks (e.g. after `futures_util::StreamExt::split`) missing wakeups from transport readiness, the shared heartbeat and Close timer, and terminal transitions such as a read-side write error or completed sink close; a `Sink` whose last poll completed is not woken, and a task waiting on both halves is woken once
+- Fixed a Tokio unified automatic Ping flushed by the `Sink`, or before a blocked Pong, starting its Pong timeout only after the reader's own flush
+- Fixed continuous `feed` calls starving pending automatic Pongs: while a Pong is pending, Sink readiness drains output before admitting more data, even below the batching threshold, and still coalesces across a blocked transport flush
 
 ## [3.0.0] - 2026-09-29
 
