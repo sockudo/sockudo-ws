@@ -2138,6 +2138,7 @@ where
                 read_buf: self.read_buf,
                 pending_messages: self.pending_messages,
                 pending_parse_error: self.pending_parse_error,
+                pending_request: None,
                 control_tx,
                 terminal_rx,
                 cancel_tx: cancel_tx.clone(),
@@ -2235,6 +2236,10 @@ pub struct CompioSplitReader<R> {
     pending_messages: Vec<Message>,
     // Deliver accepted messages before a later parse failure.
     pending_parse_error: Option<Error>,
+    // Driver notification for the control message on top of
+    // `pending_messages`, retained while a cancelled call waited for queue
+    // capacity.
+    pending_request: Option<ControlRequest>,
     control_tx: mpsc::Sender<ControlRequest>,
     terminal_rx: mpsc::UnboundedReceiver<CompioTerminalCause>,
     cancel_tx: mpsc::UnboundedSender<()>,
@@ -2276,16 +2281,27 @@ where
             }
 
             if let Some(msg) = self.pending_messages.pop() {
+                // A request left by a cancelled call already carries this
+                // message's receive time and state transition.
                 let request = match &msg {
-                    Message::Ping(data) => ControlRequest::PeerPing(data.clone(), Instant::now()),
-                    Message::Pong(data) => ControlRequest::Pong(data.clone(), Instant::now()),
-                    Message::Close(_) => {
-                        self.shared.begin_closing();
-                        self.pending_messages.clear();
-                        self.pending_parse_error = None;
-                        self.read_buf.clear();
-                        ControlRequest::PeerClose
-                    }
+                    Message::Ping(data) => self
+                        .pending_request
+                        .take()
+                        .unwrap_or_else(|| ControlRequest::PeerPing(data.clone(), Instant::now())),
+                    Message::Pong(data) => self
+                        .pending_request
+                        .take()
+                        .unwrap_or_else(|| ControlRequest::Pong(data.clone(), Instant::now())),
+                    Message::Close(_) => match self.pending_request.take() {
+                        Some(request) => request,
+                        None => {
+                            self.shared.begin_closing();
+                            self.pending_messages.clear();
+                            self.pending_parse_error = None;
+                            self.read_buf.clear();
+                            ControlRequest::PeerClose
+                        }
+                    },
                     _ => {
                         // Data frames only refresh the inactivity clock; no
                         // channel round trip per message.
@@ -2293,18 +2309,39 @@ where
                         return Some(Ok(msg));
                     }
                 };
-                if self.control_tx.send(request).await.is_err() {
+                // The wait for queue capacity may be cancelled, so the reader
+                // keeps the message and request until the driver accepts them.
+                // `start_send` is the only commit point: `SinkExt::send` can
+                // enqueue and still be pending in its flush.
+                self.pending_messages.push(msg);
+                self.pending_request = Some(request);
+                let committed = std::future::poll_fn(|cx| self.control_tx.poll_ready(cx))
+                    .await
+                    .and_then(|()| {
+                        let request = self.pending_request.take().expect("hand-off request");
+                        self.control_tx.start_send(request)
+                    });
+                if committed.is_err() {
+                    self.pending_messages.pop();
+                    self.pending_request = None;
                     self.shared.terminate(CompioTerminalCause::ConnectionClosed);
                     continue;
                 }
-                return Some(Ok(msg));
+                return self.pending_messages.pop().map(Ok);
             }
 
-            if let Some(error) = self.pending_parse_error.take() {
-                let _ = self.control_tx.send(ControlRequest::ReadError).await;
+            if self.pending_parse_error.is_some() {
+                // Keep the error until the driver is notified, so a cancelled
+                // wait reports it on the next call.
+                if std::future::poll_fn(|cx| self.control_tx.poll_ready(cx))
+                    .await
+                    .is_ok()
+                {
+                    let _ = self.control_tx.start_send(ControlRequest::ReadError);
+                }
                 self.shared.terminate(CompioTerminalCause::ConnectionClosed);
                 self.terminal_reported = true;
-                return Some(Err(error));
+                return self.pending_parse_error.take().map(Err);
             }
 
             if !self.read_buf.is_empty() {
@@ -3554,6 +3591,7 @@ where
                 read_buf: self.read_buf,
                 pending_messages: self.pending_messages,
                 pending_parse_error: self.pending_parse_error,
+                pending_request: None,
                 control_tx,
                 terminal_rx,
                 cancel_tx: cancel_tx.clone(),
@@ -3579,6 +3617,10 @@ pub struct CompioCompressedSplitReader<R> {
     pending_messages: Vec<Message>,
     // Deliver accepted messages before a later parse failure.
     pending_parse_error: Option<Error>,
+    // Driver notification for the control message on top of
+    // `pending_messages`, retained while a cancelled call waited for queue
+    // capacity.
+    pending_request: Option<ControlRequest>,
     control_tx: mpsc::Sender<ControlRequest>,
     terminal_rx: mpsc::UnboundedReceiver<CompioTerminalCause>,
     cancel_tx: mpsc::UnboundedSender<()>,
@@ -3621,16 +3663,27 @@ where
             }
 
             if let Some(msg) = self.pending_messages.pop() {
+                // A request left by a cancelled call already carries this
+                // message's receive time and state transition.
                 let request = match &msg {
-                    Message::Ping(data) => ControlRequest::PeerPing(data.clone(), Instant::now()),
-                    Message::Pong(data) => ControlRequest::Pong(data.clone(), Instant::now()),
-                    Message::Close(_) => {
-                        self.shared.begin_closing();
-                        self.pending_messages.clear();
-                        self.pending_parse_error = None;
-                        self.read_buf.clear();
-                        ControlRequest::PeerClose
-                    }
+                    Message::Ping(data) => self
+                        .pending_request
+                        .take()
+                        .unwrap_or_else(|| ControlRequest::PeerPing(data.clone(), Instant::now())),
+                    Message::Pong(data) => self
+                        .pending_request
+                        .take()
+                        .unwrap_or_else(|| ControlRequest::Pong(data.clone(), Instant::now())),
+                    Message::Close(_) => match self.pending_request.take() {
+                        Some(request) => request,
+                        None => {
+                            self.shared.begin_closing();
+                            self.pending_messages.clear();
+                            self.pending_parse_error = None;
+                            self.read_buf.clear();
+                            ControlRequest::PeerClose
+                        }
+                    },
                     _ => {
                         // Data frames only refresh the inactivity clock; no
                         // channel round trip per message.
@@ -3638,18 +3691,39 @@ where
                         return Some(Ok(msg));
                     }
                 };
-                if self.control_tx.send(request).await.is_err() {
+                // The wait for queue capacity may be cancelled, so the reader
+                // keeps the message and request until the driver accepts them.
+                // `start_send` is the only commit point: `SinkExt::send` can
+                // enqueue and still be pending in its flush.
+                self.pending_messages.push(msg);
+                self.pending_request = Some(request);
+                let committed = std::future::poll_fn(|cx| self.control_tx.poll_ready(cx))
+                    .await
+                    .and_then(|()| {
+                        let request = self.pending_request.take().expect("hand-off request");
+                        self.control_tx.start_send(request)
+                    });
+                if committed.is_err() {
+                    self.pending_messages.pop();
+                    self.pending_request = None;
                     self.shared.terminate(CompioTerminalCause::ConnectionClosed);
                     continue;
                 }
-                return Some(Ok(msg));
+                return self.pending_messages.pop().map(Ok);
             }
 
-            if let Some(error) = self.pending_parse_error.take() {
-                let _ = self.control_tx.send(ControlRequest::ReadError).await;
+            if self.pending_parse_error.is_some() {
+                // Keep the error until the driver is notified, so a cancelled
+                // wait reports it on the next call.
+                if std::future::poll_fn(|cx| self.control_tx.poll_ready(cx))
+                    .await
+                    .is_ok()
+                {
+                    let _ = self.control_tx.start_send(ControlRequest::ReadError);
+                }
                 self.shared.terminate(CompioTerminalCause::ConnectionClosed);
                 self.terminal_reported = true;
-                return Some(Err(error));
+                return self.pending_parse_error.take().map(Err);
             }
 
             if !self.read_buf.is_empty() {

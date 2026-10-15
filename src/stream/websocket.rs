@@ -1895,6 +1895,9 @@ pub struct SplitReader<S> {
     pending_ping_batch: Vec<Message>,
     // Deliver successfully parsed messages before a later parse failure.
     pending_parse_error: Option<Error>,
+    // Driver notification for the control message in `pending_message`,
+    // retained while a cancelled call waited for queue capacity.
+    pending_request: Option<ControlRequest>,
     control_tx: mpsc::Sender<ControlRequest>,
     terminal_rx: watch::Receiver<()>,
     shared: Arc<SplitShared>,
@@ -1966,6 +1969,7 @@ where
                 pending_message: self.pending_message,
                 pending_ping_batch: self.pending_ping_batch,
                 pending_parse_error: self.pending_parse_error,
+                pending_request: None,
                 control_tx: control_tx.clone(),
                 terminal_rx,
                 shared: shared.clone(),
@@ -2041,21 +2045,26 @@ where
             };
 
             if let Some(msg) = message {
+                // A request left by a cancelled call already carries this
+                // message's receive time and state transition.
                 let request = match &msg {
-                    Message::Ping(data) => {
+                    Message::Ping(data) => self.pending_request.take().unwrap_or_else(|| {
                         ControlRequest::Ping(data.clone(), super::clock::Instant::now())
-                    }
-                    Message::Pong(data) => {
+                    }),
+                    Message::Pong(data) => self.pending_request.take().unwrap_or_else(|| {
                         ControlRequest::Pong(data.clone(), super::clock::Instant::now())
-                    }
-                    Message::Close(reason) => {
-                        self.shared.begin_peer_closing();
-                        self.pending_message = None;
-                        self.pending_ping_batch.clear();
-                        self.pending_parse_error = None;
-                        self.read_buf.clear();
-                        ControlRequest::PeerClose(reason.clone())
-                    }
+                    }),
+                    Message::Close(reason) => match self.pending_request.take() {
+                        Some(request) => request,
+                        None => {
+                            self.shared.begin_peer_closing();
+                            self.pending_message = None;
+                            self.pending_ping_batch.clear();
+                            self.pending_parse_error = None;
+                            self.read_buf.clear();
+                            ControlRequest::PeerClose(reason.clone())
+                        }
+                    },
                     _ => {
                         // Data frames only need to refresh the inactivity clock; a
                         // relaxed store avoids a channel round trip per message.
@@ -2063,17 +2072,29 @@ where
                         return Some(Ok(msg));
                     }
                 };
-                if self.control_tx.send(request).await.is_err() {
+                // Waiting for queue capacity may be cancelled, and the coop budget
+                // can make it wait even with capacity free. The reader keeps the
+                // message and request until the driver accepts them.
+                self.pending_message = Some(msg);
+                self.pending_request = Some(request);
+                let Ok(permit) = self.control_tx.reserve().await else {
+                    self.pending_message = None;
+                    self.pending_request = None;
                     self.shared.terminate(TerminalCause::ConnectionClosed);
                     continue;
-                }
-                return Some(Ok(msg));
+                };
+                permit.send(self.pending_request.take().expect("hand-off request"));
+                return self.pending_message.take().map(Ok);
             }
 
-            if let Some(error) = self.pending_parse_error.take() {
-                let _ = self.control_tx.send(ControlRequest::ReadError).await;
+            if self.pending_parse_error.is_some() {
+                // Keep the error until the driver is notified, so a cancelled
+                // wait reports it on the next call.
+                if let Ok(permit) = self.control_tx.reserve().await {
+                    permit.send(ControlRequest::ReadError);
+                }
                 self.terminal_reported = true;
-                return Some(Err(error));
+                return self.pending_parse_error.take().map(Err);
             }
 
             // Reuse an empty receive window when no delivered payload still owns it.
@@ -3430,6 +3451,10 @@ pub struct CompressedSplitReader<S> {
     pending_messages: Vec<Message>,
     // Deliver successfully parsed messages before a later parse failure.
     pending_parse_error: Option<Error>,
+    // Driver notification for the control message on top of
+    // `pending_messages`, retained while a cancelled call waited for queue
+    // capacity.
+    pending_request: Option<ControlRequest>,
     control_tx: mpsc::Sender<ControlRequest>,
     terminal_rx: watch::Receiver<()>,
     shared: Arc<SplitShared>,
@@ -3547,6 +3572,7 @@ where
                 has_unprocessed_read_data: self.has_unprocessed_read_data,
                 pending_messages: self.pending_messages,
                 pending_parse_error: self.pending_parse_error,
+                pending_request: None,
                 control_tx: control_tx.clone(),
                 terminal_rx,
                 shared: shared.clone(),
@@ -3585,20 +3611,25 @@ where
             }
 
             if let Some(msg) = self.pending_messages.pop() {
+                // A request left by a cancelled call already carries this
+                // message's receive time and state transition.
                 let request = match &msg {
-                    Message::Ping(data) => {
+                    Message::Ping(data) => self.pending_request.take().unwrap_or_else(|| {
                         ControlRequest::Ping(data.clone(), super::clock::Instant::now())
-                    }
-                    Message::Pong(data) => {
+                    }),
+                    Message::Pong(data) => self.pending_request.take().unwrap_or_else(|| {
                         ControlRequest::Pong(data.clone(), super::clock::Instant::now())
-                    }
-                    Message::Close(reason) => {
-                        self.shared.begin_peer_closing();
-                        self.pending_messages.clear();
-                        self.pending_parse_error = None;
-                        self.read_buf.clear();
-                        ControlRequest::PeerClose(reason.clone())
-                    }
+                    }),
+                    Message::Close(reason) => match self.pending_request.take() {
+                        Some(request) => request,
+                        None => {
+                            self.shared.begin_peer_closing();
+                            self.pending_messages.clear();
+                            self.pending_parse_error = None;
+                            self.read_buf.clear();
+                            ControlRequest::PeerClose(reason.clone())
+                        }
+                    },
                     _ => {
                         // Data frames only need to refresh the inactivity clock; a
                         // relaxed store avoids a channel round trip per message.
@@ -3606,17 +3637,29 @@ where
                         return Some(Ok(msg));
                     }
                 };
-                if self.control_tx.send(request).await.is_err() {
+                // Waiting for queue capacity may be cancelled, and the coop budget
+                // can make it wait even with capacity free. The reader keeps the
+                // message and request until the driver accepts them.
+                self.pending_messages.push(msg);
+                self.pending_request = Some(request);
+                let Ok(permit) = self.control_tx.reserve().await else {
+                    self.pending_messages.pop();
+                    self.pending_request = None;
                     self.shared.terminate(TerminalCause::ConnectionClosed);
                     continue;
-                }
-                return Some(Ok(msg));
+                };
+                permit.send(self.pending_request.take().expect("hand-off request"));
+                return self.pending_messages.pop().map(Ok);
             }
 
-            if let Some(error) = self.pending_parse_error.take() {
-                let _ = self.control_tx.send(ControlRequest::ReadError).await;
+            if self.pending_parse_error.is_some() {
+                // Keep the error until the driver is notified, so a cancelled
+                // wait reports it on the next call.
+                if let Ok(permit) = self.control_tx.reserve().await {
+                    permit.send(ControlRequest::ReadError);
+                }
                 self.terminal_reported = true;
-                return Some(Err(error));
+                return self.pending_parse_error.take().map(Err);
             }
 
             if self.has_unprocessed_read_data {

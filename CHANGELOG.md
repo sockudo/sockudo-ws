@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed Tokio unified `Sink` and `Stream` halves polled by different tasks (e.g. after `futures_util::StreamExt::split`) missing wakeups from transport readiness, the shared heartbeat and Close timer, and terminal transitions such as a read-side write error or completed sink close; a `Sink` whose last poll completed is not woken, and a task waiting on both halves is woken once
 - Fixed a Tokio unified automatic Ping flushed by the `Sink`, or before a blocked Pong, starting its Pong timeout only after the reader's own flush
 - Fixed continuous `feed` calls starving pending automatic Pongs: while a Pong is pending, Sink readiness drains output before admitting more data, even below the batching threshold, and still coalesces across a blocked transport flush
+- Fixed Tokio and Compio split readers losing a received Ping, Pong, Close, or parse error when a `next()` waiting for control queue capacity was cancelled (e.g. by `select!` or `timeout`); a lost Close left the peer without a reply and the reader hanging, and on Tokio the cooperative budget could cause the wait even with free capacity
 
 ## [3.0.0] - 2026-09-29
 
