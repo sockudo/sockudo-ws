@@ -121,8 +121,8 @@ enum Half {
 /// A transport keeps only the most recent waker per direction, a timer keeps
 /// only one, and the Stream and Sink halves may be polled by different tasks.
 /// Transport I/O and the shared timer therefore receive a proxy waker that
-/// wakes both slots, so neither half depends on the other's task polling again
-/// (or polling at all, after a dropped future).
+/// wakes each waiting slot, so neither half depends on the other's task
+/// polling again (or polling at all, after a dropped future).
 #[derive(Default)]
 struct HalfWakers {
     // Indexed by `Half`, like `UnifiedOutput::registered`.
@@ -135,6 +135,15 @@ struct HalfSlot {
     // Mirrors `waker.is_some()`, changed only under the lock, so the owner can
     // skip relocking an unchanged registration on every poll.
     armed: AtomicBool,
+    // Set before every registration and cleared once a Sink poll completes,
+    // so readiness the reader waits on does not wake an idle writer's task.
+    // The Stream half stays waiting after its first registration. Skipping a
+    // half leaves its registration and `armed` intact for its next poll.
+    //
+    // A wake that a registration is waiting for comes from a transport or
+    // timer that observed that registration, which happens after this store,
+    // so a Relaxed load cannot skip it. A stale `true` costs one spurious wake.
+    waiting: AtomicBool,
 }
 
 impl HalfWakers {
@@ -142,22 +151,31 @@ impl HalfWakers {
         &self.slots[half as usize]
     }
 
-    fn wake(&self, half: Half) {
+    fn take(&self, half: Half) -> Option<Waker> {
         let slot = self.slot(half);
+        if !slot.waiting.load(Ordering::Relaxed) {
+            return None;
+        }
         // Taking the waker limits a half that stopped waiting to one spurious wake.
-        let waker = {
-            let mut waker = slot.waker.lock();
-            slot.armed.store(false, Ordering::Relaxed);
-            waker.take()
-        };
-        if let Some(waker) = waker {
+        let mut waker = slot.waker.lock();
+        slot.armed.store(false, Ordering::Relaxed);
+        waker.take()
+    }
+
+    fn wake(&self, half: Half) {
+        if let Some(waker) = self.take(half) {
             waker.wake();
         }
     }
 
     fn wake_both(&self) {
-        self.wake(Half::Stream);
-        self.wake(Half::Sink);
+        let stream = self.take(Half::Stream);
+        let sink = self.take(Half::Sink);
+        match (stream, sink) {
+            // One task waiting on both halves needs a single wake.
+            (Some(stream), Some(sink)) if stream.will_wake(&sink) => stream.wake(),
+            (stream, sink) => stream.into_iter().chain(sink).for_each(Waker::wake),
+        }
     }
 }
 
@@ -182,7 +200,8 @@ struct UnifiedOutput {
     // A queued automatic Ping starts its Pong deadline once a flush covers it.
     ping_flush_pending: bool,
     ready_flush_pending: bool,
-    // Transport I/O and the shared timer use `waker`, which wakes both halves' wakers.
+    // Transport I/O and the shared timer use `waker`, which wakes each waiting
+    // half's waker.
     wakers: Arc<HalfWakers>,
     waker: Waker,
     // The waker each half last stored in `wakers`, indexed by `Half`.
@@ -207,6 +226,9 @@ impl UnifiedOutput {
     #[inline]
     fn register(&mut self, half: Half, waker: &Waker) {
         let slot = self.wakers.slot(half);
+        if !slot.waiting.load(Ordering::Relaxed) {
+            slot.waiting.store(true, Ordering::Relaxed);
+        }
         let registered = &self.registered[half as usize];
         // A stale `armed` means a concurrent wake just took this same task's
         // waker. That wake re-polls the task, which then relocks here before
@@ -237,6 +259,21 @@ impl UnifiedOutput {
         }
     }
 
+    /// Stop routing readiness wakes to a Sink whose poll has completed.
+    ///
+    /// Every Sink `Pending` first registers through `poll_drain` or
+    /// `poll_shutdown`, so a Sink that then polls the timer is still waiting.
+    #[inline]
+    fn settle<T>(&self, half: Half, poll: Poll<T>) -> Poll<T> {
+        if half == Half::Sink && poll.is_ready() {
+            self.wakers
+                .slot(half)
+                .waiting
+                .store(false, Ordering::Relaxed);
+        }
+        poll
+    }
+
     fn needs_drain_before_send(&self, threshold: usize) -> bool {
         // Reader-driven partial writes can keep the buffer below the threshold.
         // Stop admitting data until the pending Pong drains, or later messages
@@ -256,9 +293,21 @@ impl UnifiedOutput {
         waker: &Waker,
         heartbeat: &mut Heartbeat,
         clock_epoch: super::clock::Instant,
-        mut encode_pong: impl FnMut(&[u8], &mut BytesMut),
+        encode_pong: impl FnMut(&[u8], &mut BytesMut),
     ) -> Poll<Result<()>> {
         self.register(half, waker);
+        let result = self.drain(inner, half, heartbeat, clock_epoch, encode_pong);
+        self.settle(half, result)
+    }
+
+    fn drain<S: AsyncWrite + Unpin>(
+        &mut self,
+        inner: &mut S,
+        half: Half,
+        heartbeat: &mut Heartbeat,
+        clock_epoch: super::clock::Instant,
+        mut encode_pong: impl FnMut(&[u8], &mut BytesMut),
+    ) -> Poll<Result<()>> {
         let cx = &mut Context::from_waker(&self.waker);
 
         // Write all pending data
@@ -360,7 +409,8 @@ impl UnifiedOutput {
         waker: &Waker,
     ) -> Poll<io::Result<()>> {
         self.register(half, waker);
-        Pin::new(inner).poll_shutdown(&mut Context::from_waker(&self.waker))
+        let result = Pin::new(inner).poll_shutdown(&mut Context::from_waker(&self.waker));
+        self.settle(half, result)
     }
 
     fn poll_read<S: AsyncRead + Unpin>(

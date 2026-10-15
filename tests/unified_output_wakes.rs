@@ -231,6 +231,39 @@ macro_rules! output_wake_cases {
                 assert!(second.take_wakes() > 0);
             }
 
+            // A Sink whose flush completed is no longer waiting, so readiness
+            // that the reader registered must not wake the writer's task.
+            #[tokio::test]
+            async fn read_readiness_skips_sink_after_completed_flush() {
+                let state = io_state(usize::MAX, true);
+                state.borrow_mut().read_overwrites_write_waker = true;
+                let mut ws = ($make)(MockIo(state.clone()), quiet_config());
+                ws.feed(Message::text("sent")).await.unwrap();
+                let (reader, writer) = (Task::new(), Task::new());
+                assert!(matches!(poll_flush(&mut ws, &writer), Poll::Ready(Ok(()))));
+                assert!(poll_next(&mut ws, &reader).is_pending());
+
+                let waker = state.borrow_mut().write_waker.take().unwrap();
+                waker.wake();
+                assert!(reader.take_wakes() > 0);
+                assert_eq!(writer.take_wakes(), 0);
+            }
+
+            #[tokio::test]
+            async fn task_waiting_on_both_halves_is_woken_once() {
+                let state = io_state(0, true);
+                state.borrow_mut().read_overwrites_write_waker = true;
+                let mut ws = ($make)(MockIo(state.clone()), quiet_config());
+                ws.feed(Message::text("queued")).await.unwrap();
+                let task = Task::new();
+                assert!(poll_flush(&mut ws, &task).is_pending());
+                assert!(poll_next(&mut ws, &task).is_pending());
+
+                let waker = state.borrow_mut().write_waker.take().unwrap();
+                waker.wake();
+                assert_eq!(task.take_wakes(), 1);
+            }
+
             // Halves on different worker threads exercise cross-thread wakes
             // racing with registration; a lost wake shows up as a timeout.
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
