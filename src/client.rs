@@ -289,6 +289,11 @@ impl WebSocketClient<Http1> {
     /// This is a convenience method that establishes a TCP connection
     /// and performs the WebSocket handshake.
     ///
+    /// Only `ws://` URLs are supported; this method never establishes TLS.
+    /// A `wss://` URL returns an error before connecting: establish the TLS
+    /// stream yourself and pass it to [`Self::connect`]. URLs with user
+    /// information or a fragment are rejected.
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -320,49 +325,62 @@ impl WebSocketClient<Http1> {
     ) -> Result<(WebSocketStream<Stream<Http1>>, HandshakeResult)> {
         use tokio::net::TcpStream;
 
-        // Simple URL parsing for ws:// and wss:// URLs
-        let (scheme, rest) = url
-            .split_once("://")
-            .ok_or(Error::HandshakeFailed("invalid URL: missing scheme"))?;
+        // RFC 6455 forbids fragments in WebSocket URIs, and `Uri` would drop one.
+        if url.contains('#') {
+            return Err(Error::HandshakeFailed("URL must not contain a fragment"));
+        }
+        let uri: http::Uri = url
+            .parse()
+            .map_err(|_| Error::HandshakeFailed("invalid URL"))?;
 
-        let default_port = match scheme {
-            "ws" => 80u16,
-            "wss" => 443u16,
-            _ => {
+        match uri.scheme_str() {
+            Some(scheme) if scheme.eq_ignore_ascii_case("ws") => {}
+            // This method only opens plain TCP; never downgrade a wss URL.
+            Some(scheme) if scheme.eq_ignore_ascii_case("wss") => {
                 return Err(Error::HandshakeFailed(
-                    "invalid URL scheme: expected ws or wss",
+                    "wss URL requires TLS: pass a TLS stream to connect",
                 ));
             }
-        };
+            _ => return Err(Error::HandshakeFailed("invalid URL scheme: expected ws")),
+        }
 
-        // Split host:port from path
-        let (host_port, path) = rest
-            .find('/')
-            .map(|i| (&rest[..i], &rest[i..]))
-            .unwrap_or((rest, "/"));
-
-        // Parse host and port
-        let (host, port) = if let Some(colon_idx) = host_port.rfind(':') {
-            let port_str = &host_port[colon_idx + 1..];
-            let port: u16 = port_str
-                .parse()
-                .map_err(|_| Error::HandshakeFailed("invalid port"))?;
-            (&host_port[..colon_idx], port)
-        } else {
-            (host_port, default_port)
-        };
-
+        let authority = uri
+            .authority()
+            .ok_or(Error::HandshakeFailed("URL missing host"))?;
+        if authority.as_str().contains('@') {
+            return Err(Error::HandshakeFailed(
+                "URL must not contain user information",
+            ));
+        }
+        // IPv6 hosts keep their brackets, so `host:port` stays parseable.
+        let host = authority.host();
         if host.is_empty() {
             return Err(Error::HandshakeFailed("URL missing host"));
         }
+        // `Uri` accepts text after an IPv6 literal and signed ports, so check
+        // that only `:<digits>` follows the host.
+        let port: u16 = match authority.as_str().strip_prefix(host) {
+            Some("") => 80,
+            suffix => suffix
+                .and_then(|suffix| suffix.strip_prefix(':'))
+                .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|digits| digits.parse().ok())
+                .ok_or(Error::HandshakeFailed("invalid port"))?,
+        };
+        let path = match uri.path_and_query().map(|path| path.as_str()) {
+            Some(query) if query.starts_with('?') => format!("/{query}"),
+            Some(path) => path.to_owned(),
+            None => "/".to_owned(),
+        };
 
         // Connect to the server
-        let addr = format!("{}:{}", host, port);
-        let stream = TcpStream::connect(&addr).await.map_err(Error::Io)?;
+        let stream = TcpStream::connect(format!("{host}:{port}"))
+            .await
+            .map_err(Error::Io)?;
         stream.set_nodelay(true).map_err(Error::Io)?;
 
-        // Perform handshake
-        self.connect_with_headers(stream, host, path, protocol, extra_headers)
+        // Perform handshake; Host carries the port as written in the URL.
+        self.connect_with_headers(stream, authority.as_str(), &path, protocol, extra_headers)
             .await
     }
 }

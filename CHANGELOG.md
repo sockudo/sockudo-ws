@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed a Tokio unified automatic Ping flushed by the `Sink`, or before a blocked Pong, starting its Pong timeout only after the reader's own flush
 - Fixed continuous `feed` calls starving pending automatic Pongs: while a Pong is pending, Sink readiness drains output before admitting more data, even below the batching threshold, and still coalesces across a blocked transport flush
 - Fixed Tokio and Compio split readers losing a received Ping, Pong, Close, or parse error when a `next()` waiting for control queue capacity was cancelled (e.g. by `select!` or `timeout`); a lost Close left the peer without a reply and the reader hanging, and on Tokio the cooperative budget could cause the wait even with free capacity
+- Fixed `WebSocketClient::<Http1>::connect_to_url` and `connect_to_url_with_headers` sending `wss://` handshakes over plaintext TCP; they now fail before connecting, and TLS callers pass their stream to `connect`
+- Fixed `connect_to_url` URL parsing: IPv6 hosts without a port, query-only targets, and uppercase schemes now work, Host keeps a non-default port (RFC 6455), and user information, fragments, or anything but `:<digits>` after the host are rejected before connecting
 - Accepted the IANA-registered close codes 1012 (Service Restart), 1013 (Try Again Later), and 1014 (Bad Gateway) from peers and in `CloseReason::is_valid_code`
 
 ### Documentation
