@@ -89,8 +89,8 @@ fn generate_key_bytes_inner() -> [u8; 16] {
 #[inline]
 fn generate_key_bytes_inner() -> [u8; 16] {
     let mut bytes = [0u8; 16];
-    for chunk in bytes.chunks_exact_mut(4) {
-        chunk.copy_from_slice(&generate_fallback(&NONCE_FALLBACK_STATE));
+    for chunk in bytes.as_chunks_mut::<4>().0 {
+        *chunk = generate_fallback(&NONCE_FALLBACK_STATE);
     }
     bytes
 }
