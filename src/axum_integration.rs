@@ -469,6 +469,10 @@ impl WebSocket {
     }
 
     /// Close the connection
+    ///
+    /// The code and reason are sent as given: the caller must pass a code
+    /// accepted by [`crate::error::CloseReason::is_valid_code`] and a reason
+    /// of at most 123 bytes.
     pub async fn close(self, code: u16, reason: &str) -> Result<()> {
         match self.inner {
             WebSocketInner::Plain(mut ws) => ws.close(code, reason).await,
@@ -604,6 +608,10 @@ impl WebSocketWriter {
     }
 
     /// Send a close frame
+    ///
+    /// The code and reason are sent as given: the caller must pass a code
+    /// accepted by [`crate::error::CloseReason::is_valid_code`] and a reason
+    /// of at most 123 bytes.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         self.send(Message::Close(Some(CloseReason::new(code, reason))))
             .await

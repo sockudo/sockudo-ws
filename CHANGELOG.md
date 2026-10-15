@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed Tokio and Compio split readers losing a received Ping, Pong, Close, or parse error when a `next()` waiting for control queue capacity was cancelled (e.g. by `select!` or `timeout`); a lost Close left the peer without a reply and the reader hanging, and on Tokio the cooperative budget could cause the wait even with free capacity
 - Accepted the IANA-registered close codes 1012 (Service Restart), 1013 (Try Again Later), and 1014 (Bad Gateway) from peers and in `CloseReason::is_valid_code`
 
+### Documentation
+
+- Documented that outgoing messages and `close` arguments are not validated: callers must keep Text payloads valid UTF-8, Ping and Pong payloads at most 125 bytes, and Close reasons at most 123 bytes with a valid code
+
 ## [3.0.0] - 2026-09-29
 
 ### Enhancements

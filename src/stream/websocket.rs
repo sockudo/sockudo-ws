@@ -650,6 +650,10 @@ where
     /// Keep polling `next()` to drive the handshake. One `close_timeout`
     /// budget covers writes, the peer response, and best-effort shutdown;
     /// a silent peer yields `ConnectionClosed` once and then ends the stream.
+    ///
+    /// The code and reason are sent as given: the caller must pass a code
+    /// accepted by [`crate::error::CloseReason::is_valid_code`] and a reason
+    /// of at most 123 bytes.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         if self.state != StreamState::Open {
             return Ok(());
@@ -2205,6 +2209,10 @@ where
     /// reopen the connection. If the frame has not finished writing, it is not
     /// retried and the peer may observe transport termination without a
     /// WebSocket Close frame.
+    ///
+    /// The code and reason are sent as given: the caller must pass a code
+    /// accepted by [`crate::error::CloseReason::is_valid_code`] and a reason
+    /// of at most 123 bytes.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         self.send(Message::Close(Some(CloseReason::new(code, reason))))
             .await
@@ -2819,6 +2827,10 @@ where
     /// Keep polling `next()` to drive the handshake. One `close_timeout`
     /// budget covers writes, the peer response, and best-effort shutdown;
     /// a silent peer yields `ConnectionClosed` once and then ends the stream.
+    ///
+    /// The code and reason are sent as given: the caller must pass a code
+    /// accepted by [`crate::error::CloseReason::is_valid_code`] and a reason
+    /// of at most 123 bytes.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         if self.state != StreamState::Open {
             return Ok(());
@@ -3802,6 +3814,10 @@ where
     /// reopen the connection. If the frame has not finished writing, it is not
     /// retried and the peer may observe transport termination without a
     /// WebSocket Close frame.
+    ///
+    /// The code and reason are sent as given: the caller must pass a code
+    /// accepted by [`crate::error::CloseReason::is_valid_code`] and a reason
+    /// of at most 123 bytes.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<()> {
         self.send(Message::Close(Some(CloseReason::new(code, reason))))
             .await

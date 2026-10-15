@@ -30,6 +30,11 @@ pub enum Role {
 /// Text messages use `Bytes` internally for zero-copy efficiency.
 /// Parsing validates UTF-8 unless [`crate::Config::validate_text_utf8`] is disabled.
 /// Text accessors also check received and publicly constructed payloads.
+///
+/// Outgoing messages are encoded as given, without validation. The caller must
+/// keep Text payloads valid UTF-8, Ping and Pong payloads at most 125 bytes,
+/// and Close reasons at most 123 bytes with a code accepted by
+/// [`CloseReason::is_valid_code`].
 #[derive(Debug, Clone)]
 pub enum Message {
     /// Text message (stored as Bytes; validation depends on the receive configuration)
