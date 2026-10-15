@@ -606,25 +606,12 @@ impl fmt::Debug for Stream<Http3> {
     }
 }
 
-// ============================================================================
-// Send + Sync implementations
-// ============================================================================
-
-// SAFETY: Stream<T> is Send because all inner types are Send
-unsafe impl Send for Stream<Http1> {}
-#[cfg(feature = "http2")]
-unsafe impl Send for Stream<Http2> {}
-#[cfg(feature = "http3")]
-unsafe impl Send for Stream<Http3> {}
-
-// SAFETY: Stream<T> is Sync for types where inner is Sync
-// Http1 inner is a Box<dyn Http1Stream> which is Send but not necessarily Sync
-// We don't implement Sync for Http1 to be safe
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // Every inner transport is Send, so Stream derives Send without an
+    // unsafe impl; this fails to compile if an inner type stops being Send.
     #[test]
     fn test_stream_is_send() {
         fn assert_send<T: Send>() {}
