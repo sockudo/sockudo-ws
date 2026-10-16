@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-10-16
+
 ### Breaking Changes
 
 - Changed Tokio `WebSocketStream` and `CompressedWebSocketStream` to keep receiving while automatic control output is blocked: a Ping is delivered before its Pong is flushed, only the latest unencoded Pong is kept, and a peer that sends without reading is no longer closed by the inbound idle timeout; there is no output deadline
@@ -554,6 +556,8 @@ ASCII fast-path strategy: Check if all bytes in a 16/32-byte chunk have high bit
 - Passes all 517 Autobahn test cases
 - Outperforms uWebSockets in benchmarks
 
+[Unreleased]: https://github.com/sockudo/sockudo-ws/compare/v3.1.0...HEAD
+[3.1.0]: https://github.com/sockudo/sockudo-ws/compare/v3.0.0...v3.1.0
 [3.0.0]: https://github.com/sockudo/sockudo-ws/compare/v2.1.0...v3.0.0
 [2.1.0]: https://github.com/sockudo/sockudo-ws/compare/v2.0.2...v2.1.0
 [2.0.2]: https://github.com/sockudo/sockudo-ws/compare/v2.0.1...v2.0.2
