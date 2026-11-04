@@ -78,8 +78,7 @@ pin_project! {
         inner: S,
         protocol: Protocol,
         read_buf: BytesMut,
-        // Reclaim once after buffered input reaches half a receive window.
-        reclaim_read_window: bool,
+        read_window: super::receive_window::ReceiveWindow,
         // Process handshake leftovers and unread frame tails before another read.
         has_unprocessed_read_data: bool,
         output: UnifiedOutput,
@@ -484,7 +483,8 @@ where
     ) -> Self {
         let protocol = Protocol::new(role, config.max_frame_size, config.max_message_size)
             .with_text_utf8_validation(config.validate_text_utf8);
-        let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);
+        let read_window = super::receive_window::ReceiveWindow::new(config.read_buffer_size);
+        let mut read_buf = read_window.allocate();
         if let Some(leftover) = leftover {
             read_buf.extend_from_slice(&leftover);
         }
@@ -496,7 +496,7 @@ where
             inner,
             protocol,
             read_buf,
-            reclaim_read_window: false,
+            read_window,
             has_unprocessed_read_data,
             output: UnifiedOutput::new(config.write_buffer_size),
             state: StreamState::Open,
@@ -716,20 +716,7 @@ where
     fn poll_read_more(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         let this = self.project();
 
-        // Ensure we have space in the buffer
-        // Reuse an empty receive window when no delivered payload still owns it.
-        if *this.reclaim_read_window && this.read_buf.is_empty() {
-            *this.reclaim_read_window = false;
-            if !this.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE) {
-                // Retained messages still own the old allocation. Grow the empty
-                // window now so a later reserve does not copy a partial frame.
-                this.read_buf.reserve(crate::RECV_BUFFER_SIZE);
-            }
-        }
-
-        if this.read_buf.capacity() - this.read_buf.len() < 4096 {
-            this.read_buf.reserve(crate::RECV_BUFFER_SIZE);
-        }
+        this.read_window.prepare(this.read_buf, true);
 
         // Get a slice of uninitialized memory
         let buf_len = this.read_buf.len();
@@ -742,10 +729,7 @@ where
                 unsafe {
                     this.read_buf.set_len(buf_len + n);
                 }
-                // Keep the hint across partial frames until the receive window is empty.
-                if this.read_buf.len() >= crate::RECV_BUFFER_SIZE / 2 {
-                    *this.reclaim_read_window = true;
-                }
+                this.read_window.record_read(this.read_buf.len(), n);
                 if n == 0 {
                     Poll::Ready(Ok(0))
                 } else {
@@ -1891,8 +1875,7 @@ pub struct SplitReader<S> {
     reader: SplitTransport<S>,
     protocol: Protocol,
     read_buf: BytesMut,
-    // Reclaim once after buffered input reaches half a receive window.
-    reclaim_read_window: bool,
+    read_window: super::receive_window::ReceiveWindow,
     has_unprocessed_read_data: bool,
     pending_message: Option<Message>,
     // Messages parsed by the unified reader after a Ping and moved through split().
@@ -1968,7 +1951,7 @@ where
                 reader,
                 protocol: reader_protocol,
                 read_buf: self.read_buf,
-                reclaim_read_window: self.reclaim_read_window,
+                read_window: self.read_window,
                 has_unprocessed_read_data: self.has_unprocessed_read_data,
                 pending_message: self.pending_message,
                 pending_ping_batch: self.pending_ping_batch,
@@ -2101,19 +2084,7 @@ where
                 return self.pending_parse_error.take().map(Err);
             }
 
-            // Reuse an empty receive window when no delivered payload still owns it.
-            if self.reclaim_read_window && self.read_buf.is_empty() {
-                self.reclaim_read_window = false;
-                if !self.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE) {
-                    // Retained messages still own the old allocation. Grow the empty
-                    // window now so a later reserve does not copy a partial frame.
-                    self.read_buf.reserve(crate::RECV_BUFFER_SIZE);
-                }
-            }
-
-            if self.read_buf.capacity() - self.read_buf.len() < 4096 {
-                self.read_buf.reserve(crate::RECV_BUFFER_SIZE);
-            }
+            self.read_window.prepare(&mut self.read_buf, true);
 
             tokio::select! {
                 biased;
@@ -2129,10 +2100,8 @@ where
                             let _ = self.control_tx.send(ControlRequest::Eof).await;
                             self.shared.terminate(TerminalCause::ConnectionClosed);
                         }
-                        Ok(_) => {
-                            if self.read_buf.len() >= crate::RECV_BUFFER_SIZE / 2 {
-                                self.reclaim_read_window = true;
-                            }
+                        Ok(read) => {
+                            self.read_window.record_read(self.read_buf.len(), read);
                             self.has_unprocessed_read_data = true;
                         },
                         Err(error) => {
@@ -2647,8 +2616,7 @@ pin_project! {
         inner: S,
         protocol: crate::protocol::CompressedProtocol,
         read_buf: BytesMut,
-        // Reclaim once after buffered input reaches half a receive window.
-        reclaim_read_window: bool,
+        read_window: super::receive_window::ReceiveWindow,
         // Leftover handshake bytes must be processed once before the first read.
         has_unprocessed_read_data: bool,
         output: UnifiedOutput,
@@ -2700,7 +2668,8 @@ where
         )
         .with_text_utf8_validation(config.validate_text_utf8);
 
-        let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);
+        let read_window = super::receive_window::ReceiveWindow::new(config.read_buffer_size);
+        let mut read_buf = read_window.allocate();
         if let Some(leftover) = leftover {
             read_buf.extend_from_slice(&leftover);
         }
@@ -2711,7 +2680,7 @@ where
             inner,
             protocol,
             read_buf,
-            reclaim_read_window: false,
+            read_window,
             has_unprocessed_read_data,
             output: UnifiedOutput::new(config.write_buffer_size),
             state: StreamState::Open,
@@ -2754,7 +2723,8 @@ where
         )
         .with_text_utf8_validation(config.validate_text_utf8);
 
-        let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);
+        let read_window = super::receive_window::ReceiveWindow::new(config.read_buffer_size);
+        let mut read_buf = read_window.allocate();
         if let Some(leftover) = leftover {
             read_buf.extend_from_slice(&leftover);
         }
@@ -2765,7 +2735,7 @@ where
             inner,
             protocol,
             read_buf,
-            reclaim_read_window: false,
+            read_window,
             has_unprocessed_read_data,
             output: UnifiedOutput::new(config.write_buffer_size),
             state: StreamState::Open,
@@ -2886,15 +2856,7 @@ where
     fn poll_read_more(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         let this = self.project();
 
-        // Reuse an empty receive window when no delivered payload still owns it.
-        if *this.reclaim_read_window && this.read_buf.is_empty() {
-            *this.reclaim_read_window = false;
-            let _ = this.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE);
-        }
-
-        if this.read_buf.capacity() - this.read_buf.len() < 4096 {
-            this.read_buf.reserve(crate::RECV_BUFFER_SIZE);
-        }
+        this.read_window.prepare(this.read_buf, false);
 
         let buf_len = this.read_buf.len();
         let mut read_buf = ReadBuf::uninit(this.read_buf.spare_capacity_mut());
@@ -2906,10 +2868,7 @@ where
                 unsafe {
                     this.read_buf.set_len(buf_len + n);
                 }
-                // Keep the hint across partial frames until the receive window is empty.
-                if this.read_buf.len() >= crate::RECV_BUFFER_SIZE / 2 {
-                    *this.reclaim_read_window = true;
-                }
+                this.read_window.record_read(this.read_buf.len(), n);
                 if n == 0 {
                     Poll::Ready(Ok(0))
                 } else {
@@ -3456,8 +3415,7 @@ pub struct CompressedSplitReader<S> {
     protocol: crate::protocol::CompressedReaderProtocol,
     /// Read buffer
     read_buf: BytesMut,
-    // Reclaim once after buffered input reaches half a receive window.
-    reclaim_read_window: bool,
+    read_window: super::receive_window::ReceiveWindow,
     has_unprocessed_read_data: bool,
     /// Pending messages from last decode
     pending_messages: Vec<Message>,
@@ -3580,7 +3538,7 @@ where
                 reader,
                 protocol: reader_protocol,
                 read_buf: self.read_buf,
-                reclaim_read_window: self.reclaim_read_window,
+                read_window: self.read_window,
                 has_unprocessed_read_data: self.has_unprocessed_read_data,
                 pending_messages: self.pending_messages,
                 pending_parse_error: self.pending_parse_error,
@@ -3701,15 +3659,7 @@ where
                 }
             }
 
-            // Reuse an empty receive window when no delivered payload still owns it.
-            if self.reclaim_read_window && self.read_buf.is_empty() {
-                self.reclaim_read_window = false;
-                let _ = self.read_buf.try_reclaim(crate::RECV_BUFFER_SIZE);
-            }
-
-            if self.read_buf.capacity() - self.read_buf.len() < 4096 {
-                self.read_buf.reserve(crate::RECV_BUFFER_SIZE);
-            }
+            self.read_window.prepare(&mut self.read_buf, false);
 
             let mut accepted_fragment = false;
             tokio::select! {
@@ -3730,10 +3680,8 @@ where
                             let _ = self.control_tx.send(ControlRequest::Eof).await;
                             self.shared.terminate(TerminalCause::ConnectionClosed);
                         }
-                        Ok(_) => {
-                            if self.read_buf.len() >= crate::RECV_BUFFER_SIZE / 2 {
-                                self.reclaim_read_window = true;
-                            }
+                        Ok(read) => {
+                            self.read_window.record_read(self.read_buf.len(), read);
                             match self
                                 .protocol
                                 .process_into_with_activity(&mut self.read_buf, &mut self.pending_messages, &mut accepted_fragment)

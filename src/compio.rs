@@ -1573,7 +1573,7 @@ where
         config: Config,
         leftover: Option<Bytes>,
     ) -> Self {
-        let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);
+        let mut read_buf = BytesMut::with_capacity(config.read_buffer_size.max(1024));
         if let Some(leftover) = leftover {
             read_buf.extend_from_slice(&leftover);
         }
@@ -3043,7 +3043,7 @@ where
         deflate_config: DeflateConfig,
         leftover: Option<Bytes>,
     ) -> Self {
-        let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);
+        let mut read_buf = BytesMut::with_capacity(config.read_buffer_size.max(1024));
         if let Some(leftover) = leftover {
             read_buf.extend_from_slice(&leftover);
         }
@@ -3088,7 +3088,7 @@ where
         deflate_config: DeflateConfig,
         leftover: Option<Bytes>,
     ) -> Self {
-        let mut read_buf = BytesMut::with_capacity(crate::RECV_BUFFER_SIZE);
+        let mut read_buf = BytesMut::with_capacity(config.read_buffer_size.max(1024));
         if let Some(leftover) = leftover {
             read_buf.extend_from_slice(&leftover);
         }
