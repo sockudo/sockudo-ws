@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.1] - 2026-11-04
+
 ### Breaking Changes
 
 - Added the public `Config::read_buffer_size` field; code that builds `Config` with a struct literal and no `..Default::default()` must set it
@@ -565,7 +567,8 @@ ASCII fast-path strategy: Check if all bytes in a 16/32-byte chunk have high bit
 - Passes all 517 Autobahn test cases
 - Outperforms uWebSockets in benchmarks
 
-[Unreleased]: https://github.com/sockudo/sockudo-ws/compare/v3.1.0...HEAD
+[Unreleased]: https://github.com/sockudo/sockudo-ws/compare/v3.1.1...HEAD
+[3.1.1]: https://github.com/sockudo/sockudo-ws/compare/v3.1.0...v3.1.1
 [3.1.0]: https://github.com/sockudo/sockudo-ws/compare/v3.0.0...v3.1.0
 [3.0.0]: https://github.com/sockudo/sockudo-ws/compare/v2.1.0...v3.0.0
 [2.1.0]: https://github.com/sockudo/sockudo-ws/compare/v2.0.2...v2.1.0
