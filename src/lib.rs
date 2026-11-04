@@ -160,7 +160,7 @@ pub const CACHE_LINE_SIZE: usize = 64;
 /// Default cork buffer size (16KB like uWebSockets)
 pub const CORK_BUFFER_SIZE: usize = 16 * 1024;
 
-/// Default receive buffer size (64KB for high throughput)
+/// Default receive buffer size (64KB for high throughput); see `Config::read_buffer_size`.
 pub const RECV_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Maximum WebSocket frame header size (2 + 8 + 4 = 14 bytes)
@@ -513,6 +513,15 @@ pub struct Config {
     pub max_frame_size: usize,
     /// Write buffer size for corking (default: 16KB)
     pub write_buffer_size: usize,
+    /// Receive buffer size (default: 64KB, minimum 1KB).
+    ///
+    /// Each connection allocates this much up front and reserves it again
+    /// whenever spare capacity runs low, so it is the per-connection cost of
+    /// an idle reader. A smaller window suits servers with many mostly idle
+    /// connections: larger frames still grow the buffer as needed, and once
+    /// the input is consumed and reads are small again, the grown buffer is
+    /// released back to this size.
+    pub read_buffer_size: usize,
     /// Compression mode (default: Disabled)
     pub compression: Compression,
     /// Hard inbound-idle timeout in seconds (default: 120, 0 = disabled).
@@ -598,6 +607,7 @@ impl Default for Config {
             max_message_size: 64 * 1024 * 1024,
             max_frame_size: 16 * 1024 * 1024,
             write_buffer_size: CORK_BUFFER_SIZE,
+            read_buffer_size: RECV_BUFFER_SIZE,
             compression: Compression::Disabled,
             idle_timeout: 120,
             max_backpressure: 1024 * 1024,
@@ -633,6 +643,7 @@ impl Config {
             max_message_size: 16 * 1024,
             max_frame_size: 16 * 1024,
             write_buffer_size: CORK_BUFFER_SIZE,
+            read_buffer_size: RECV_BUFFER_SIZE,
             compression: Compression::Shared,
             // A hard inbound-idle deadline shorter than the first Ping is
             // surprising. uWS-style defaults therefore leave hard idle
@@ -719,6 +730,12 @@ impl ConfigBuilder {
     /// Set write buffer size for corking
     pub fn write_buffer_size(mut self, size: usize) -> Self {
         self.config.write_buffer_size = size;
+        self
+    }
+
+    /// Set the receive buffer size (see `Config::read_buffer_size`)
+    pub fn read_buffer_size(mut self, size: usize) -> Self {
+        self.config.read_buffer_size = size;
         self
     }
 

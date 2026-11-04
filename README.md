@@ -796,6 +796,7 @@ let config = Config::builder()
 | `pong_timeout_close_reason` | `Pong reply not received in time` | Close reason for a missed Pong |
 | `close_timeout` | 5s | Bound for Close handling; Tokio split `close()` includes waiting for the shared sink (0 = one immediate attempt without waiting) |
 | `write_buffer_size` | 16KB | Cork buffer size |
+| `read_buffer_size` | 64KB | Receive buffer allocated per connection; lower it for many mostly idle connections |
 
 ### Queued-write backpressure
 

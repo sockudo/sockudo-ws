@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Added the public `Config::read_buffer_size` field; code that builds `Config` with a struct literal and no `..Default::default()` must set it
+
+### Added
+
+- Added `Config::read_buffer_size` and `ConfigBuilder::read_buffer_size` (default 64KB, the previous fixed `RECV_BUFFER_SIZE`, minimum 1KB): the receive buffer each connection allocates up front and reserves when spare capacity runs low. A 4KB window cut idle server memory by about 70KB per connection with no change in delivery latency; frames larger than the window still grow the buffer
+- Released a receive buffer that a large frame grew past twice the window once its input is consumed and the next read is small, so a connection that went quiet does not keep the grown allocation; streams of large frames keep reusing it
+
 ## [3.1.0] - 2026-10-16
 
 ### Breaking Changes
