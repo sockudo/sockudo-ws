@@ -17,7 +17,13 @@ async fn small_receive_window_delivers_frames_larger_than_the_window() {
     let server = WebSocketStream::server(server_io, config);
     let (mut server_reader, mut server_writer) = server.split();
 
-    let messages = [payload(16), payload(200 * 1024), payload(6), payload(70 * 1024), payload(1)];
+    let messages = [
+        payload(16),
+        payload(200 * 1024),
+        payload(6),
+        payload(70 * 1024),
+        payload(1),
+    ];
     let expected = messages.clone();
     let echo = tokio::spawn(async move {
         for expected in &expected {
@@ -43,9 +49,15 @@ async fn small_receive_window_delivers_frames_larger_than_the_window() {
 
 #[test]
 fn read_buffer_size_defaults_to_the_receive_buffer_constant() {
-    assert_eq!(Config::default().read_buffer_size, sockudo_ws::RECV_BUFFER_SIZE);
     assert_eq!(
-        Config::builder().read_buffer_size(2048).build().read_buffer_size,
+        Config::default().read_buffer_size,
+        sockudo_ws::RECV_BUFFER_SIZE
+    );
+    assert_eq!(
+        Config::builder()
+            .read_buffer_size(2048)
+            .build()
+            .read_buffer_size,
         2048
     );
 }
